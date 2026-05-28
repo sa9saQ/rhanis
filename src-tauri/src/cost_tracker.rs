@@ -9,29 +9,60 @@
 //! 制限の ON/OFF と金額の判断はユーザーに委ねる（`BudgetConfig::enabled`）。
 //! OpenAI ダッシュボード側の上限とは独立した、アプリ内で完結する安全網。
 //!
-//! 純粋計算 + serde のみに依存し、音声デバイスや WebSocket を持たないため
-//! 単体テストで全分岐を検証できる。
+//! ## 設計上の不変条件（R-C / Codex レビュー反映）
+//! - **金額は整数ナノドル**で扱う。f64 の丸め誤差や NaN/Inf による fail-open
+//!   （安全装置の無効化）を構造的に排除する。
+//! - **月リセットは月が前進した時のみ**。過去月・無効月の入力では累計をリセット
+//!   せず、リセット悪用による無料化を防ぐ。
+//! - 算術はすべて `saturating_*`。オーバーフローしても panic せず上限側に張り付く
+//!   （= 予算超過と判定され、fail-closed）。
+//!
+//! ## 呼び出し側（session_manager / settings UI）の責務
+//! - session_manager は開始時の `can_start_session()` に加え、usage 受信ごとに
+//!   `is_over_budget()` を確認し、超過したら進行中セッションを即停止すること
+//!   （開始後の野放し課金を防ぐ）。複数同時セッションの原子的予約は M2 で導入。
+//! - `enabled = false` は「ユーザーが明示的に無制限を選んだ」状態。初回オンボー
+//!   ディングで「上限を設定する / 明示的に無制限」を必須選択にし、未設定のまま
+//!   高額課金が起きないようにすること（settings UI 層の責務）。
 //
 // --- 課金安全 hook bypass note（本モジュールが該当しない根拠） ---
 // idempotency_key N/A / FOR UPDATE N/A / transaction N/A:
 //   本モジュールは料金の"計算"のみで、Stripe 等の決済・DB 書き込み・残高更新を行わない。
 // 正数検証 N/A:
-//   トークン数は全て u64 で負値を型レベルで排除。料金は (非負トークン × 正の単価) なので
-//   月次累計も常に非負。ユーザー入力である monthly_limit_usd の負値検証だけは
-//   設定 UI 層（settings）の責務とし、本計算層では扱わない。
+//   トークン数・料金・累計・上限はすべて u64（負値・NaN・Inf を型レベルで排除）。
+//   ユーザー入力の USD は usd_to_nanodollars() で finite && 非負を検証してから u64 化する。
 
 use serde::{Deserialize, Serialize};
 
-/// GPT-Realtime-2 の料金単価（USD / 100 万トークン）。
+/// 1 USD = 1,000,000,000 ナノドル。金額はこの整数単位で保持する。
+pub const NANODOLLARS_PER_USD: u64 = 1_000_000_000;
+
+/// 料金単価（ナノドル / トークン）。USD/100 万トークンを整数化したもの。
 ///
-/// 出典: OpenAI pricing 2026-05。単価が変わったらここだけ直す。
+/// 例: 音声入力 $32 / 1M tokens = 32 USD / 1e6 tokens
+///   = 32 * 1e9 nanodollars / 1e6 tokens = 32_000 nanodollars/token。
+/// 出典: OpenAI GPT-Realtime-2 pricing 2026-05。単価が変わったらここだけ直す。
 pub mod pricing {
-    pub const AUDIO_INPUT_PER_M: f64 = 32.0;
-    pub const AUDIO_OUTPUT_PER_M: f64 = 64.0;
-    pub const TEXT_INPUT_PER_M: f64 = 4.0;
-    pub const TEXT_OUTPUT_PER_M: f64 = 24.0;
-    /// キャッシュ済み入力は大幅割引（繰り返し送られる system prompt 等）。
-    pub const CACHED_INPUT_PER_M: f64 = 0.40;
+    pub const AUDIO_INPUT_PER_TOKEN: u64 = 32_000;
+    pub const AUDIO_OUTPUT_PER_TOKEN: u64 = 64_000;
+    pub const TEXT_INPUT_PER_TOKEN: u64 = 4_000;
+    pub const TEXT_OUTPUT_PER_TOKEN: u64 = 24_000;
+    /// キャッシュ済み入力は大幅割引（繰り返し送られる system prompt 等）。$0.40/1M = 400/token。
+    pub const CACHED_INPUT_PER_TOKEN: u64 = 400;
+}
+
+/// USD を nanodollars に変換（UI 入力用）。
+/// 非有限（NaN/Inf）・負値は `None`（不正値を u64 に通さない fail-closed）。
+pub fn usd_to_nanodollars(usd: f64) -> Option<u64> {
+    if !usd.is_finite() || usd < 0.0 {
+        return None;
+    }
+    Some((usd * NANODOLLARS_PER_USD as f64).round() as u64)
+}
+
+/// nanodollars を表示用 USD に変換（表示のみ。判定・比較には使わない）。
+pub fn nanodollars_to_usd(nano: u64) -> f64 {
+    nano as f64 / NANODOLLARS_PER_USD as f64
 }
 
 /// 1 レスポンス分のトークン使用量。Realtime API の `usage` イベント由来。
@@ -45,31 +76,38 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// この usage 分の料金（USD）。
-    pub fn cost_usd(&self) -> f64 {
+    /// この usage 分の料金（ナノドル）。
+    /// オーバーフローは saturating（上限張り付き = 予算超過側 = fail-closed）。
+    pub fn cost_nanodollars(&self) -> u64 {
         use pricing::*;
-        let per_m = |tokens: u64, rate: f64| (tokens as f64) * rate / 1_000_000.0;
-        per_m(self.audio_input_tokens, AUDIO_INPUT_PER_M)
-            + per_m(self.audio_output_tokens, AUDIO_OUTPUT_PER_M)
-            + per_m(self.text_input_tokens, TEXT_INPUT_PER_M)
-            + per_m(self.text_output_tokens, TEXT_OUTPUT_PER_M)
-            + per_m(self.cached_input_tokens, CACHED_INPUT_PER_M)
+        let mul = |t: u64, r: u64| t.saturating_mul(r);
+        mul(self.audio_input_tokens, AUDIO_INPUT_PER_TOKEN)
+            .saturating_add(mul(self.audio_output_tokens, AUDIO_OUTPUT_PER_TOKEN))
+            .saturating_add(mul(self.text_input_tokens, TEXT_INPUT_PER_TOKEN))
+            .saturating_add(mul(self.text_output_tokens, TEXT_OUTPUT_PER_TOKEN))
+            .saturating_add(mul(self.cached_input_tokens, CACHED_INPUT_PER_TOKEN))
+    }
+
+    /// 表示用の USD 換算（UI 表示専用、判定には使わない）。
+    pub fn cost_usd(&self) -> f64 {
+        nanodollars_to_usd(self.cost_nanodollars())
     }
 }
 
 /// 予算設定。`enabled = false` なら無制限（ユーザーが明示設定するまで縛らない）。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+/// 金額は nanodollars（整数）で保持し、NaN/Inf を型レベルで排除する。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BudgetConfig {
     pub enabled: bool,
-    pub monthly_limit_usd: f64,
+    pub monthly_limit_nanodollars: u64,
 }
 
 impl Default for BudgetConfig {
     fn default() -> Self {
-        // 既定は OFF。ユーザーが上限額を入れて初めて制限が効く。
+        // 既定は OFF。ユーザーが上限額を入れて初めて制限が効く（オンボーディング必須）。
         Self {
             enabled: false,
-            monthly_limit_usd: 0.0,
+            monthly_limit_nanodollars: 0,
         }
     }
 }
@@ -77,12 +115,11 @@ impl Default for BudgetConfig {
 /// 月次のコスト累計 + 予算判定。
 ///
 /// `current_month` は `YYYYMM`（例: 2026 年 5 月 = `202605`）。
-/// `add_usage` に渡した月が変わると累計を自動リセットする（課金サイクル境界）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostTracker {
     pub config: BudgetConfig,
     pub current_month: u32,
-    pub month_total_usd: f64,
+    pub month_total_nanodollars: u64,
 }
 
 impl CostTracker {
@@ -90,25 +127,37 @@ impl CostTracker {
         Self {
             config,
             current_month,
-            month_total_usd: 0.0,
+            month_total_nanodollars: 0,
         }
     }
 
-    /// usage を月次累計に加算し、加算後の累計（USD）を返す。
-    /// `month` が現在の月と違えば、累計をリセットしてから加算する。
-    pub fn add_usage(&mut self, usage: &Usage, month: u32) -> f64 {
-        if month != self.current_month {
+    /// `YYYYMM` の妥当性（月部分 01-12、年 2000-9999）。
+    fn is_valid_month(month: u32) -> bool {
+        let mm = month % 100;
+        let yyyy = month / 100;
+        (1..=12).contains(&mm) && (2000..=9999).contains(&yyyy)
+    }
+
+    /// usage を累計に加算し、加算後の月次累計（ナノドル）を返す。
+    ///
+    /// 月リセットは **月が前進（`month > current_month`）した時のみ**。
+    /// 過去月・無効月の入力では累計をリセットせず現在の月に計上する
+    /// （`202605 -> 202604 -> 202605` のようなリセット悪用による無料化を防ぐ）。
+    pub fn add_usage(&mut self, usage: &Usage, month: u32) -> u64 {
+        if Self::is_valid_month(month) && month > self.current_month {
             self.current_month = month;
-            self.month_total_usd = 0.0;
+            self.month_total_nanodollars = 0;
         }
-        self.month_total_usd += usage.cost_usd();
-        self.month_total_usd
+        self.month_total_nanodollars = self
+            .month_total_nanodollars
+            .saturating_add(usage.cost_nanodollars());
+        self.month_total_nanodollars
     }
 
     /// 予算超過か。`enabled = false` なら常に false（無制限）。
     /// 上限ちょうどに達した時点で「超過」とみなす（fail-closed 寄り）。
     pub fn is_over_budget(&self) -> bool {
-        self.config.enabled && self.month_total_usd >= self.config.monthly_limit_usd
+        self.config.enabled && self.month_total_nanodollars >= self.config.monthly_limit_nanodollars
     }
 
     /// 新しいセッションを開始してよいか。予算超過なら false（fail-closed）。
@@ -116,12 +165,21 @@ impl CostTracker {
         !self.is_over_budget()
     }
 
-    /// 上限までの残額（USD、負にはならない）。`enabled = false` なら None（無制限）。
-    pub fn remaining_usd(&self) -> Option<f64> {
+    /// 上限までの残額（ナノドル、負にはならない）。`enabled = false` なら None（無制限）。
+    pub fn remaining_nanodollars(&self) -> Option<u64> {
         if !self.config.enabled {
             return None;
         }
-        Some((self.config.monthly_limit_usd - self.month_total_usd).max(0.0))
+        Some(
+            self.config
+                .monthly_limit_nanodollars
+                .saturating_sub(self.month_total_nanodollars),
+        )
+    }
+
+    /// 上限までの残額（表示用 USD）。
+    pub fn remaining_usd(&self) -> Option<f64> {
+        self.remaining_nanodollars().map(nanodollars_to_usd)
     }
 }
 
@@ -129,10 +187,7 @@ impl CostTracker {
 mod tests {
     use super::*;
 
-    /// 浮動小数点の近似比較。
-    fn approx(a: f64, b: f64) {
-        assert!((a - b).abs() < 1e-9, "expected {b}, got {a}");
-    }
+    const USD: u64 = NANODOLLARS_PER_USD;
 
     #[test]
     fn cost_single_meter() {
@@ -141,7 +196,7 @@ mod tests {
             audio_input_tokens: 1_000_000,
             ..Default::default()
         };
-        approx(u.cost_usd(), 32.0);
+        assert_eq!(u.cost_nanodollars(), 32 * USD);
     }
 
     #[test]
@@ -153,7 +208,8 @@ mod tests {
             text_output_tokens: 1_000_000,  // $24
             cached_input_tokens: 1_000_000, // $0.40
         };
-        approx(u.cost_usd(), 32.0 + 64.0 + 4.0 + 24.0 + 0.40);
+        // $124.40 = 124_400_000_000 nanodollars（整数なので誤差なし）
+        assert_eq!(u.cost_nanodollars(), 124_400_000_000);
     }
 
     #[test]
@@ -164,13 +220,31 @@ mod tests {
             audio_output_tokens: 1200,
             ..Default::default()
         };
-        // 600/1e6*32 + 1200/1e6*64 = 0.0192 + 0.0768 = 0.096 USD/分
-        approx(u.cost_usd(), 0.096);
+        // 600*32_000 + 1200*64_000 = 19_200_000 + 76_800_000 = 96_000_000 ($0.096)
+        assert_eq!(u.cost_nanodollars(), 96_000_000);
     }
 
     #[test]
     fn empty_usage_is_free() {
-        approx(Usage::default().cost_usd(), 0.0);
+        assert_eq!(Usage::default().cost_nanodollars(), 0);
+    }
+
+    #[test]
+    fn cost_saturates_instead_of_overflow() {
+        // 極端なトークン数でも panic せず u64::MAX に張り付く（fail-closed）。
+        let u = Usage {
+            audio_output_tokens: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(u.cost_nanodollars(), u64::MAX);
+    }
+
+    #[test]
+    fn usd_conversion_rejects_non_finite_and_negative() {
+        assert_eq!(usd_to_nanodollars(f64::NAN), None);
+        assert_eq!(usd_to_nanodollars(f64::INFINITY), None);
+        assert_eq!(usd_to_nanodollars(-1.0), None);
+        assert_eq!(usd_to_nanodollars(10.0), Some(10 * USD));
     }
 
     #[test]
@@ -180,22 +254,50 @@ mod tests {
             audio_input_tokens: 1_000_000,
             ..Default::default()
         };
-        approx(t.add_usage(&u, 202605), 32.0);
-        approx(t.add_usage(&u, 202605), 64.0);
+        assert_eq!(t.add_usage(&u, 202605), 32 * USD);
+        assert_eq!(t.add_usage(&u, 202605), 64 * USD);
         assert_eq!(t.current_month, 202605);
     }
 
     #[test]
-    fn month_rollover_resets_total() {
+    fn month_forward_resets_total() {
         let mut t = CostTracker::new(BudgetConfig::default(), 202605);
         let u = Usage {
             audio_input_tokens: 1_000_000,
             ..Default::default()
         };
         t.add_usage(&u, 202605);
-        // 翌月になったら累計はリセットされ、その月の最初の usage だけが残る。
-        approx(t.add_usage(&u, 202606), 32.0);
+        // 翌月（前進）になったら累計はリセットされ、その月の最初の usage だけが残る。
+        assert_eq!(t.add_usage(&u, 202606), 32 * USD);
         assert_eq!(t.current_month, 202606);
+    }
+
+    #[test]
+    fn past_month_does_not_reset_budget_bypass() {
+        // P1 修正: 202605 -> 202604（過去月）-> 202605 のリセット悪用を防ぐ。
+        let mut t = CostTracker::new(BudgetConfig::default(), 202605);
+        let u = Usage {
+            audio_input_tokens: 500_000, // $16
+            ..Default::default()
+        };
+        t.add_usage(&u, 202605); // 累計 $16
+        // 過去月を渡してもリセットされず、現在の月に加算される。
+        assert_eq!(t.add_usage(&u, 202604), 32 * USD);
+        assert_eq!(t.current_month, 202605); // 月は遡らない
+    }
+
+    #[test]
+    fn invalid_month_does_not_reset() {
+        let mut t = CostTracker::new(BudgetConfig::default(), 202605);
+        let u = Usage {
+            audio_input_tokens: 500_000, // $16
+            ..Default::default()
+        };
+        t.add_usage(&u, 202605);
+        // 無効月（13 月、年 0 等）ではリセットせず加算（fail-closed）。
+        assert_eq!(t.add_usage(&u, 202613), 32 * USD);
+        assert_eq!(t.add_usage(&u, 0), 48 * USD);
+        assert_eq!(t.current_month, 202605);
     }
 
     #[test]
@@ -203,7 +305,7 @@ mod tests {
         let mut t = CostTracker::new(
             BudgetConfig {
                 enabled: false,
-                monthly_limit_usd: 1.0,
+                monthly_limit_nanodollars: 1 * USD,
             },
             202605,
         );
@@ -214,6 +316,7 @@ mod tests {
         t.add_usage(&big, 202605);
         assert!(!t.is_over_budget());
         assert!(t.can_start_session());
+        assert_eq!(t.remaining_nanodollars(), None);
         assert_eq!(t.remaining_usd(), None);
     }
 
@@ -222,7 +325,7 @@ mod tests {
         let mut t = CostTracker::new(
             BudgetConfig {
                 enabled: true,
-                monthly_limit_usd: 32.0,
+                monthly_limit_nanodollars: 32 * USD,
             },
             202605,
         );
@@ -234,13 +337,13 @@ mod tests {
         t.add_usage(&half, 202605); // 累計 $16
         assert!(!t.is_over_budget());
         assert!(t.can_start_session());
-        approx(t.remaining_usd().unwrap(), 16.0);
+        assert_eq!(t.remaining_nanodollars(), Some(16 * USD));
 
-        // 上限ちょうど ($32) に達したらブロック（fail-closed）。
+        // 上限ちょうど ($32) に達したらブロック（fail-closed、整数なので誤差なし）。
         t.add_usage(&half, 202605); // 累計 $32
         assert!(t.is_over_budget());
         assert!(!t.can_start_session());
-        approx(t.remaining_usd().unwrap(), 0.0);
+        assert_eq!(t.remaining_nanodollars(), Some(0));
     }
 
     #[test]
@@ -248,7 +351,7 @@ mod tests {
         let mut t = CostTracker::new(
             BudgetConfig {
                 enabled: true,
-                monthly_limit_usd: 10.0,
+                monthly_limit_nanodollars: 10 * USD,
             },
             202605,
         );
@@ -257,8 +360,7 @@ mod tests {
             ..Default::default()
         };
         t.add_usage(&over, 202605);
-        // 残額は負にならず 0 にクランプ。
-        approx(t.remaining_usd().unwrap(), 0.0);
+        assert_eq!(t.remaining_nanodollars(), Some(0)); // 負にならず 0
         assert!(t.is_over_budget());
     }
 }
