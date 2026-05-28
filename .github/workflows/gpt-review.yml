@@ -44,21 +44,23 @@ jobs:
 
       - name: Get PR diff and metadata
         id: pr_data
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git fetch origin "$BASE_REF"
 
           # Get diff excluding non-code files
-          DIFF=$(git diff origin/${{ github.event.pull_request.base.ref }}...HEAD \
+          DIFF=$(git diff "origin/${BASE_REF}...HEAD" \
             -- . ':!*.md' ':!*.json' ':!*.lock' ':!*.yaml' ':!*.yml' \
             ':!node_modules/*' ':!dist/*' ':!build/*' ':!*.min.js' ':!*.min.css' \
             ':!package-lock.json' ':!pnpm-lock.yaml' ':!yarn.lock' \
-            | head -c ${{ env.MAX_DIFF_SIZE }})
+            | head -c "$MAX_DIFF_SIZE")
 
           # Get changed files list
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD | head -50)
+          CHANGED_FILES=$(git diff --name-only "origin/${BASE_REF}...HEAD" | head -50)
 
           # Get stats
-          STATS=$(git diff --stat origin/${{ github.event.pull_request.base.ref }}...HEAD | tail -1)
+          STATS=$(git diff --stat "origin/${BASE_REF}...HEAD" | tail -1)
 
           {
             echo 'diff<<EOF'
@@ -376,10 +378,12 @@ jobs:
 
       - name: Get PR diff
         id: diff
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          DIFF=$(git diff origin/${{ github.event.pull_request.base.ref }}...HEAD \
-            -- . ':!*.md' ':!*.json' ':!*.lock' | head -c ${{ env.MAX_DIFF_SIZE }})
+          git fetch origin "$BASE_REF"
+          DIFF=$(git diff "origin/${BASE_REF}...HEAD" \
+            -- . ':!*.md' ':!*.json' ':!*.lock' | head -c "$MAX_DIFF_SIZE")
           {
             echo 'content<<EOF'
             echo "$DIFF"
