@@ -291,7 +291,9 @@ impl SecretStore for StrongholdSecretStore {
                 .create_client(CLIENT_PATH)
                 .map_err(|_| SecretError::Backend)?,
         };
-        client
+        // `insert` returns any previous value; wrap it so a replaced key's
+        // plaintext is zeroized rather than left lingering on the heap.
+        let previous = client
             .store()
             .insert(
                 name.as_bytes().to_vec(),
@@ -299,6 +301,7 @@ impl SecretStore for StrongholdSecretStore {
                 None,
             )
             .map_err(|_| SecretError::Backend)?;
+        drop(previous.map(Zeroizing::new));
         // Persisting must succeed; a swallowed save would lose the key silently.
         stronghold.save().map_err(|_| SecretError::Backend)?;
         Ok(())
@@ -338,10 +341,12 @@ impl SecretStore for StrongholdSecretStore {
             Some(client) => client,
             None => return Ok(()),
         };
-        client
+        // Zeroize the removed value rather than dropping the plaintext as-is.
+        let removed = client
             .store()
             .delete(name.as_bytes())
             .map_err(|_| SecretError::Backend)?;
+        drop(removed.map(Zeroizing::new));
         stronghold.save().map_err(|_| SecretError::Backend)?;
         Ok(())
     }
@@ -359,11 +364,12 @@ impl SecretStore for StrongholdSecretStore {
             // No client yet = legitimately empty.
             None => return Ok(false),
         };
-        Ok(client
+        // `contains_key` avoids materializing (and having to zeroize) the
+        // plaintext value just to test presence.
+        client
             .store()
-            .get(name.as_bytes())
-            .map_err(|_| SecretError::Backend)?
-            .is_some())
+            .contains_key(name.as_bytes())
+            .map_err(|_| SecretError::Backend)
     }
 }
 
