@@ -43,7 +43,12 @@ impl SequenceCounter {
 /// tool_dispatcher (koe-2gy) hold clones of the SAME `Arc<SequenceCounter>`;
 /// koe-2gy obtains it through `tauri::State<'_, ManagedSequenceCounter>` rather
 /// than importing the gate.
-pub struct ManagedSequenceCounter(pub Arc<SequenceCounter>);
+///
+/// `lib.rs` registers this now so the counter is shared from day one, but its
+/// only *reader* is the not-yet-merged tool_dispatcher (koe-2gy) — hence
+/// `#[allow(dead_code)]` on the field (interface-first, like
+/// `secret_store::SecretStore::get_api_key`), not skeleton.
+pub struct ManagedSequenceCounter(#[allow(dead_code)] pub Arc<SequenceCounter>);
 
 #[cfg(test)]
 mod tests {

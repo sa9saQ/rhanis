@@ -1,11 +1,16 @@
+mod approval_gate;
 mod cost_tracker;
+mod events;
 mod secret_store;
 mod storage;
+mod validation;
 
 use std::sync::Arc;
 
 use tauri::Manager;
 
+use approval_gate::{resolve_tool_approval, ApprovalGate, ManagedApprovalGate};
+use events::{ManagedSequenceCounter, SequenceCounter};
 use secret_store::{
     delete_openai_api_key, has_openai_api_key, set_openai_api_key, KeychainPassword,
     ManagedSecretStore, StrongholdSecretStore,
@@ -50,13 +55,23 @@ pub fn run() {
             // session_manager koe-e3m) reach it via tauri::State<ManagedRecorder>.
             let recorder = SqliteAdapter::open(&data_dir.join("koe.db"))?;
             app.manage(ManagedRecorder(Arc::new(recorder)));
+
+            // Approval gate (koe-1vi). One process-wide activity-event sequence
+            // is shared between the gate (ApprovalRequest.sequence) and the
+            // future tool_dispatcher (koe-2gy, ToolEvent.sequence) — koe-2gy
+            // obtains it via tauri::State<ManagedSequenceCounter>, not by
+            // importing the gate, so the two never grow divergent counters.
+            let sequence = Arc::new(SequenceCounter::new());
+            app.manage(ManagedSequenceCounter(Arc::clone(&sequence)));
+            app.manage(ManagedApprovalGate(Arc::new(ApprovalGate::new(sequence))));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             greet,
             set_openai_api_key,
             has_openai_api_key,
-            delete_openai_api_key
+            delete_openai_api_key,
+            resolve_tool_approval
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

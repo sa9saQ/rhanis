@@ -33,6 +33,12 @@ getrandom = "0.2"
 # builds). tauri-plugin-sql is intentionally NOT used: it would expose a SQL
 # surface to the WebView, the same risk the disabled stronghold plugin avoids.
 rusqlite = { version = "0.37", features = ["bundled"] }
+# Approval gate (koe-1vi): a per-request `oneshot` channel carries the human
+# decision back to the awaiting tool task, and `time::timeout` enforces the 30s
+# fail-closed deadline. Tauri already pulls tokio in transitively, but the
+# approval gate depends on these APIs directly, so it is declared explicitly
+# (`rt`/`macros` are needed for the `#[tokio::test]` timeout tests).
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 
 # OS keychain for the 32-byte Stronghold snapshot key. Platform-split so the
 # crate compiles both on the Windows target and in the WSL/Linux dev box used
