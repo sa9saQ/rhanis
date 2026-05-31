@@ -3,6 +3,7 @@ mod cost_tracker;
 mod events;
 mod realtime_types;
 mod secret_store;
+mod session_manager;
 mod settings_store;
 mod storage;
 mod tool_dispatcher;
@@ -24,6 +25,7 @@ use settings_store::{
     JsonSettingsStore, ManagedSettings,
 };
 use realtime_types::ManagedDispatcher;
+use session_manager::{start_session, stop_session, ManagedSession};
 use storage::{
     adapter::{ManagedRecorder, RecorderAdapter},
     sqlite::SqliteAdapter,
@@ -94,6 +96,10 @@ pub fn run() {
             let settings = JsonSettingsStore::new(settings_path);
             app.manage(ManagedSettings(Arc::new(settings)));
 
+            // Realtime session (koe-e3m): the RealToolDispatcher managed above
+            // (koe-2gy) is read by session_manager via tauri::State<ManagedDispatcher>.
+            app.manage(ManagedSession::new());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -105,6 +111,8 @@ pub fn run() {
             complete_onboarding,
             save_budget_config,
             set_recorder_adapter,
+            start_session,
+            stop_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
