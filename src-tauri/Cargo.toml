@@ -47,18 +47,39 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 # is declared explicitly so StreamExt does not depend on a transitive feature.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "async-await"] }
 
-# OS keychain for the 32-byte Stronghold snapshot key. Platform-split so the
-# crate compiles both on the Windows target and in the WSL/Linux dev box used
-# for `cargo test` (pure-Rust secret-service backend, no system libs needed).
-[target.'cfg(windows)'.dependencies]
-keyring = { version = "3", features = ["windows-native"] }
+# HTTP client for the web_search tool (Bing Search API, koe-s7i). rustls-tls
+# (pure Rust) is used for the same reason as tokio-tungstenite: reliable
+# `cargo test` on WSL/Linux without a system TLS library.
+#
+# NOTE: these four crates (reqwest, xcap, image, dirs-next) MUST live in the
+# normal `[dependencies]` table, NOT under `cfg(not(windows))`. Windows is the
+# M1 ship target, and web_search.rs / take_screenshot.rs / read_file.rs use them
+# unconditionally (on Windows too). Putting them under cfg(not(windows)) made the
+# Windows build fail to resolve these crates (koe-s7i P1-1). They all build on
+# every target (Windows / macOS / Linux), so no platform gating is needed here —
+# only `libc` below is genuinely Unix-only.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
-[target.'cfg(not(windows))'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+# Screenshot capture for the take_screenshot tool (koe-s7i). xcap provides a
+# cross-platform API (Windows / macOS / Linux X11). The real screen-capture call
+# is OS-specific; pure-logic paths (path building, size cap, encoding) are
+# unit-testable on WSL without a display via feature-flagged stubbing.
+xcap = "0.3"
+
+# PNG encoding for take_screenshot output (dependency of xcap; explicit here so
+# we can call png::Encoder directly when size-capping the raw RGBA capture).
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Directory discovery for the read_file default allowlist (Documents, Desktop).
+# koe-351 will replace the callers with user-configurable policy from
+# JsonSettingsStore; the seam is the `allowed_bases` parameter.
+dirs-next = "2"
 
 # Audio bridge (koe-flu): cpal for mic capture, rodio for playback.
 # cpal: cross-platform audio I/O — Windows WASAPI / macOS CoreAudio / Linux ALSA.
 # rodio: high-level playback on top of cpal; handles PCM sink + format negotation.
+# These MUST be unconditional [dependencies] (Windows is the M1 ship target and
+# audio_bridge.rs uses them on every platform); they build on Windows/macOS/Linux.
 # Resampling: handled by the hand-rolled resample_mono_linear() in audio_bridge.rs
 # (linear interpolation, voice-adequate for the cpal device-rate ratios in use).
 #
@@ -76,6 +97,21 @@ rodio = { version = "0.20", default-features = false, features = ["symphonia-wav
 # 16000→24000). Re-add rubato if higher-quality resampling is required later.
 # base64 for encoding PCM16 chunks into the OpenAI input_audio_buffer.append frame
 base64 = "0.22"
+
+# OS keychain for the 32-byte Stronghold snapshot key. Platform-split so the
+# crate compiles both on the Windows target and in the WSL/Linux dev box used
+# for `cargo test` (pure-Rust secret-service backend, no system libs needed).
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(not(windows))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+# Raw syscall access for the openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)
+# TOCTOU-safe open on Linux (koe-s7i read_file). Not needed on Windows (handled
+# via FILE_FLAG_OPEN_REPARSE_POINT). libc is the ONLY genuinely Unix-only crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

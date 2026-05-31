@@ -130,7 +130,8 @@ impl ToolRegistry {
     }
 
     /// Schemas of every registered tool (order is unspecified). For `session.update`.
-    fn schemas(&self) -> Vec<ToolSchema> {
+    /// Public so `tools/mod.rs` tests can inspect the registry directly.
+    pub fn tool_schemas(&self) -> Vec<ToolSchema> {
         self.tools.values().map(|t| t.schema.clone()).collect()
     }
 }
@@ -215,7 +216,7 @@ impl DispatcherSeam for RealToolDispatcher {
     }
 
     fn tool_schemas(&self) -> Vec<ToolSchema> {
-        self.registry.schemas()
+        self.registry.tool_schemas()
     }
 }
 
@@ -272,6 +273,19 @@ async fn dispatch_impl(
             ));
             return function_call_output(&call_id, error_output("user declined"));
         }
+    }
+
+    // (5.5) run_command ALLOW_LIST: checked AFTER deny-list (step 3) AND after
+    // the human gate (step 5). Only commands whose executable basename appears in
+    // `tools::ALLOW_COMMANDS` may proceed. A command that passes the deny-list and
+    // survives human approval but is NOT in the allow-list is blocked here.
+    // CLAUDE.md: "DENY_LIST … を先に判定、その後 ALLOW_LIST ホワイトリスト".
+    if name == "run_command" && !crate::tools::command_is_allowed(&args) {
+        io.emit_tool_event(make_event(
+            &seq, &name, &call_id, "error",
+            start_summary(&name), Some("command not in allow list".to_string()),
+        ));
+        return function_call_output(&call_id, error_output("command not permitted"));
     }
 
     // (6) run the tool. Unregistered → safe stub (koe-s7i fills these in).
@@ -368,11 +382,9 @@ fn args_too_large(args: &Value) -> bool {
 /// extensions, lowercases it, and rejects if it is in [`DENY_TOKENS`]. Also
 /// rejects any PowerShell encoded-command flag anywhere in the string.
 ///
-/// TODO(koe-s7i): when `run_command` is actually registered, add an ALLOW_LIST
-/// (`command_is_allowed`) as a second gate AFTER this DENY check and the human
-/// approval, per CLAUDE.md. Today `run_command` is unregistered (stub), so the
-/// DANGER human gate is the only active control and this DENY list is the
-/// belt-and-suspenders pre-gate.
+/// DENY check is step 3 in the dispatch flow; the ALLOW_LIST (`command_is_allowed`
+/// in `tools/mod.rs`) is step 5.5 — called after this AND after the 30s human
+/// gate (koe-s7i). Per CLAUDE.md: "DENY_LIST … を先に判定、その後 ALLOW_LIST ホワイトリスト".
 fn command_is_denied(args: &Value) -> bool {
     let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
     let low = cmd.to_ascii_lowercase();
@@ -538,6 +550,33 @@ mod tests {
         assert!(out.contains("security policy"));
     }
 
+    #[tokio::test]
+    async fn run_command_allowlist_blocks_after_gate() {
+        // `python` passes the DENY_LIST (not a deny-listed command) but is NOT in
+        // ALLOW_COMMANDS. Even with human approval (Approved), the dispatcher's
+        // step 5.5 ALLOW_LIST check must block it and return "not permitted".
+        //
+        // This mirrors `run_command_denylist_blocks_before_gate` for the ALLOW_LIST
+        // path: deny-list check (step 3) passes → human gate fires and approves
+        // (step 5) → ALLOW_LIST gate (step 5.5) rejects.
+        let io = MockIo::new(ApprovalOutcome::Approved);
+        let res = run(
+            &io,
+            Arc::new(ToolRegistry::new()),
+            call("run_command", serde_json::json!({"command": "python script.py"})),
+        )
+        .await;
+        // Phases: start (step 2) → error (step 5.5 ALLOW_LIST block).
+        // The human gate fires between those two phases (Approved), then the
+        // ALLOW_LIST check terminates with an error.
+        assert_eq!(io.phases(), vec!["start", "error"]);
+        let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
+        assert!(
+            out.contains("not permitted"),
+            "ALLOW_LIST block must say 'not permitted', got: {out}"
+        );
+    }
+
     #[test]
     fn denylist_is_token_level_not_substring() {
         // basename `format` is blocked …
@@ -587,7 +626,7 @@ mod tests {
     #[test]
     fn registry_schemas_round_trip() {
         let r = echo_registry();
-        let schemas = r.schemas();
+        let schemas = r.tool_schemas();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0].name, "write_note");
     }
