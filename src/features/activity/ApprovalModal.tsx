@@ -1,4 +1,5 @@
-// Human-in-the-loop approval for CAUTION / DANGER operations. Shows the head of
+// Human-in-the-loop approval for DANGER operations (M1; CAUTION is notify-only
+// and never populates this queue — see types.ts ApprovalRisk). Shows the head of
 // the FIFO approval queue, a live countdown to the backend's 30s oneshot
 // deadline, and approve / deny actions that echo `approvalId` back to Rust.
 //
