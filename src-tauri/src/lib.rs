@@ -1,9 +1,12 @@
 mod approval_gate;
 mod cost_tracker;
 mod events;
+mod realtime_types;
 mod secret_store;
 mod settings_store;
 mod storage;
+mod tool_dispatcher;
+mod tools;
 mod validation;
 
 use std::sync::Arc;
@@ -20,7 +23,12 @@ use settings_store::{
     complete_onboarding, get_app_settings, save_budget_config, set_recorder_adapter,
     JsonSettingsStore, ManagedSettings,
 };
-use storage::{adapter::ManagedRecorder, sqlite::SqliteAdapter};
+use realtime_types::ManagedDispatcher;
+use storage::{
+    adapter::{ManagedRecorder, RecorderAdapter},
+    sqlite::SqliteAdapter,
+};
+use tool_dispatcher::{AppDispatchIo, RealToolDispatcher, ToolRegistry};
 
 /// Keychain identifiers for the Stronghold snapshot decryption key.
 const KEYCHAIN_SERVICE: &str = "com.zsaku.koe";
@@ -52,8 +60,9 @@ pub fn run() {
             // snapshots in a Rust-owned SQLite DB beside the secret snapshot.
             // No WebView SQL surface; consumers (write_note tool koe-s7i,
             // session_manager koe-e3m) reach it via tauri::State<ManagedRecorder>.
-            let recorder = SqliteAdapter::open(&data_dir.join("koe.db"))?;
-            app.manage(ManagedRecorder(Arc::new(recorder)));
+            let recorder: Arc<dyn RecorderAdapter> =
+                Arc::new(SqliteAdapter::open(&data_dir.join("koe.db"))?);
+            app.manage(ManagedRecorder(Arc::clone(&recorder)));
 
             // Approval gate (koe-1vi). One process-wide activity-event sequence
             // is shared between the gate (ApprovalRequest.sequence) and the
@@ -62,7 +71,22 @@ pub fn run() {
             // importing the gate, so the two never grow divergent counters.
             let sequence = Arc::new(SequenceCounter::new());
             app.manage(ManagedSequenceCounter(Arc::clone(&sequence)));
-            app.manage(ManagedApprovalGate(Arc::new(ApprovalGate::new(sequence))));
+            // ONE ApprovalGate Arc is shared by the `resolve_tool_approval`
+            // command's state AND the dispatcher below, so a resolve reaches the
+            // exact pending request the dispatcher is awaiting. Two separate
+            // `Arc::new(ApprovalGate::new(..))` would split the pending map and
+            // DANGER approvals would never resolve.
+            let gate = Arc::new(ApprovalGate::new(Arc::clone(&sequence)));
+            app.manage(ManagedApprovalGate(Arc::clone(&gate)));
+
+            // Tool dispatcher (koe-2gy). Shares the one gate + sequence and emits
+            // tool-events via the real AppHandle. write_note is registered now;
+            // koe-s7i plugs the remaining tools into the same registry.
+            let io = Arc::new(AppDispatchIo::new(app.handle().clone(), Arc::clone(&gate)));
+            let mut registry = ToolRegistry::new();
+            tools::register_m1_tools(&mut registry, Arc::clone(&recorder));
+            let dispatcher = RealToolDispatcher::new(io, Arc::clone(&sequence), Arc::new(registry));
+            app.manage(ManagedDispatcher(Arc::new(dispatcher)));
 
             // Settings persistence (koe-200): onboarding flag + budget config +
             // recorder adapter choice. Rust-owned JSON; no WebView file surface.

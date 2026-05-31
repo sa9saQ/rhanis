@@ -7,8 +7,12 @@
 //! | tier    | tools                                            | flow                     |
 //! |---------|--------------------------------------------------|--------------------------|
 //! | SAFE    | web_search / read_file / take_screenshot / write_note | run immediately     |
-//! | CAUTION | write_file / open_url / open_app                 | confirm before running   |
+//! | CAUTION | write_file / open_url / open_app                 | notify, then run now      |
 //! | DANGER  | run_command / delete_file / external_upload      | confirm before running   |
+//!
+//! Per the user decision (memory `koe-caution-tier`): CAUTION is **notify-only**
+//! — the dispatcher emits a non-blocking `tool-event` notification and runs the
+//! tool immediately. Only DANGER goes through the human gate below.
 //!
 //! The confirmation is fail-closed: a request that is denied, times out (30s),
 //! or whose channel is dropped resolves to [`ApprovalOutcome::Declined`]. Only an
@@ -16,7 +20,8 @@
 //!
 //! ## Frontend contract (src/features/activity/types.ts — the source of truth)
 //! - emit `tool-approval-required` with
-//!   `{ approvalId, tool, risk: "CAUTION"|"DANGER", displaySummary, deadlineAt, sequence }`
+//!   `{ approvalId, tool, risk: "DANGER", displaySummary, deadlineAt, sequence }`
+//!   (M1 emits DANGER only; "CAUTION" stays reserved in the union — see types.ts)
 //! - command `resolve_tool_approval` accepting `{ approvalId, decision: "approve"|"deny" }`,
 //!   routed to the matching pending request by `approvalId`. Unknown / already
 //!   resolved / timed-out ids are rejected (fail-closed) — a stale click can
@@ -77,12 +82,14 @@ pub enum ApprovalRisk {
 }
 
 impl ApprovalRisk {
-    /// Whether this tier must be confirmed by a human before the tool runs.
-    /// Consumed by the tool_dispatcher (koe-2gy) to decide SAFE → run now vs
-    /// CAUTION/DANGER → `request_approval`.
-    #[allow(dead_code)]
+    /// Whether this tier must be confirmed by a human (the 30s gate) before the
+    /// tool runs. Per the user decision (memory `koe-caution-tier`): **only
+    /// DANGER** gates. SAFE runs immediately with no notification; CAUTION emits
+    /// a non-blocking `tool-event` notification and then runs immediately (it
+    /// does NOT wait for approval). Consumed by the tool_dispatcher (koe-2gy) to
+    /// route SAFE/CAUTION → run now vs DANGER → `request_approval`.
     pub fn requires_approval(self) -> bool {
-        !matches!(self, ApprovalRisk::Safe)
+        matches!(self, ApprovalRisk::Danger)
     }
 }
 
@@ -112,7 +119,6 @@ pub enum ApprovalOutcome {
 /// rather than merely prompting.
 ///
 /// Consumed by the tool_dispatcher (koe-2gy).
-#[allow(dead_code)]
 pub fn classify(tool: &str) -> ApprovalRisk {
     match tool {
         "web_search" | "read_file" | "take_screenshot" | "write_note" => ApprovalRisk::Safe,
@@ -145,6 +151,26 @@ struct ApprovalRequestPayload<'a> {
 struct PendingApproval {
     tx: oneshot::Sender<ApprovalDecision>,
     expires_at: Instant,
+}
+
+/// RAII guard that removes a pending approval entry when the awaiting future is
+/// dropped before it completes — e.g. the dispatch task is aborted on session
+/// stop or a budget trip. Without it an aborted DANGER approval would leave an
+/// orphaned sender in `pending` (a bounded memory leak plus a stale
+/// UI/backend divergence). Removal is idempotent with `await_decision`'s own
+/// cleanup, so arming it on every request is safe.
+///
+/// The `&'a ApprovalGate` borrow means the guard is created and dropped within
+/// `request_approval`'s stack frame; it is never moved into a separate task.
+struct PendingGuard<'a> {
+    gate: &'a ApprovalGate,
+    approval_id: String,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.remove_pending(&self.approval_id);
+    }
 }
 
 /// Routes human approval decisions to the tool task awaiting them.
@@ -252,13 +278,12 @@ impl ApprovalGate {
     }
 
     /// Emits an approval request and awaits the human decision (fail-closed,
-    /// 30s). Consumed by the tool_dispatcher (koe-2gy) for CAUTION/DANGER tools;
-    /// no in-crate caller yet.
+    /// 30s). Consumed by the tool_dispatcher (koe-2gy) for DANGER tools only
+    /// (CAUTION is notify-only and never calls this — koe-caution-tier).
     ///
     /// `display_summary` MUST be pre-redacted by the caller (no key / absolute
     /// path / PII) — it is shown (after a defensive length cap) in the modal.
     /// The cap is belt-and-suspenders; redaction remains the caller's job.
-    #[allow(dead_code)]
     pub async fn request_approval(
         &self,
         app: &tauri::AppHandle,
@@ -269,6 +294,14 @@ impl ApprovalGate {
         use tauri::Emitter;
 
         let (approval_id, sequence, rx) = self.register();
+        // RAII safety net: if this future is dropped (e.g. the dispatch task is
+        // aborted on session stop / budget trip) before `await_decision` removes
+        // the entry, the guard removes it so no orphaned sender leaks in
+        // `pending`. Removal is idempotent with `await_decision`'s own cleanup.
+        let _guard = PendingGuard {
+            gate: self,
+            approval_id: approval_id.clone(),
+        };
         let deadline_at = now_ms().saturating_add(self.timeout_millis());
         let display_summary = truncate_summary(&display_summary);
 
@@ -292,6 +325,12 @@ impl ApprovalGate {
     /// error strings. Returns `Err` for an unknown / already-resolved /
     /// expired `approval_id`, or when the awaiting side has already gone away.
     fn resolve(&self, approval_id: &str, decision: ApprovalDecision) -> Result<(), &'static str> {
+        // Bound the input: a valid id is "appr-" + 32 hex = 37 chars. Reject
+        // anything wildly longer up front (leak-free fixed message), so a
+        // misbehaving caller cannot push huge keys at the pending map.
+        if approval_id.len() > 64 {
+            return Err("unknown approval");
+        }
         // Remove first: a second resolve (or a resolve racing the timeout) then
         // finds nothing and is rejected, so a decision is delivered at most once.
         let entry = {
@@ -408,9 +447,12 @@ mod tests {
     }
 
     #[test]
-    fn safe_does_not_require_approval_others_do() {
+    fn only_danger_requires_approval() {
+        // Per the user decision (koe-caution-tier): SAFE and CAUTION both run
+        // immediately (CAUTION emits a non-blocking notification, no gate); only
+        // DANGER goes through the 30s human gate.
         assert!(!ApprovalRisk::Safe.requires_approval());
-        assert!(ApprovalRisk::Caution.requires_approval());
+        assert!(!ApprovalRisk::Caution.requires_approval());
         assert!(ApprovalRisk::Danger.requires_approval());
     }
 
@@ -629,5 +671,34 @@ mod tests {
         let multi = "あ".repeat(1000);
         let tm = truncate_summary(&multi);
         assert!(tm.is_char_boundary(tm.len()));
+    }
+
+    // ---- pending guard (aborted request future) ------------------------------
+
+    #[test]
+    fn pending_guard_removes_entry_when_request_future_is_dropped() {
+        // Mimics the dispatch task being aborted after the request registered but
+        // before a decision: the PendingGuard (held in request_approval's frame)
+        // drops and removes the entry, so no orphaned sender leaks in `pending`.
+        let g = gate();
+        let (id, _seq, _rx) = g.register();
+        assert_eq!(g.pending_len(), 1);
+        {
+            let _guard = PendingGuard {
+                gate: &g,
+                approval_id: id,
+            };
+            // guard drops at scope end (stands in for the future being dropped)
+        }
+        assert_eq!(g.pending_len(), 0);
+    }
+
+    #[test]
+    fn resolve_rejects_oversized_id_input() {
+        // The command-level length guard rejects an absurdly long id before it
+        // reaches the pending map.
+        let g = gate();
+        let huge = "x".repeat(100);
+        assert_eq!(g.resolve(&huge, ApprovalDecision::Approve), Err("unknown approval"));
     }
 }

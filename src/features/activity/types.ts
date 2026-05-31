@@ -37,15 +37,24 @@ export interface ToolEvent {
   progress?: number;
 }
 
-/** Risk tier of an operation requiring confirmation (see CLAUDE.md safety gate). */
+/**
+ * Risk tier of an operation (see CLAUDE.md safety gate). This union is a
+ * forward-looking superset: in M1 the backend only ever emits an
+ * `ApprovalRequest` for **DANGER** (the 30s human gate). CAUTION is
+ * notify-only — it rides a non-blocking `tool-event` (with a `detail` note) and
+ * never produces an `ApprovalRequest` (user decision `koe-caution-tier`). The
+ * `"CAUTION"` member is retained for a future milestone that may surface CAUTION
+ * in the approval UI.
+ */
 export type ApprovalRisk = "CAUTION" | "DANGER";
 
 /**
  * Emitted by the backend on the `tool-approval-required` channel when a
- * DANGER (or CAUTION) operation needs a human decision. The UI must echo
- * `approvalId` back via `resolve_tool_approval` so the backend can route the
- * answer to the exact pending oneshot. Anything not answered by `deadlineAt`
- * is treated as declined by the backend (fail-closed, 30s timeout).
+ * **DANGER** operation needs a human decision (M1 emits this for DANGER only;
+ * CAUTION runs immediately — see `ApprovalRisk`). The UI must echo `approvalId`
+ * back via `resolve_tool_approval` so the backend can route the answer to the
+ * exact pending oneshot. Anything not answered by `deadlineAt` is treated as
+ * declined by the backend (fail-closed, 30s timeout).
  */
 export interface ApprovalRequest {
   /** Correlation id; echoed back in `resolve_tool_approval`. */
