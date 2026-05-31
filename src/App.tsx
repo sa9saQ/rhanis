@@ -4,6 +4,8 @@ import { ActivityLog } from "./features/activity/ActivityLog";
 import { ApprovalModal } from "./features/activity/ApprovalModal";
 import { DevMockEmitter } from "./features/activity/DevMockEmitter";
 import { useActivityEvents } from "./features/activity/useActivityEvents";
+import { VoiceButton } from "./features/session/VoiceButton";
+import { useSessionEvents } from "./features/session/useSessionEvents";
 import { OnboardingGate } from "./features/settings/OnboardingGate";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
 import "./App.css";
@@ -12,6 +14,8 @@ function ActivityConsole() {
   // Subscribe to the backend tool-event / approval / status streams for the
   // app's lifetime.
   useActivityEvents();
+  // Subscribe to the backend session-status stream; drives sessionStore.
+  useSessionEvents();
 
   const [showSettings, setShowSettings] = useState(false);
 
@@ -29,6 +33,8 @@ function ActivityConsole() {
         </button>
       </div>
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {/* Primary MVP control — start / stop the Realtime session. */}
+      <VoiceButton />
       <ActivityLog />
       {import.meta.env.DEV && <DevMockEmitter />}
       <ApprovalModal />

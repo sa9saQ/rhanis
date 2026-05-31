@@ -1,0 +1,132 @@
+/* VoiceButton — the main start/stop control for the Realtime session.
+ *
+ * Anti-AI-smell: no Inter, no purple/blue gradient. Single solid accent.
+ * Radii intentionally varied from other panels (10px here vs 14px panel,
+ * 999px for inner spinner). Durations per motion role (not all 300ms).
+ */
+
+.koe-voice-button-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ── Base button ── */
+.koe-voice-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 14px 36px;
+  border-radius: 10px;
+  border: 2px solid transparent;
+  font-family: var(--font-ui);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  /* Spring easing for human-initiated interactions (anti-AI-smell rule). */
+  transition:
+    background-color var(--dur-hover) var(--ease-spring),
+    border-color var(--dur-hover) var(--ease-spring),
+    transform var(--dur-hover) var(--ease-spring),
+    opacity var(--dur-hover) var(--ease-spring);
+  user-select: none;
+  min-width: 120px;
+}
+
+.koe-voice-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.koe-voice-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.koe-voice-btn:not(:disabled):active {
+  transform: scale(0.97);
+}
+
+/* ── Tone variants ── */
+
+/* idle — neutral, invites action */
+.koe-voice-tone-idle {
+  background: var(--panel-2);
+  border-color: var(--border);
+  color: var(--text);
+}
+.koe-voice-tone-idle:not(:disabled):hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* loading — muted, disabled interaction */
+.koe-voice-tone-loading {
+  background: var(--panel-2);
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+/* connected — solid accent, shows the active state */
+.koe-voice-tone-connected {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0d1117;
+}
+.koe-voice-tone-connected:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent) 85%, white);
+}
+
+/* error — danger tone, invites retry */
+.koe-voice-tone-error {
+  background: var(--panel-2);
+  border-color: var(--tone-error);
+  color: var(--tone-error);
+}
+.koe-voice-tone-error:not(:disabled):hover {
+  background: color-mix(in srgb, var(--tone-error) 12%, transparent);
+}
+
+/* ── Spinner (loading state) ── */
+.koe-voice-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, var(--muted) 30%, transparent);
+  border-top-color: var(--muted);
+  animation: koe-voice-spin 0.7s linear infinite;
+  flex: none;
+}
+
+/* ── Error message ── */
+.koe-voice-error {
+  margin: 0;
+  font-size: 13px;
+  color: var(--tone-error);
+  background: color-mix(in srgb, var(--tone-error) 10%, transparent);
+  border-left: 3px solid var(--tone-error);
+  padding: 8px 12px;
+  border-radius: 6px;
+  max-width: 340px;
+  text-align: left;
+}
+
+/* ── Animations ── */
+@keyframes koe-voice-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .koe-voice-spinner {
+    animation: none;
+  }
+  .koe-voice-btn {
+    transition: none;
+  }
+}

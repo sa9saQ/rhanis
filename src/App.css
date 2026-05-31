@@ -23,7 +23,8 @@
   --tone-connecting: #d99a2b;
   --tone-conversing: #3fb6a8;
   --tone-working: #4ade80;
-  --tone-error: #e5564b;
+  /* Contrast on --panel-2 (#232733): #f0706a gives ~5.4:1 (was #e5564b ~4.3:1, below AA). */
+  --tone-error: #f0706a;
 
   /* Motion — distinct easings + durations per role (never a bare `ease`). */
   --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
