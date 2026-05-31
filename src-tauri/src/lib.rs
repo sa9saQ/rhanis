@@ -1,4 +1,5 @@
 mod approval_gate;
+mod audio_bridge;
 mod cost_tracker;
 mod events;
 mod realtime_types;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use tauri::Manager;
 
 use approval_gate::{resolve_tool_approval, ApprovalGate, ManagedApprovalGate};
+use audio_bridge::ManagedAudioBridge;
 use events::{ManagedSequenceCounter, SequenceCounter};
 use secret_store::{
     delete_openai_api_key, has_openai_api_key, set_openai_api_key, KeychainPassword,
@@ -99,6 +101,12 @@ pub fn run() {
             // Realtime session (koe-e3m): the RealToolDispatcher managed above
             // (koe-2gy) is read by session_manager via tauri::State<ManagedDispatcher>.
             app.manage(ManagedSession::new());
+
+            // Audio bridge (koe-flu): cpal mic capture + rodio playback.
+            // Start/stop is driven by session_manager (start_session / stop_session)
+            // via tauri::State<ManagedAudioBridge>. The bridge is idle until a
+            // session begins; device open happens inside start_session.
+            app.manage(ManagedAudioBridge::new());
 
             Ok(())
         })
