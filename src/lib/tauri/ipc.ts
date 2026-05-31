@@ -34,6 +34,9 @@ export const COMMAND = {
   setOpenaiApiKey: "set_openai_api_key",
   hasOpenaiApiKey: "has_openai_api_key",
   deleteOpenaiApiKey: "delete_openai_api_key",
+  // Session lifecycle commands (koe-e3m)
+  startSession: "start_session",
+  stopSession: "stop_session",
 } as const;
 
 /** Subscribe to live tool events. Returns an unlisten function. */
@@ -125,4 +128,23 @@ export function hasOpenaiApiKey(): Promise<boolean> {
 /** Deletes the stored OpenAI API key. */
 export function deleteOpenaiApiKey(): Promise<void> {
   return invoke(COMMAND.deleteOpenaiApiKey);
+}
+
+// ---------------------------------------------------------------------------
+// Session lifecycle commands (koe-e3m)
+// ---------------------------------------------------------------------------
+
+/**
+ * Starts a Realtime session: connects the BYOK WebSocket, registers tools, and
+ * begins the read loop. Rejects (fail-closed) if onboarding is incomplete, the
+ * monthly budget is exceeded, or no API key is stored. Live connection status
+ * arrives on the `session-status` channel.
+ */
+export function startSession(): Promise<void> {
+  return invoke(COMMAND.startSession);
+}
+
+/** Stops the active Realtime session. Idempotent (no-op if already stopped). */
+export function stopSession(): Promise<void> {
+  return invoke(COMMAND.stopSession);
 }

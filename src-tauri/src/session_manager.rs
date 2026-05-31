@@ -217,6 +217,10 @@ async fn run_read_loop<S, F>(
     // drains them instead, so their side effects (e.g. a note write) and final
     // response frames complete rather than being killed mid-flight.
     let abort_inflight: bool;
+    // An error exit must leave the terminal `error` status visible: emitting a
+    // trailing `idle` would make the frontend clear `lastError`, hiding the
+    // budget/connection/timeout reason (a near-silent failure).
+    let mut ended_with_error = false;
     loop {
         tokio::select! {
             _ = &mut shutdown => {
@@ -225,6 +229,7 @@ async fn run_read_loop<S, F>(
             }
             _ = &mut deadline => {
                 emit("error", Some("session timeout"));
+                ended_with_error = true;
                 abort_inflight = true;
                 break;
             }
@@ -236,7 +241,10 @@ async fn run_read_loop<S, F>(
                             &emit, &mut dispatch_tasks, &mut save_failures,
                         ).await {
                             LoopAction::Continue => {}
+                            // handle_text already emitted the terminal error
+                            // (budget exceeded / cost tracking unavailable).
                             LoopAction::Stop => {
+                                ended_with_error = true;
                                 abort_inflight = true;
                                 break;
                             }
@@ -251,6 +259,7 @@ async fn run_read_loop<S, F>(
                     Some(Ok(_)) => {}
                     Some(Err(_)) => {
                         emit("error", Some("connection error"));
+                        ended_with_error = true;
                         abort_inflight = true;
                         break;
                     }
@@ -267,10 +276,14 @@ async fn run_read_loop<S, F>(
     }
     // Clear the session slot on EVERY exit (server close / budget / timeout /
     // shutdown) so a stale `Some` cannot permanently block the next
-    // start_session. The read loop is the SINGLE place that emits the terminal
-    // idle (stop_session relies on this), so there is never a double transition.
+    // start_session. The read loop is the SINGLE place that emits a terminal
+    // status (stop_session relies on this), so there is never a double idle.
     session.lock().await.take();
-    emit("idle", None);
+    // Only a clean stop/close transitions to idle; an error exit leaves the
+    // already-emitted `error` as the terminal status so the UI keeps the reason.
+    if !ended_with_error {
+        emit("idle", None);
+    }
 }
 
 /// Handles one decoded server text frame. Returns whether to keep looping.
@@ -372,7 +385,10 @@ fn build_request(
         .map_err(|_| "invalid realtime url")?;
     let headers = request.headers_mut();
     headers.insert("Authorization", auth.bearer_header()?);
-    headers.insert("OpenAI-Beta", HeaderValue::from_static("realtime=v1"));
+    // gpt-realtime-2 is a GA model; the current Realtime WebSocket docs drop the
+    // `OpenAI-Beta: realtime=v1` header (it selected the now-superseded beta
+    // interface). The exact handshake headers + server event shapes are verified
+    // against the live API in koe-ef8 (Windows E2E).
     Ok(request)
 }
 
@@ -798,6 +814,8 @@ mod tests {
         .await;
         let events = log.lock().unwrap();
         assert!(events.iter().any(|(s, e)| s == "error" && e.as_deref() == Some("connection error")));
+        // error is terminal — no trailing idle that would clear the reason in the UI.
+        assert!(!events.iter().any(|(s, _)| s == "idle"));
     }
 
     #[tokio::test]
