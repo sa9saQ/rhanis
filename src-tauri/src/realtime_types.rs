@@ -54,9 +54,13 @@ pub struct DispatchResult {
 }
 
 /// A tool's function-calling schema, serialized into the `session.update` tools
-/// array so the model knows the tool exists. `parameters` is a JSON Schema object.
+/// array so the model knows the tool exists. `parameters` is a JSON Schema
+/// object. `kind` serializes as `"type"` and is `"function"` for all M1 tools —
+/// the Realtime format requires each callable entry to carry `type: "function"`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSchema {
+    #[serde(rename = "type")]
+    pub kind: String,
     pub name: String,
     pub description: String,
     pub parameters: Value,
@@ -176,13 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_serializes_with_plain_keys() {
+    fn tool_schema_serializes_with_function_type() {
         let s = ToolSchema {
+            kind: "function".into(),
             name: "write_note".into(),
             description: "save a note".into(),
             parameters: serde_json::json!({ "type": "object" }),
         };
         let v = serde_json::to_value(&s).unwrap();
+        // Realtime requires `type: "function"` on each callable tool entry.
+        assert_eq!(v["type"], "function");
         assert_eq!(v["name"], "write_note");
         assert_eq!(v["description"], "save a note");
         assert_eq!(v["parameters"]["type"], "object");

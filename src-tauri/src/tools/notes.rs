@@ -51,6 +51,7 @@ pub fn write_note_tool(recorder: Arc<dyn RecorderAdapter>) -> ToolFn {
 /// The `session.update` schema advertised to the model for `write_note`.
 pub fn write_note_schema() -> ToolSchema {
     ToolSchema {
+        kind: "function".into(),
         name: "write_note".into(),
         description: "Save a short note to the user's local notebook.".into(),
         parameters: serde_json::json!({

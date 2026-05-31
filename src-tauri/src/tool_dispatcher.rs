@@ -340,15 +340,23 @@ fn cap_output(output: String) -> String {
     if output.len() <= MAX_TOOL_OUTPUT_LEN {
         return output;
     }
+    // JSON-escaping `partial` (quotes/backslashes/control chars) can inflate it
+    // up to ~6x, so shrink the prefix until the SERIALIZED envelope fits the cap.
     let mut end = MAX_TOOL_OUTPUT_LEN / 2;
-    while !output.is_char_boundary(end) {
-        end -= 1;
+    loop {
+        while end > 0 && !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        let envelope = serde_json::json!({
+            "error": "output truncated",
+            "partial": &output[..end],
+        })
+        .to_string();
+        if envelope.len() <= MAX_TOOL_OUTPUT_LEN || end == 0 {
+            return envelope;
+        }
+        end /= 2;
     }
-    serde_json::json!({
-        "error": "output truncated",
-        "partial": &output[..end],
-    })
-    .to_string()
 }
 
 fn args_too_large(args: &Value) -> bool {
@@ -448,6 +456,7 @@ mod tests {
                 Box::pin(async move { Ok(serde_json::json!({ "saved": args }).to_string()) })
             }),
             ToolSchema {
+                kind: "function".into(),
                 name: "write_note".into(),
                 description: "save a note".into(),
                 parameters: serde_json::json!({ "type": "object" }),
@@ -619,6 +628,16 @@ mod tests {
         assert_eq!(cap_output("small".into()), "small");
     }
 
+    #[test]
+    fn cap_output_envelope_fits_cap_even_with_heavy_escaping() {
+        // All-quotes output OVER the cap: JSON-escaping nearly doubles it. The
+        // serialized envelope must STILL be within the cap and parse as valid JSON.
+        let quotes = "\"".repeat(MAX_TOOL_OUTPUT_LEN + 100);
+        let capped = cap_output(quotes);
+        assert!(capped.len() <= MAX_TOOL_OUTPUT_LEN, "escaped envelope must fit cap: {}", capped.len());
+        let _: serde_json::Value = serde_json::from_str(&capped).expect("valid JSON");
+    }
+
     #[tokio::test]
     async fn registered_tool_error_is_redacted_not_forwarded() {
         // A tool whose Err carries a path must NOT have that path forwarded to
@@ -630,6 +649,7 @@ mod tests {
                 Box::pin(async move { Err("/home/user/.ssh/id_rsa leaked".to_string()) })
             }),
             ToolSchema {
+                kind: "function".into(),
                 name: "write_note".into(),
                 description: "x".into(),
                 parameters: serde_json::json!({}),
