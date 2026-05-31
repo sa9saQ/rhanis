@@ -3,8 +3,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const getAppSettings = vi.fn();
 
-// App mounts useActivityEvents (subscribes via ipc) and OnboardingGate (loads
-// settings). Mock all ipc functions so no real Tauri runtime is required.
+// App mounts useActivityEvents + useSessionEvents (subscribe via ipc) and
+// OnboardingGate (loads settings). Mock all ipc functions so no Tauri runtime
+// is required. VoiceButton also reads sessionStore which imports start/stopSession
+// — those must be in the mock to avoid "not a function" errors.
 vi.mock("./lib/tauri/ipc", () => ({
   onToolEvent: vi.fn().mockResolvedValue(() => {}),
   onApprovalRequired: vi.fn().mockResolvedValue(() => {}),
@@ -17,8 +19,12 @@ vi.mock("./lib/tauri/ipc", () => ({
   setOpenaiApiKey: vi.fn().mockResolvedValue(undefined),
   hasOpenaiApiKey: vi.fn().mockResolvedValue(false),
   deleteOpenaiApiKey: vi.fn().mockResolvedValue(undefined),
+  // Session lifecycle (used by sessionStore, which VoiceButton reads).
+  startSession: vi.fn().mockResolvedValue(undefined),
+  stopSession: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { useSessionStore } from "./features/session/sessionStore";
 import { useSettingsStore } from "./features/settings/settingsStore";
 import App from "./App";
 import { onToolEvent } from "./lib/tauri/ipc";
@@ -32,6 +38,7 @@ beforeEach(() => {
     recorder_adapter: "sqlite",
   });
   useSettingsStore.setState({ settings: null, loaded: false, loadError: null });
+  useSessionStore.getState().reset();
 });
 
 describe("App", () => {
@@ -43,5 +50,15 @@ describe("App", () => {
     // ActivityLog renders with the default idle status.
     expect(screen.getByText("待機")).toBeInTheDocument();
     await waitFor(() => expect(onToolEvent).toHaveBeenCalled());
+  });
+
+  it("renders the VoiceButton in idle state", async () => {
+    await act(async () => {
+      render(<App />);
+    });
+    // VoiceButton is in the document: the start button aria-label indicates idle.
+    const voiceBtn = screen.getByRole("button", { name: /セッションを開始/i });
+    expect(voiceBtn).toBeInTheDocument();
+    expect(voiceBtn).not.toBeDisabled();
   });
 });
