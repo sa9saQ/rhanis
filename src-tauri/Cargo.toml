@@ -38,7 +38,14 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # fail-closed deadline. Tauri already pulls tokio in transitively, but the
 # approval gate depends on these APIs directly, so it is declared explicitly
 # (`rt`/`macros` are needed for the `#[tokio::test]` timeout tests).
-tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "net"] }
+# WebSocket client for the OpenAI Realtime session (koe-e3m). rustls (pure Rust,
+# no system TLS lib) so `cargo test` links on WSL/Linux — native-tls fails to
+# link there.
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+# SinkExt (.send()) + StreamExt (.next()) for the WS sink/stream. `async-await`
+# is declared explicitly so StreamExt does not depend on a transitive feature.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "async-await"] }
 
 # OS keychain for the 32-byte Stronghold snapshot key. Platform-split so the
 # crate compiles both on the Windows target and in the WSL/Linux dev box used

@@ -98,7 +98,10 @@ src-tauri/src/
 - セッションタイムアウト既定 30 分（コスト保護の補助）
 
 ### CSP (tauri.conf.json)
-- `connect-src` に追加必須: `wss://api.openai.com`、`https://api.openai.com`、`https://api.bing.microsoft.com`（M1）、後続でツール用 API ホストを追加
+- OpenAI Realtime / Bing 等の外部 API は **Rust 側**（`tokio-tungstenite` WebSocket / Rust HTTP client）で接続するため **WebView CSP の対象外**。CSP は WebView 内の fetch/WS にのみ効くので、`connect-src` に OpenAI/Bing を足しても無効（むしろ XSS 時の外向き通信面を広げるだけ）→ **足さない**
+- `connect-src` は Tauri IPC のみ（`ipc: http://ipc.localhost`）。`csp` は `null` でなく最小値（`default-src 'self'` 系）にして XSS を防ぐ
+- 将来 WebView から直接外部 API を叩く経路を足す場合のみ、そのホストを `connect-src` に追加
+- 注: 旧記述は「`connect-src` に wss://api.openai.com 追加必須」だったが、これは WebView 直接接続前提の誤り。koe は Rust cpal マイク + Rust WS（上記アーキテクチャ参照）なので訂正（2026-05-31, Codex R-C + CodeRabbit 指摘で確定）
 
 ## Reusable Patterns from Enitar
 Enitar (`/home/zsaku/projects/Enitar/`) は同ユーザーの確立済 Tauri+React プロジェクト。以下を直接流用:
