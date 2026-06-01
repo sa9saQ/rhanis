@@ -56,6 +56,27 @@ keyring = { version = "3", features = ["windows-native"] }
 [target.'cfg(not(windows))'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
+# Audio bridge (koe-flu): cpal for mic capture, rodio for playback.
+# cpal: cross-platform audio I/O — Windows WASAPI / macOS CoreAudio / Linux ALSA.
+# rodio: high-level playback on top of cpal; handles PCM sink + format negotation.
+# Resampling: handled by the hand-rolled resample_mono_linear() in audio_bridge.rs
+# (linear interpolation, voice-adequate for the cpal device-rate ratios in use).
+#
+# WSL/Linux build note: cpal links against libasound (ALSA). `libasound2-dev`
+# is needed at compile time. If not installed system-wide, extract the .deb
+# manually and set:
+#   PKG_CONFIG_PATH=<path-to-extracted-alsa>/pkgconfig
+#   RUSTFLAGS="-L<path-to-extracted-alsa>/lib"
+# The pure-logic unit tests (no hardware) pass on WSL with this workaround.
+# Real mic / playback E2E requires native Windows (see koe-ef8).
+cpal = "0.15"
+rodio = { version = "0.20", default-features = false, features = ["symphonia-wav"] }
+# rubato removed: the hand-rolled resample_mono_linear() in audio_bridge.rs
+# is voice-adequate for the cpal device-rate ratios (44100→24000, 48000→24000,
+# 16000→24000). Re-add rubato if higher-quality resampling is required later.
+# base64 for encoding PCM16 chunks into the OpenAI input_audio_buffer.append frame
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
 
