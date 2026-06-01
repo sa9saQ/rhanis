@@ -134,9 +134,10 @@ M1 では `.env` 不使用。API キーはユーザーがアプリ UI で入力 
 | （該当なし、M1） | — | — |
 
 ## Branches / Milestones
-- `main`: scaffold + project-init 完了状態
-- `feat/cost-tracker`: 月次予算ハードキャップ（14 tests passing、R-C round 2 通過、main マージ待ち）
-- 次に切る予定: `feat/session-manager`（M1 中核、WebSocket + Realtime-2）
+- `main`: M1 backend 完成（PR #1–#15 merged）。cost_tracker / secret_store（stronghold BYOK）/ activity 可視化 / recorder（SQLite）/ settings + 予算オンボーディング / approval_gate（SAFE・CAUTION・DANGER の 3 段）/ tool_dispatcher / session_manager（WebSocket + RealtimeAuth + コスト gate）/ audio_bridge（cpal マイク + rodio 再生）/ M1 tools 4 本 が実装・マージ済
+- **M1 残**: ネイティブ Windows 実機での E2E（`koe-ef8`、依存は全て ✓ で着手可）と hardening（`koe-pr3` audio race / `koe-8kw` read_file の Windows handle walk / `koe-wj2` dispatch の DoS guard 等）。WSL ではマイク（cpal）が動かないため E2E は Windows 必須
+- **製品方向（2026-06）**: multi-provider キー設定基盤 `koe-31u`（声 = OpenAI / Google 選択 + 手足 tool 用キー）→ 接続層の trait 化 `koe-zv3`（OpenAI Realtime ⇄ Gemini Live）+ 手足 tool `koe-eal`。許可ポリシー UI は `koe-351`
+- タスクの最新状態は markdown ではなく **bd**（`bd ready` / `bd show <id>`）が真実の源。本節は節目の要約のみに留める
 
 詳細マイルストーンは `~/.claude/plans/virtual-riding-hearth.md` 参照。
 
