@@ -52,6 +52,29 @@ const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-
 /// Hard session cap (also a coarse cost backstop). Mirrors CLAUDE.md's 30 min.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const WRITE_CHANNEL_CAP: usize = 32;
+/// Upper bound on concurrently in-flight tool dispatches (DoS guard, koe-wj2).
+///
+/// A hostile / compromised model server could stream `function_call` frames for
+/// the whole [`SESSION_TIMEOUT`] window. Each accepted frame spawns a task that
+/// holds its captured arguments (each ≤ `MAX_ARGS_LEN`) and drives a real tool
+/// side effect (file write / screenshot / shell / computer_use). The bound is on
+/// those **concurrently-executing side effects and their argument buffers**, not
+/// on the (tiny) `JoinSet` task handles — so do not raise it on the reasoning
+/// that "handles are cheap". 64 is far above any legitimate concurrency (the
+/// model issues at most a handful of parallel tool calls), so a non-hostile
+/// session never reaches it.
+///
+/// Past the cap, new function-call frames are skipped — the session keeps
+/// running (fail-soft, no crash) and resumes dispatching as earlier tasks finish
+/// and are reaped. A skipped frame's `call_id` receives **no**
+/// `function_call_output` (the model's pending call is intentionally left
+/// unanswered); this is the deliberate fail-soft contract under attack.
+///
+/// Known gap (tracked: koe-rxh): a DANGER-tier dispatch parks its slot for up to
+/// the 30s approval-gate timeout, so a burst of DANGER calls can hold the cap and
+/// starve subsequent calls for that window. Bounding *pending approvals*
+/// separately is approval_gate's concern, out of scope for this session-loop cap.
+const MAX_INFLIGHT_DISPATCHES: usize = 64;
 /// Consecutive cost-snapshot save failures tolerated before stopping fail-closed
 /// (a persistent failure means a restart could lose the running total).
 const MAX_SNAPSHOT_SAVE_FAILURES: u32 = 3;
@@ -262,6 +285,10 @@ async fn run_read_loop<S, F, A, SA>(
     // (rather than letting them complete and spend more).
     let mut dispatch_tasks = tokio::task::JoinSet::new();
     let mut save_failures: u32 = 0;
+    // Latch so the in-flight dispatch cap logs once per saturation episode, not
+    // once per dropped frame — a sustained flood must not turn the fail-soft drop
+    // into a stderr-backpressure DoS (koe-wj2 R-C / Codex).
+    let mut cap_warned = false;
     let deadline = tokio::time::sleep(SESSION_TIMEOUT);
     tokio::pin!(deadline);
     // Interval-based poll for cpal device loss (error_callback sets running=false).
@@ -335,7 +362,7 @@ async fn run_read_loop<S, F, A, SA>(
                         }
                         match handle_text(
                             txt.as_str(), &write_tx, &cost, &recorder, &dispatcher,
-                            &emit, &mut dispatch_tasks, &mut save_failures,
+                            &emit, &mut dispatch_tasks, &mut save_failures, &mut cap_warned,
                         ).await {
                             LoopAction::Continue => {}
                             // handle_text already emitted the terminal error
@@ -408,6 +435,7 @@ async fn handle_text<F>(
     emit: &F,
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
     save_failures: &mut u32,
+    cap_warned: &mut bool,
 ) -> LoopAction
 where
     F: Fn(&str, Option<&str>),
@@ -419,6 +447,29 @@ where
 
     match event.get("type").and_then(Value::as_str) {
         Some("response.function_call_arguments.done") => {
+            // Reap finished dispatches so the in-flight count reflects reality,
+            // then bound it (DoS guard, koe-wj2 — see MAX_INFLIGHT_DISPATCHES for
+            // the threat model and the koe-rxh approval-gate caveat). This runs
+            // BEFORE the call_id/args parse + MAX_ARGS_LEN check so an over-cap
+            // burst is rejected as cheaply as possible. Skipping returns
+            // LoopAction::Continue (fail-soft): the session keeps running and the
+            // dropped call_id is intentionally left unanswered.
+            while dispatch_tasks.try_join_next().is_some() {}
+            if dispatch_tasks.len() >= MAX_INFLIGHT_DISPATCHES {
+                // Log once per saturation episode (latched). A sustained flood
+                // must not turn this fail-soft drop into a stderr-backpressure
+                // DoS: a per-frame synchronous write could stall the read loop.
+                if !*cap_warned {
+                    eprintln!(
+                        "[session] in-flight tool dispatch cap ({MAX_INFLIGHT_DISPATCHES}) reached, dropping calls until a slot frees"
+                    );
+                    *cap_warned = true;
+                }
+                return LoopAction::Continue;
+            }
+            // Back below the cap — re-arm the latch so the next saturation
+            // episode logs once more.
+            *cap_warned = false;
             let call_id = event
                 .get("call_id")
                 .and_then(Value::as_str)
@@ -921,6 +972,74 @@ mod tests {
         let f2 = write_rx.recv().await.expect("response.create frame");
         assert!(matches!(f1, Message::Text(_)));
         assert!(matches!(f2, Message::Text(_)));
+    }
+
+    #[tokio::test]
+    async fn inflight_dispatch_count_is_bounded() {
+        // koe-wj2 DoS guard: a hostile / compromised model that streams
+        // `function_call` frames for the whole session must NOT grow the dispatch
+        // JoinSet without bound. We feed MAX_INFLIGHT_DISPATCHES + extra
+        // function-call frames; only the cap many may ever be spawned, the rest
+        // are skipped (the loop keeps running and exits cleanly — no crash).
+        //
+        // Determinism rests on the default current-thread test runtime: the read
+        // loop never awaits between back-to-back ready frames, so spawned dispatch
+        // tasks are NOT polled (hence not reaped) during the burst — exactly the
+        // worst case the cap defends against. `RecordingDispatcher` completes
+        // immediately, so the normal-exit drain (`join_next().await`) finishes
+        // instead of hanging; it records one call per task as the drain polls it,
+        // giving a count equal to how many tasks were actually spawned.
+        let disp = Arc::new(RecordingDispatcher { calls: StdMutex::new(Vec::new()) });
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        // Drop the receiver so each task's two result `send`s fail instantly
+        // (the tasks ignore the error) rather than blocking on a never-read,
+        // bounded channel — which would deadlock the drain. This test only counts
+        // dispatches; frame-content correctness is covered by
+        // function_call_frame_is_dispatched_and_result_sent.
+        let (write_tx, write_rx) = mpsc::channel::<Message>(8);
+        drop(write_rx);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        let extra = 10;
+        let frames: Vec<Value> = (0..MAX_INFLIGHT_DISPATCHES + extra)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "call_id": format!("call_{i}"),
+                    "name": "write_note",
+                    "arguments": "{}"
+                })
+            })
+            .collect();
+
+        run_read_loop(
+            frame_stream(frames),
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            disp.clone() as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            |_| {}, // no-op audio_handler (no device in test)
+            Arc::new(AtomicBool::new(true)), // mic always running in tests
+            |_| {}, // no-op stop_audio (no device in test)
+            None, // no write task to abort in unit tests
+        )
+        .await;
+
+        // Exactly the cap was spawned/dispatched; the extra frames were skipped,
+        // not crashed. (Before koe-wj2 the count would equal the full frame
+        // count, MAX_INFLIGHT_DISPATCHES + extra.)
+        let dispatched = disp.calls.lock().unwrap().len();
+        assert_eq!(
+            dispatched, MAX_INFLIGHT_DISPATCHES,
+            "in-flight tool dispatches must be capped at MAX_INFLIGHT_DISPATCHES, got {dispatched}"
+        );
     }
 
     #[tokio::test]
