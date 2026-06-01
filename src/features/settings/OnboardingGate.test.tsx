@@ -7,12 +7,20 @@ const getAppSettings = vi.fn();
 const completeOnboarding = vi.fn();
 const hasOpenaiApiKey = vi.fn();
 const setOpenaiApiKey = vi.fn();
+// ApiKeyInput (rendered by the gate) now routes through the provider-generic
+// commands; OnboardingGate's own mount probe still uses hasOpenaiApiKey.
+const setProviderApiKey = vi.fn();
+const hasProviderApiKey = vi.fn();
+const deleteProviderApiKey = vi.fn();
 
 vi.mock("../../lib/tauri/ipc", () => ({
   getAppSettings: (...args: unknown[]) => getAppSettings(...args),
   completeOnboarding: (...args: unknown[]) => completeOnboarding(...args),
   hasOpenaiApiKey: (...args: unknown[]) => hasOpenaiApiKey(...args),
   setOpenaiApiKey: (...args: unknown[]) => setOpenaiApiKey(...args),
+  setProviderApiKey: (...args: unknown[]) => setProviderApiKey(...args),
+  hasProviderApiKey: (...args: unknown[]) => hasProviderApiKey(...args),
+  deleteProviderApiKey: (...args: unknown[]) => deleteProviderApiKey(...args),
   saveBudgetConfig: vi.fn(),
   deleteOpenaiApiKey: vi.fn(),
   setRecorderAdapter: vi.fn(),
@@ -26,9 +34,15 @@ beforeEach(() => {
   completeOnboarding.mockReset();
   hasOpenaiApiKey.mockReset();
   setOpenaiApiKey.mockReset();
+  setProviderApiKey.mockReset();
+  hasProviderApiKey.mockReset();
+  deleteProviderApiKey.mockReset();
   // Default: key not stored, finalize resolves
   hasOpenaiApiKey.mockResolvedValue(false);
   setOpenaiApiKey.mockResolvedValue(undefined);
+  setProviderApiKey.mockResolvedValue(undefined);
+  hasProviderApiKey.mockResolvedValue(false);
+  deleteProviderApiKey.mockResolvedValue(undefined);
   completeOnboarding.mockResolvedValue(undefined);
   useSettingsStore.setState({ settings: null, loaded: false, loadError: null });
 });
@@ -122,11 +136,11 @@ describe("OnboardingGate", () => {
         recorder_adapter: "sqlite",
       });
 
-    // When the gate mounts, hasOpenaiApiKey returns false.
-    // After setOpenaiApiKey, hasOpenaiApiKey returns true.
-    hasOpenaiApiKey
-      .mockResolvedValueOnce(false) // mount probe
-      .mockResolvedValue(true);    // after ApiKeyInput save
+    // The gate's mount probe uses hasOpenaiApiKey (no key yet → false).
+    // ApiKeyInput's save now confirms presence via hasProviderApiKey("openai")
+    // → true, which flips the gate's hasKey and reveals the 完了 button.
+    hasOpenaiApiKey.mockResolvedValue(false);
+    hasProviderApiKey.mockResolvedValue(true);
 
     await act(async () => {
       render(

@@ -17,6 +17,17 @@ export interface BudgetConfig {
 }
 
 /**
+ * Per-provider enable flags for the 手足 (tool) keys. Mirrors
+ * `settings_store::ToolProviderFlags` (Rust). The key itself lives in the secret
+ * store (queried via `hasProviderApiKey`); this only records "user wants it on".
+ */
+export interface ToolProviderFlags {
+  xai: boolean;
+  x: boolean;
+  search: boolean;
+}
+
+/**
  * Application settings. Mirrors `settings_store::AppSettings` (Rust).
  * All field names are snake_case to match the JSON the backend emits.
  */
@@ -25,6 +36,13 @@ export interface AppSettings {
   budget: BudgetConfig;
   /** Recorder adapter name. M1 only supports `"sqlite"`. */
   recorder_adapter: string;
+  /**
+   * Selected voice provider/model as a single `"provider/model"` string
+   * (e.g. `"openai/gpt-realtime-2"`). koe-31u persists it; koe-zv3 acts on it.
+   */
+  voice_provider_model: string;
+  /** Per-provider enable flags for the 手足 tool keys (koe-31u). */
+  tool_providers: ToolProviderFlags;
 }
 
 /**

@@ -33,6 +33,24 @@ const CLIENT_PATH: &[u8] = b"koe-secrets";
 /// Logical name of the OpenAI key record inside the store.
 pub const OPENAI_KEY_NAME: &str = "openai_api_key";
 
+// Sibling provider key records (koe-31u multi-provider foundation). OpenAI is
+// intentionally left BARE ("openai_api_key") so the existing stored key keeps
+// resolving — `session_manager` reads `get_api_key(OPENAI_KEY_NAME)` and a rename
+// would orphan it. New providers are namespaced with a `voice.` / `tool.` prefix
+// so a typo can never collide with the legacy bare name and the role of each
+// record is visible at a glance. All records share the one `CLIENT_PATH` /
+// snapshot / keychain key; they differ only by this byte-key. These are consumed
+// later (koe-zv3 reads the voice key, koe-eal reads the 手足 tool keys); for now
+// they exist so the namespacing primitive ([`provider_key_name`]) is complete.
+/// Voice provider = Google (Gemini Live). Consumed later by koe-zv3.
+pub const GOOGLE_KEY_NAME: &str = "voice.google_api_key";
+/// 手足 tool key: XAI (Grok). Consumed later by koe-eal.
+pub const XAI_KEY_NAME: &str = "tool.xai_api_key";
+/// 手足 tool key: X (Twitter) API. Consumed later by koe-eal.
+pub const X_API_KEY_NAME: &str = "tool.x_api_key";
+/// 手足 tool key: search provider. Consumed later by koe-8fw / koe-eal.
+pub const SEARCH_KEY_NAME: &str = "tool.search_api_key";
+
 // ---------------------------------------------------------------------------
 // SecretString — a redacted, non-serializable string wrapper.
 // ---------------------------------------------------------------------------
@@ -439,6 +457,74 @@ pub async fn delete_openai_api_key(
 // `lib_rs_does_not_expose_get_command` locks this in.
 
 // ---------------------------------------------------------------------------
+// Multi-provider key commands (koe-31u). Same Day-0 invariants as the OpenAI
+// trio above — write + boolean presence only, no get-* anywhere.
+// ---------------------------------------------------------------------------
+
+/// Maps a WebView-supplied provider id to its **fixed** Stronghold record name.
+///
+/// This is the single namespacing primitive. A `provider: String` that crosses
+/// the IPC boundary is attacker/model-influenced, so it is resolved through this
+/// CLOSED allowlist *before* any store operation: an unknown id returns a fixed
+/// error and never becomes an arbitrary record key, so the WebView cannot read,
+/// write, or delete a namespace that isn't enumerated here. koe-zv3 / koe-eal
+/// extend this by ADDING arms (and the matching `*_KEY_NAME` const), never by
+/// accepting a free-form name. `"openai"` maps to the legacy bare record so the
+/// existing key path is unchanged.
+fn provider_key_name(provider: &str) -> Result<&'static str, SecretError> {
+    match provider {
+        "openai" => Ok(OPENAI_KEY_NAME),
+        "google" => Ok(GOOGLE_KEY_NAME),
+        "xai" => Ok(XAI_KEY_NAME),
+        "x" => Ok(X_API_KEY_NAME),
+        "search" => Ok(SEARCH_KEY_NAME),
+        // Fixed error — never echo the (attacker-influenced) provider string back.
+        _ => Err(SecretError::NotFound),
+    }
+}
+
+/// Stores an API key for `provider` (声 = `openai` / `google`, 手足 = `xai` /
+/// `x` / `search`). The provider id is resolved through the [`provider_key_name`]
+/// allowlist, so an unknown id is rejected before the vault is touched. Like
+/// [`set_openai_api_key`], the plain key arrives once over IPC and is immediately
+/// moved into the encrypted store; it is never returned to the WebView.
+#[tauri::command]
+pub async fn set_provider_api_key(
+    provider: String,
+    key: String,
+    store: tauri::State<'_, ManagedSecretStore>,
+) -> Result<(), String> {
+    let name = provider_key_name(&provider).map_err(|e| e.to_string())?;
+    let key = normalize_api_key(&key).map_err(|e| e.to_string())?;
+    store
+        .0
+        .save_api_key(name, SecretString::new(key.to_string()))
+        .map_err(|e| e.to_string())
+}
+
+/// Reports whether a key is stored for `provider`, **without** returning its
+/// value. An Err (locked / corrupt vault) propagates rather than collapsing to
+/// `false`, preserving the fail-closed contract.
+#[tauri::command]
+pub async fn has_provider_api_key(
+    provider: String,
+    store: tauri::State<'_, ManagedSecretStore>,
+) -> Result<bool, String> {
+    let name = provider_key_name(&provider).map_err(|e| e.to_string())?;
+    store.0.has_api_key(name).map_err(|e| e.to_string())
+}
+
+/// Deletes the stored key for `provider`.
+#[tauri::command]
+pub async fn delete_provider_api_key(
+    provider: String,
+    store: tauri::State<'_, ManagedSecretStore>,
+) -> Result<(), String> {
+    let name = provider_key_name(&provider).map_err(|e| e.to_string())?;
+    store.0.delete_api_key(name).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -655,16 +741,127 @@ mod tests {
 
     #[test]
     fn lib_rs_does_not_expose_get_command() {
-        // Lock in that the raw key has no WebView read path.
+        // Lock in that the raw key has no WebView read path — for ANY provider,
+        // not just OpenAI. A single-literal check would silently let a future
+        // `get_xai_api_key` slip through, so forbid every `get_*_api_key` shape.
         let code = lib_rs_code_only();
-        assert!(
-            !code.contains("get_openai_api_key"),
-            "get_openai_api_key must never be registered as a Tauri command"
-        );
+        for forbidden in [
+            "get_openai_api_key",
+            "get_google_api_key",
+            "get_xai_api_key",
+            "get_x_api_key",
+            "get_search_api_key",
+            "get_provider_api_key",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "{forbidden} must never be registered as a Tauri command (no WebView key read path)"
+            );
+        }
+        // The write path stays wired (sanity that the guard is checking live code).
         assert!(
             code.contains("set_openai_api_key"),
             "set_openai_api_key should be wired into the invoke handler"
         );
+    }
+
+    // ---- Multi-provider key namespacing (koe-31u) --------------------------
+
+    #[test]
+    fn provider_key_name_maps_allowlisted_ids() {
+        assert_eq!(provider_key_name("openai").unwrap(), OPENAI_KEY_NAME);
+        assert_eq!(provider_key_name("google").unwrap(), GOOGLE_KEY_NAME);
+        assert_eq!(provider_key_name("xai").unwrap(), XAI_KEY_NAME);
+        assert_eq!(provider_key_name("x").unwrap(), X_API_KEY_NAME);
+        assert_eq!(provider_key_name("search").unwrap(), SEARCH_KEY_NAME);
+    }
+
+    #[test]
+    fn provider_key_name_rejects_unknown_without_echo() {
+        // Unknown / attacker-supplied ids get a FIXED error and never map to a
+        // record key — the error must not echo the provider string.
+        for bad in ["", "OPENAI", "../escape", "voice.google_api_key", "anything"] {
+            let err = provider_key_name(bad).unwrap_err();
+            assert_eq!(err, SecretError::NotFound);
+            assert!(
+                !err.to_string().contains(bad) || bad.is_empty(),
+                "error message must not echo the provider id"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_key_names_are_pairwise_distinct() {
+        use std::collections::HashSet;
+        let names = [
+            OPENAI_KEY_NAME,
+            GOOGLE_KEY_NAME,
+            XAI_KEY_NAME,
+            X_API_KEY_NAME,
+            SEARCH_KEY_NAME,
+        ];
+        let set: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(set.len(), names.len(), "key record names must be unique");
+        // OpenAI stays bare (backward compat); the rest are namespaced.
+        assert_eq!(OPENAI_KEY_NAME, "openai_api_key");
+        for n in [GOOGLE_KEY_NAME] {
+            assert!(n.starts_with("voice."), "{n} must be voice-namespaced");
+        }
+        for n in [XAI_KEY_NAME, X_API_KEY_NAME, SEARCH_KEY_NAME] {
+            assert!(n.starts_with("tool."), "{n} must be tool-namespaced");
+        }
+    }
+
+    #[test]
+    fn openai_provider_resolves_to_the_existing_record() {
+        // Backward-compat proof: storing under provider "openai" writes the SAME
+        // record the legacy OpenAI path reads, so an already-onboarded user's key
+        // keeps working without migration.
+        let (store, _dir) = temp_store(Box::new(FixedPassword::new()));
+        let name = provider_key_name("openai").unwrap();
+        store
+            .save_api_key(name, SecretString::new("sk-legacy".to_string()))
+            .expect("save under provider 'openai'");
+        // Read back via the original OPENAI_KEY_NAME record.
+        assert!(store.has_api_key(OPENAI_KEY_NAME).expect("has openai"));
+        assert_eq!(
+            store.get_api_key(OPENAI_KEY_NAME).expect("get").expose(),
+            "sk-legacy"
+        );
+    }
+
+    #[test]
+    fn provider_key_round_trips_independently() {
+        // A 手足 provider's key set→has→delete→has cycle is independent of others.
+        let (store, _dir) = temp_store(Box::new(FixedPassword::new()));
+        let xai = provider_key_name("xai").unwrap();
+        assert!(!store.has_api_key(xai).expect("has before"));
+        store
+            .save_api_key(xai, SecretString::new("xai-key".to_string()))
+            .expect("save xai");
+        assert!(store.has_api_key(xai).expect("has after save"));
+        // A different provider remains absent (distinct record).
+        assert!(!store
+            .has_api_key(provider_key_name("x").unwrap())
+            .expect("x absent"));
+        store.delete_api_key(xai).expect("delete xai");
+        assert!(!store.has_api_key(xai).expect("has after delete"));
+    }
+
+    #[test]
+    fn has_provider_propagates_locked_fail_closed() {
+        // A locked vault must surface as Err, not a silent `false` — same
+        // fail-closed contract the OpenAI path has.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("koe-secrets.stronghold");
+        StrongholdSecretStore::new(path.clone(), Box::new(FixedPassword::new()))
+            .save_api_key(provider_key_name("xai").unwrap(), SecretString::new("k".into()))
+            .expect("seed snapshot");
+        let store = StrongholdSecretStore::new(path, Box::new(NoKeyPassword));
+        match store.has_api_key(provider_key_name("xai").unwrap()) {
+            Err(e) => assert_eq!(e, SecretError::Locked),
+            Ok(v) => panic!("expected Locked, got Ok({v})"),
+        }
     }
 
     #[test]

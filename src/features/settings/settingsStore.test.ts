@@ -4,11 +4,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const getAppSettings = vi.fn();
 const completeOnboarding = vi.fn();
 const saveBudgetConfig = vi.fn();
+const setVoiceProvider = vi.fn();
+const setToolProviderEnabled = vi.fn();
 
 vi.mock("../../lib/tauri/ipc", () => ({
   getAppSettings: (...args: unknown[]) => getAppSettings(...args),
   completeOnboarding: (...args: unknown[]) => completeOnboarding(...args),
   saveBudgetConfig: (...args: unknown[]) => saveBudgetConfig(...args),
+  setVoiceProvider: (...args: unknown[]) => setVoiceProvider(...args),
+  setToolProviderEnabled: (...args: unknown[]) => setToolProviderEnabled(...args),
   hasOpenaiApiKey: vi.fn(),
   setOpenaiApiKey: vi.fn(),
   deleteOpenaiApiKey: vi.fn(),
@@ -21,18 +25,24 @@ const defaultSettings: AppSettings = {
   onboarding_completed: false,
   budget: { enabled: false, monthly_limit_nanodollars: 0 },
   recorder_adapter: "sqlite",
+  voice_provider_model: "openai/gpt-realtime-2",
+  tool_providers: { xai: false, x: false, search: false },
 };
 
 const completedSettings: AppSettings = {
   onboarding_completed: true,
   budget: { enabled: true, monthly_limit_nanodollars: 10_000_000_000 },
   recorder_adapter: "sqlite",
+  voice_provider_model: "openai/gpt-realtime-2",
+  tool_providers: { xai: false, x: false, search: false },
 };
 
 beforeEach(() => {
   getAppSettings.mockReset();
   completeOnboarding.mockReset();
   saveBudgetConfig.mockReset();
+  setVoiceProvider.mockReset();
+  setToolProviderEnabled.mockReset();
   // Reset zustand store
   useSettingsStore.setState({
     settings: null,
@@ -111,5 +121,56 @@ describe("settingsStore.saveBudget", () => {
 
     expect(saveBudgetConfig).toHaveBeenCalledWith(false, null);
     expect(useSettingsStore.getState().settings?.budget.enabled).toBe(false);
+  });
+});
+
+describe("settingsStore.saveVoiceProvider", () => {
+  it("calls setVoiceProvider IPC then re-fetches the authoritative settings", async () => {
+    setVoiceProvider.mockResolvedValue(undefined);
+    const updated: AppSettings = {
+      ...completedSettings,
+      voice_provider_model: "google/gemini-2.5-flash-live",
+    };
+    getAppSettings.mockResolvedValue(updated);
+
+    await useSettingsStore.getState().saveVoiceProvider("google/gemini-2.5-flash-live");
+
+    expect(setVoiceProvider).toHaveBeenCalledWith("google/gemini-2.5-flash-live");
+    // Reflects the re-fetched value, not a local optimistic copy (stale guard).
+    expect(getAppSettings).toHaveBeenCalled();
+    expect(useSettingsStore.getState().settings?.voice_provider_model).toBe(
+      "google/gemini-2.5-flash-live",
+    );
+  });
+
+  it("propagates IPC errors (does not silently swallow)", async () => {
+    setVoiceProvider.mockRejectedValue(new Error("unsupported voice provider"));
+    await expect(
+      useSettingsStore.getState().saveVoiceProvider("evil/model"),
+    ).rejects.toThrow();
+  });
+});
+
+describe("settingsStore.setToolProviderEnabled", () => {
+  it("calls setToolProviderEnabled IPC then re-fetches the authoritative settings", async () => {
+    setToolProviderEnabled.mockResolvedValue(undefined);
+    const updated: AppSettings = {
+      ...completedSettings,
+      tool_providers: { xai: true, x: false, search: false },
+    };
+    getAppSettings.mockResolvedValue(updated);
+
+    await useSettingsStore.getState().setToolProviderEnabled("xai", true);
+
+    expect(setToolProviderEnabled).toHaveBeenCalledWith("xai", true);
+    expect(getAppSettings).toHaveBeenCalled();
+    expect(useSettingsStore.getState().settings?.tool_providers.xai).toBe(true);
+  });
+
+  it("propagates IPC errors (does not silently swallow)", async () => {
+    setToolProviderEnabled.mockRejectedValue(new Error("unsupported tool provider"));
+    await expect(
+      useSettingsStore.getState().setToolProviderEnabled("bad", true),
+    ).rejects.toThrow();
   });
 });

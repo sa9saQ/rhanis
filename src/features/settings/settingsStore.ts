@@ -13,6 +13,8 @@ import {
   completeOnboarding as ipcCompleteOnboarding,
   getAppSettings,
   saveBudgetConfig as ipcSaveBudgetConfig,
+  setToolProviderEnabled as ipcSetToolProviderEnabled,
+  setVoiceProvider as ipcSetVoiceProvider,
 } from "../../lib/tauri/ipc";
 import type { AppSettings } from "./types";
 
@@ -31,6 +33,10 @@ interface SettingsState {
     recorderAdapter: string,
   ) => Promise<void>;
   saveBudget: (enabled: boolean, monthlyLimitUsd: number | null) => Promise<void>;
+  /** Persists the selected voice provider/model (koe-31u), then re-fetches. */
+  saveVoiceProvider: (value: string) => Promise<void>;
+  /** Enables/disables a 手足 tool provider (koe-31u), then re-fetches. */
+  setToolProviderEnabled: (provider: string, enabled: boolean) => Promise<void>;
 }
 
 export const useSettingsStore = create<SettingsState>((set) => ({
@@ -63,6 +69,19 @@ export const useSettingsStore = create<SettingsState>((set) => ({
 
   saveBudget: async (enabled, monthlyLimitUsd) => {
     await ipcSaveBudgetConfig(enabled, monthlyLimitUsd);
+    const settings = await getAppSettings();
+    set((s) => ({ ...s, settings }));
+  },
+
+  saveVoiceProvider: async (value) => {
+    await ipcSetVoiceProvider(value);
+    // Re-fetch the authoritative persisted state (avoids a stale local copy).
+    const settings = await getAppSettings();
+    set((s) => ({ ...s, settings }));
+  },
+
+  setToolProviderEnabled: async (provider, enabled) => {
+    await ipcSetToolProviderEnabled(provider, enabled);
     const settings = await getAppSettings();
     set((s) => ({ ...s, settings }));
   },
