@@ -27,3 +27,10 @@ dist-ssr
 .dolt/
 *.db
 .beads-credential-key
+
+# Local build/dev artifacts (not part of the repo)
+# WSL ALSA build workaround: libasound2-dev .deb extracted manually for cpal
+*.deb
+# Stray character-device node accidentally created at .github (NOT a real dir);
+# ignore so it never gets staged. Remove it manually: `rm -f .github`
+/.github
