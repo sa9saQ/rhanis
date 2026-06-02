@@ -11,6 +11,7 @@ import { create } from "zustand";
 
 import {
   completeOnboarding as ipcCompleteOnboarding,
+  deleteToolProviderKey as ipcDeleteToolProviderKey,
   getAppSettings,
   saveBudgetConfig as ipcSaveBudgetConfig,
   setToolProviderEnabled as ipcSetToolProviderEnabled,
@@ -37,6 +38,8 @@ interface SettingsState {
   saveVoiceProvider: (value: string) => Promise<void>;
   /** Enables/disables a 手足 tool provider (koe-31u), then re-fetches. */
   setToolProviderEnabled: (provider: string, enabled: boolean) => Promise<void>;
+  /** Deletes a 手足 tool key + clears its flag atomically (koe-31u), then re-fetches. */
+  deleteToolProviderKey: (provider: string) => Promise<void>;
 }
 
 export const useSettingsStore = create<SettingsState>((set) => ({
@@ -82,6 +85,12 @@ export const useSettingsStore = create<SettingsState>((set) => ({
 
   setToolProviderEnabled: async (provider, enabled) => {
     await ipcSetToolProviderEnabled(provider, enabled);
+    const settings = await getAppSettings();
+    set((s) => ({ ...s, settings }));
+  },
+
+  deleteToolProviderKey: async (provider) => {
+    await ipcDeleteToolProviderKey(provider);
     const settings = await getAppSettings();
     set((s) => ({ ...s, settings }));
   },

@@ -29,6 +29,10 @@ interface ApiKeyInputProps {
   /** Optional id of an external description element (e.g. a "not yet active"
    *  hint) to associate with the field for screen readers. */
   describedById?: string;
+  /** Optional delete handler that replaces the default
+   *  `deleteProviderApiKey(provider)`. Used by 手足 tool rows so the key delete
+   *  and the enable-flag clear happen in one atomic backend command. */
+  onDelete?: () => Promise<void>;
 }
 
 export function ApiKeyInput({
@@ -38,6 +42,7 @@ export function ApiKeyInput({
   hasKey = false,
   onKeyStatusChange,
   describedById,
+  onDelete,
 }: ApiKeyInputProps) {
   const [value, setValue] = useState("");
   const [show, setShow] = useState(false);
@@ -77,7 +82,11 @@ export function ApiKeyInput({
     setDeleting(true);
     setError(null);
     try {
-      await deleteProviderApiKey(provider);
+      if (onDelete) {
+        await onDelete();
+      } else {
+        await deleteProviderApiKey(provider);
+      }
       onKeyStatusChange?.(false);
     } catch {
       setError("APIキーの削除に失敗しました。もう一度お試しください。");

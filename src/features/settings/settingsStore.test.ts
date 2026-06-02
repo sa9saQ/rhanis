@@ -6,6 +6,7 @@ const completeOnboarding = vi.fn();
 const saveBudgetConfig = vi.fn();
 const setVoiceProvider = vi.fn();
 const setToolProviderEnabled = vi.fn();
+const deleteToolProviderKey = vi.fn();
 
 vi.mock("../../lib/tauri/ipc", () => ({
   getAppSettings: (...args: unknown[]) => getAppSettings(...args),
@@ -13,6 +14,7 @@ vi.mock("../../lib/tauri/ipc", () => ({
   saveBudgetConfig: (...args: unknown[]) => saveBudgetConfig(...args),
   setVoiceProvider: (...args: unknown[]) => setVoiceProvider(...args),
   setToolProviderEnabled: (...args: unknown[]) => setToolProviderEnabled(...args),
+  deleteToolProviderKey: (...args: unknown[]) => deleteToolProviderKey(...args),
   hasOpenaiApiKey: vi.fn(),
   setOpenaiApiKey: vi.fn(),
   deleteOpenaiApiKey: vi.fn(),
@@ -43,6 +45,7 @@ beforeEach(() => {
   saveBudgetConfig.mockReset();
   setVoiceProvider.mockReset();
   setToolProviderEnabled.mockReset();
+  deleteToolProviderKey.mockReset();
   // Reset zustand store
   useSettingsStore.setState({
     settings: null,
@@ -171,6 +174,30 @@ describe("settingsStore.setToolProviderEnabled", () => {
     setToolProviderEnabled.mockRejectedValue(new Error("unsupported tool provider"));
     await expect(
       useSettingsStore.getState().setToolProviderEnabled("bad", true),
+    ).rejects.toThrow();
+  });
+});
+
+describe("settingsStore.deleteToolProviderKey", () => {
+  it("calls deleteToolProviderKey IPC then re-fetches (key gone + flag cleared)", async () => {
+    deleteToolProviderKey.mockResolvedValue(undefined);
+    const updated: AppSettings = {
+      ...completedSettings,
+      tool_providers: { xai: false, x: false, search: false },
+    };
+    getAppSettings.mockResolvedValue(updated);
+
+    await useSettingsStore.getState().deleteToolProviderKey("xai");
+
+    expect(deleteToolProviderKey).toHaveBeenCalledWith("xai");
+    expect(getAppSettings).toHaveBeenCalled();
+    expect(useSettingsStore.getState().settings?.tool_providers.xai).toBe(false);
+  });
+
+  it("propagates IPC errors", async () => {
+    deleteToolProviderKey.mockRejectedValue(new Error("secret store is unavailable"));
+    await expect(
+      useSettingsStore.getState().deleteToolProviderKey("xai"),
     ).rejects.toThrow();
   });
 });

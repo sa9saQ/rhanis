@@ -24,8 +24,9 @@ use secret_store::{
     StrongholdSecretStore,
 };
 use settings_store::{
-    complete_onboarding, get_app_settings, save_budget_config, set_recorder_adapter,
-    set_tool_provider_enabled, set_voice_provider, JsonSettingsStore, ManagedSettings,
+    complete_onboarding, delete_tool_provider_key, get_app_settings, save_budget_config,
+    set_recorder_adapter, set_tool_provider_enabled, set_voice_provider, JsonSettingsStore,
+    ManagedSettings,
 };
 use realtime_types::ManagedDispatcher;
 use session_manager::{start_session, stop_session, ManagedSession};
@@ -125,6 +126,7 @@ pub fn run() {
             set_recorder_adapter,
             set_voice_provider,
             set_tool_provider_enabled,
+            delete_tool_provider_key,
             start_session,
             stop_session,
         ])

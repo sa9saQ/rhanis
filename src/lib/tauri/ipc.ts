@@ -33,6 +33,7 @@ export const COMMAND = {
   // Multi-provider settings (koe-31u)
   setVoiceProvider: "set_voice_provider",
   setToolProviderEnabled: "set_tool_provider_enabled",
+  deleteToolProviderKey: "delete_tool_provider_key",
   // Secret store commands (secret_store.rs)
   setOpenaiApiKey: "set_openai_api_key",
   hasOpenaiApiKey: "has_openai_api_key",
@@ -151,9 +152,16 @@ export function setVoiceProvider(value: string): Promise<void> {
   return invoke(COMMAND.setVoiceProvider, { value });
 }
 
-/** Enables/disables a 手足 (tool) provider. Records intent only — not the key. */
+/** Enables/disables a 手足 (tool) provider. Records intent only — not the key.
+ *  Enabling is rejected backend-side if no key is stored for the provider. */
 export function setToolProviderEnabled(provider: string, enabled: boolean): Promise<void> {
   return invoke(COMMAND.setToolProviderEnabled, { provider, enabled });
+}
+
+/** Deletes a 手足 tool key AND clears its enable flag atomically (flag-first
+ *  ordering, so a partial failure can't leave an "enabled but key-less" state). */
+export function deleteToolProviderKey(provider: string): Promise<void> {
+  return invoke(COMMAND.deleteToolProviderKey, { provider });
 }
 
 /**

@@ -119,6 +119,16 @@ describe("ApiKeyInput", () => {
     expect(deleteProviderApiKey).toHaveBeenCalledWith("openai");
   });
 
+  it("uses the onDelete override instead of deleteProviderApiKey when provided", async () => {
+    const onDelete = vi.fn().mockResolvedValue(undefined);
+    render(<ApiKeyInput provider="xai" hasKey={true} onDelete={onDelete} />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /削除|delete/i }));
+    });
+    expect(onDelete).toHaveBeenCalled();
+    expect(deleteProviderApiKey).not.toHaveBeenCalled();
+  });
+
   it("does not show the saved key value in the DOM after save (key must not linger)", async () => {
     hasProviderApiKey.mockResolvedValue(true);
     render(<ApiKeyInput />);

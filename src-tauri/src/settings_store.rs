@@ -21,7 +21,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::cost_tracker::{usd_to_nanodollars, BudgetConfig};
-use crate::secret_store::{ManagedSecretStore, OPENAI_KEY_NAME};
+use crate::secret_store::{
+    ManagedSecretStore, OPENAI_KEY_NAME, SEARCH_KEY_NAME, XAI_KEY_NAME, X_API_KEY_NAME,
+};
 
 // ---------------------------------------------------------------------------
 // AppSettings
@@ -358,24 +360,64 @@ pub async fn set_tool_provider_enabled(
     provider: String,
     enabled: bool,
     settings: tauri::State<'_, ManagedSettings>,
+    secret: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<(), String> {
-    settings.update(|s| match provider.as_str() {
-        "xai" => {
-            s.tool_providers.xai = enabled;
-            Ok(())
-        }
-        "x" => {
-            s.tool_providers.x = enabled;
-            Ok(())
-        }
-        "search" => {
-            s.tool_providers.search = enabled;
-            Ok(())
-        }
-        // Fixed message — never echo the provider id back. Returning Err inside
-        // update() means nothing is saved (no partial write).
-        _ => Err("unsupported tool provider".into()),
+    // Resolve + validate the provider first (fixed Err, never echoes the id).
+    let key_name = tool_provider_key_name(&provider)?;
+    // Backend invariant: a tool can only be enabled while its key is actually
+    // stored. Don't trust the UI's disabled checkbox — a direct or stale WebView
+    // call must not persist a credential-less "enabled" provider for the future
+    // tool path (koe-eal) to trust. Fail-closed: an Err from has_api_key (locked
+    // vault) blocks the enable too.
+    if enabled && !secret.0.has_api_key(key_name).map_err(|e| e.to_string())? {
+        return Err("set an API key before enabling this tool".into());
+    }
+    settings.update(|s| {
+        set_tool_flag(&mut s.tool_providers, &provider, enabled);
+        Ok(())
     })
+}
+
+/// Deletes a 手足 tool key **and** clears its enable flag. The flag is cleared
+/// FIRST so a partial failure can never leave the unsafe "enabled but key-less"
+/// state: if the key delete then fails, we are left with disabled + key-present
+/// (benign — the tool is simply off). This is the atomic counterpart to the
+/// enable guard above; the frontend routes tool-key deletes through here rather
+/// than the generic delete + a best-effort flag clear.
+#[tauri::command]
+pub async fn delete_tool_provider_key(
+    provider: String,
+    settings: tauri::State<'_, ManagedSettings>,
+    secret: tauri::State<'_, ManagedSecretStore>,
+) -> Result<(), String> {
+    let key_name = tool_provider_key_name(&provider)?;
+    settings.update(|s| {
+        set_tool_flag(&mut s.tool_providers, &provider, false);
+        Ok(())
+    })?;
+    secret.0.delete_api_key(key_name).map_err(|e| e.to_string())
+}
+
+/// Maps a 手足 tool provider id to its secret record name (tools only — voice
+/// providers are not togglable here). Unknown ids get a fixed Err.
+fn tool_provider_key_name(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "xai" => Ok(XAI_KEY_NAME),
+        "x" => Ok(X_API_KEY_NAME),
+        "search" => Ok(SEARCH_KEY_NAME),
+        _ => Err("unsupported tool provider".into()),
+    }
+}
+
+/// Sets the flag for an already-validated tool provider. `provider` MUST have
+/// passed [`tool_provider_key_name`]; an unrecognised id is unreachable.
+fn set_tool_flag(flags: &mut ToolProviderFlags, provider: &str, enabled: bool) {
+    match provider {
+        "xai" => flags.xai = enabled,
+        "x" => flags.x = enabled,
+        "search" => flags.search = enabled,
+        _ => unreachable!("provider validated by tool_provider_key_name"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +906,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tool_provider_key_name_maps_and_rejects() {
+        assert_eq!(tool_provider_key_name("xai").unwrap(), XAI_KEY_NAME);
+        assert_eq!(tool_provider_key_name("x").unwrap(), X_API_KEY_NAME);
+        assert_eq!(tool_provider_key_name("search").unwrap(), SEARCH_KEY_NAME);
+        // Voice providers are not togglable as tools, and unknown ids fail closed.
+        assert!(tool_provider_key_name("openai").is_err());
+        assert!(tool_provider_key_name("google").is_err());
+        assert!(tool_provider_key_name("").is_err());
+    }
+
+    #[test]
+    fn set_tool_flag_flips_only_target() {
+        let mut f = ToolProviderFlags::default();
+        set_tool_flag(&mut f, "x", true);
+        assert!(f.x && !f.xai && !f.search);
+        set_tool_flag(&mut f, "xai", true);
+        assert!(f.x && f.xai && !f.search);
+        set_tool_flag(&mut f, "x", false);
+        assert!(!f.x && f.xai && !f.search);
+    }
+
     // ---- Structural guard: settings commands are registered in lib.rs ------
 
     fn lib_rs_code_only() -> String {
@@ -884,6 +948,7 @@ mod tests {
             "set_recorder_adapter",
             "set_voice_provider",
             "set_tool_provider_enabled",
+            "delete_tool_provider_key",
         ] {
             assert!(
                 code.contains(cmd),

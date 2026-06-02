@@ -17,6 +17,7 @@ import {
   completeOnboarding,
   deleteOpenaiApiKey,
   deleteProviderApiKey,
+  deleteToolProviderKey,
   getAppSettings,
   hasOpenaiApiKey,
   hasProviderApiKey,
@@ -213,5 +214,10 @@ describe("multi-provider key + voice/tool commands (koe-31u)", () => {
   it("deleteProviderApiKey invokes delete_provider_api_key with {provider}", async () => {
     await deleteProviderApiKey("x");
     expect(invoke).toHaveBeenCalledWith(COMMAND.deleteProviderApiKey, { provider: "x" });
+  });
+
+  it("deleteToolProviderKey invokes delete_tool_provider_key with {provider}", async () => {
+    await deleteToolProviderKey("xai");
+    expect(invoke).toHaveBeenCalledWith(COMMAND.deleteToolProviderKey, { provider: "xai" });
   });
 });

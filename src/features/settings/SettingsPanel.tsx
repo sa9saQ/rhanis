@@ -33,7 +33,8 @@ const TOOL_KEYS_HINT_ID = "koe-tool-keys-hint";
 const DEFAULT_VOICE_PROVIDER_MODEL = "openai/gpt-realtime-2";
 
 export function SettingsPanel({ onClose }: SettingsPanelProps) {
-  const { settings, saveBudget, saveVoiceProvider, setToolProviderEnabled } = useSettingsStore();
+  const { settings, saveBudget, saveVoiceProvider, setToolProviderEnabled, deleteToolProviderKey } =
+    useSettingsStore();
   const [hasKey, setHasKey] = useState(false);
   const [toolHasKey, setToolHasKey] = useState<Record<string, boolean>>({});
   const [actionError, setActionError] = useState<string | null>(null);
@@ -83,17 +84,6 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
       await setToolProviderEnabled(provider, enabled);
     } catch {
       setActionError("ツールの設定保存に失敗しました。もう一度お試しください。");
-    }
-  }
-
-  // When a tool key is deleted, also clear its enable flag so the persisted
-  // settings never keep an "enabled but key-less" provider (R-C / Codex).
-  async function handleToolKeyRemoved(provider: keyof ToolProviderFlags) {
-    if (!(toolFlags[provider] ?? false)) return; // already disabled — nothing to do
-    try {
-      await setToolProviderEnabled(provider, false);
-    } catch {
-      /* best-effort; the now-disabled checkbox already blocks re-enable */
     }
   }
 
@@ -156,10 +146,8 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                 label={label}
                 placeholder={placeholder}
                 hasKey={keyStored}
-                onKeyStatusChange={(has) => {
-                  setToolHasKey((m) => ({ ...m, [provider]: has }));
-                  if (!has) void handleToolKeyRemoved(provider);
-                }}
+                onKeyStatusChange={(has) => setToolHasKey((m) => ({ ...m, [provider]: has }))}
+                onDelete={() => deleteToolProviderKey(provider)}
                 describedById={TOOL_KEYS_HINT_ID}
               />
               <label className="koe-tool-enable">

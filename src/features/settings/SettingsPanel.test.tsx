@@ -9,6 +9,7 @@ const hasProviderApiKey = vi.fn();
 const deleteProviderApiKey = vi.fn();
 const setVoiceProvider = vi.fn();
 const setToolProviderEnabled = vi.fn();
+const deleteToolProviderKey = vi.fn();
 
 vi.mock("../../lib/tauri/ipc", () => ({
   getAppSettings: (...args: unknown[]) => getAppSettings(...args),
@@ -18,6 +19,7 @@ vi.mock("../../lib/tauri/ipc", () => ({
   deleteProviderApiKey: (...args: unknown[]) => deleteProviderApiKey(...args),
   setVoiceProvider: (...args: unknown[]) => setVoiceProvider(...args),
   setToolProviderEnabled: (...args: unknown[]) => setToolProviderEnabled(...args),
+  deleteToolProviderKey: (...args: unknown[]) => deleteToolProviderKey(...args),
   completeOnboarding: vi.fn(),
   setRecorderAdapter: vi.fn(),
 }));
@@ -41,6 +43,8 @@ beforeEach(() => {
   deleteProviderApiKey.mockReset();
   setVoiceProvider.mockReset();
   setToolProviderEnabled.mockReset();
+  deleteToolProviderKey.mockReset();
+  deleteToolProviderKey.mockResolvedValue(undefined);
   getAppSettings.mockResolvedValue(completedSettings);
   saveBudgetConfig.mockResolvedValue(undefined);
   setProviderApiKey.mockResolvedValue(undefined);
@@ -141,8 +145,10 @@ describe("SettingsPanel", () => {
     await act(async () => {
       fireEvent.click(deleteBtn);
     });
-    expect(deleteProviderApiKey).toHaveBeenCalledWith("xai");
-    expect(setToolProviderEnabled).toHaveBeenCalledWith("xai", false);
+    // Tool deletes route through the atomic backend command (key delete + flag
+    // clear in one op), NOT the generic deleteProviderApiKey + a separate toggle.
+    expect(deleteToolProviderKey).toHaveBeenCalledWith("xai");
+    expect(deleteProviderApiKey).not.toHaveBeenCalled();
   });
 
   it("allows closing the panel via onClose callback", async () => {
