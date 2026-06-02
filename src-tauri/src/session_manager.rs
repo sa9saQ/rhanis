@@ -27,7 +27,6 @@
 //! transaction N/A · idempotency_key N/A (real-time session control; the budget
 //! guard stops the session, it does not write a charge).
 
-use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,20 +34,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use crate::audio_bridge::{ManagedAudioBridge, MAX_ARGS_LEN, MAX_WS_TEXT_BYTES};
-use crate::cost_tracker::{CostTracker, Usage};
+use crate::audio_bridge::{ManagedAudioBridge, MAX_WS_TEXT_BYTES};
+use crate::cost_tracker::CostTracker;
 use crate::events::{ManagedSequenceCounter, SequenceCounter};
-use crate::realtime_types::{DispatcherSeam, FunctionCall, ManagedDispatcher, ToolSchema};
-use crate::secret_store::{ManagedSecretStore, SecretString, OPENAI_KEY_NAME};
+use crate::realtime_provider::{select_provider, ProviderEvent, RealtimeAuth, RealtimeProvider};
+use crate::realtime_types::{DispatcherSeam, FunctionCall, ManagedDispatcher};
+use crate::secret_store::{ManagedSecretStore, OPENAI_KEY_NAME};
 use crate::settings_store::ManagedSettings;
 use crate::storage::adapter::{ManagedRecorder, RecorderAdapter};
 
-const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2";
 /// Hard session cap (also a coarse cost backstop). Mirrors CLAUDE.md's 30 min.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const WRITE_CHANNEL_CAP: usize = 32;
@@ -85,46 +82,6 @@ const MAX_SNAPSHOT_SAVE_FAILURES: u32 = 3;
 /// Max frame: same cap; the Realtime API does not fragment messages.
 const WS_MAX_MESSAGE_SIZE: usize = 512 * 1024;
 const WS_MAX_FRAME_SIZE: usize = 512 * 1024;
-
-// ---- RealtimeAuth ------------------------------------------------------------
-
-/// The connection credential. `Byok` is M1; `ManagedCredit` is a stub for M4
-/// (operator-key prepaid). NOT `Serialize`/`Clone`; `Debug` is redacted so the
-/// key cannot leak through a derived format.
-pub enum RealtimeAuth {
-    Byok(SecretString),
-    /// M4 operator-key path; unused in M1.
-    #[allow(dead_code)]
-    ManagedCredit { token: SecretString },
-}
-
-impl RealtimeAuth {
-    /// Builds the `Authorization: Bearer …` header. `expose()` is called ONLY
-    /// here; the formatted string lives in this frame and drops immediately.
-    fn bearer_header(&self) -> Result<HeaderValue, &'static str> {
-        let secret = match self {
-            RealtimeAuth::Byok(s) => s,
-            RealtimeAuth::ManagedCredit { token } => token,
-        };
-        // Zeroize the intermediate "Bearer …" string so the key does not linger
-        // in a second heap allocation after HeaderValue copies it. (The
-        // HeaderValue's own bytes + the TLS write buffer remain an unavoidable
-        // minimum exposure window for a BYOK desktop client.)
-        let mut bearer = zeroize::Zeroizing::new(String::with_capacity(7 + secret.expose().len()));
-        bearer.push_str("Bearer ");
-        bearer.push_str(secret.expose());
-        HeaderValue::from_str(&bearer).map_err(|_| "invalid credential")
-    }
-}
-
-impl fmt::Debug for RealtimeAuth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RealtimeAuth::Byok(_) => f.write_str("RealtimeAuth::Byok(***)"),
-            RealtimeAuth::ManagedCredit { .. } => f.write_str("RealtimeAuth::ManagedCredit(***)"),
-        }
-    }
-}
 
 // ---- managed session state ---------------------------------------------------
 
@@ -184,35 +141,6 @@ fn current_yyyymm() -> u32 {
     (year as u32) * 100 + m as u32
 }
 
-/// Best-effort parse of an OpenAI Realtime usage payload into [`Usage`].
-///
-/// NOTE: the exact token-detail field names are confirmed against live traffic
-/// in koe-ef8 (Windows E2E). Unknown fields default to 0, so an unexpected shape
-/// under-counts rather than panicking — the session timeout is the backstop.
-fn parse_usage(event: &Value) -> Option<Usage> {
-    let u = event.get("response")?.get("usage")?;
-    let input = u.get("input_token_details");
-    let output = u.get("output_token_details");
-    let get = |d: Option<&Value>, k: &str| -> u64 {
-        d.and_then(|d| d.get(k)).and_then(Value::as_u64).unwrap_or(0)
-    };
-    Some(Usage {
-        audio_input_tokens: get(input, "audio_tokens"),
-        text_input_tokens: get(input, "text_tokens"),
-        cached_input_tokens: get(input, "cached_tokens"),
-        audio_output_tokens: get(output, "audio_tokens"),
-        text_output_tokens: get(output, "text_tokens"),
-    })
-}
-
-/// Builds the `session.update` frame advertising the dispatcher's tools.
-fn build_session_update(tools: &[ToolSchema]) -> Value {
-    serde_json::json!({
-        "type": "session.update",
-        "session": { "tools": tools, "tool_choice": "auto" }
-    })
-}
-
 // ---- read loop (AppHandle-free; unit-tested via injected frames + emit) ------
 
 /// What the loop should do after handling one frame.
@@ -264,6 +192,7 @@ const MIC_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[allow(clippy::too_many_arguments)]
 async fn run_read_loop<S, F, A, SA>(
     mut stream: S,
+    provider: Arc<dyn RealtimeProvider>,
     write_tx: mpsc::Sender<Message>,
     cost: Arc<TokioMutex<CostTracker>>,
     recorder: Arc<dyn RecorderAdapter>,
@@ -354,14 +283,17 @@ async fn run_read_loop<S, F, A, SA>(
                             eprintln!("[session] oversized text frame ({} bytes), dropping", txt.len());
                             continue;
                         }
-                        // Give the audio bridge first look at every text frame so
-                        // `response.audio.delta` events reach the playback queue
-                        // before handle_text processes the rest.
-                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(txt.as_str()) {
-                            audio_handler(&event);
-                        }
+                        // Parse the frame ONCE: the audio bridge gets first look
+                        // (so `response.audio.delta` reaches the playback queue),
+                        // then the normalized dispatch path. Unparseable frames are
+                        // ignored and the loop continues (no double serde parse).
+                        let Ok(event) = serde_json::from_str::<serde_json::Value>(txt.as_str())
+                        else {
+                            continue;
+                        };
+                        audio_handler(&event);
                         match handle_text(
-                            txt.as_str(), &write_tx, &cost, &recorder, &dispatcher,
+                            &event, &provider, &write_tx, &cost, &recorder, &dispatcher,
                             &emit, &mut dispatch_tasks, &mut save_failures, &mut cap_warned,
                         ).await {
                             LoopAction::Continue => {}
@@ -424,10 +356,12 @@ async fn run_read_loop<S, F, A, SA>(
     }
 }
 
-/// Handles one decoded server text frame. Returns whether to keep looping.
+/// Handles one decoded server frame via the provider's normalizer. Returns
+/// whether to keep looping.
 #[allow(clippy::too_many_arguments)]
 async fn handle_text<F>(
-    txt: &str,
+    event: &Value,
+    provider: &Arc<dyn RealtimeProvider>,
     write_tx: &mpsc::Sender<Message>,
     cost: &Arc<TokioMutex<CostTracker>>,
     recorder: &Arc<dyn RecorderAdapter>,
@@ -440,20 +374,17 @@ async fn handle_text<F>(
 where
     F: Fn(&str, Option<&str>),
 {
-    let event: Value = match serde_json::from_str(txt) {
-        Ok(v) => v,
-        Err(_) => return LoopAction::Continue, // ignore unparseable frames
-    };
-
-    match event.get("type").and_then(Value::as_str) {
-        Some("response.function_call_arguments.done") => {
+    match provider.parse_frame(event) {
+        ProviderEvent::FunctionCall(pending) => {
             // Reap finished dispatches so the in-flight count reflects reality,
             // then bound it (DoS guard, koe-wj2 — see MAX_INFLIGHT_DISPATCHES for
-            // the threat model and the koe-rxh approval-gate caveat). This runs
-            // BEFORE the call_id/args parse + MAX_ARGS_LEN check so an over-cap
-            // burst is rejected as cheaply as possible. Skipping returns
-            // LoopAction::Continue (fail-soft): the session keeps running and the
-            // dropped call_id is intentionally left unanswered.
+            // the threat model and the koe-rxh approval-gate caveat). The per-frame
+            // argument size cap (MAX_ARGS_LEN) already ran in parse_frame (over-cap
+            // frames arrive here as `Ignored`); the call's arguments are still
+            // UNPARSED at this point, so a saturated burst is rejected below WITHOUT
+            // paying the JSON parse — matching the pre-trait order (cap before arg
+            // parse). Skipping returns LoopAction::Continue (fail-soft): the session
+            // keeps running and the dropped call_id is intentionally left unanswered.
             while dispatch_tasks.try_join_next().is_some() {}
             if dispatch_tasks.len() >= MAX_INFLIGHT_DISPATCHES {
                 // Log once per saturation episode (latched). A sustained flood
@@ -470,35 +401,20 @@ where
             // Back below the cap — re-arm the latch so the next saturation
             // episode logs once more.
             *cap_warned = false;
-            let call_id = event
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let name = event
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            // `arguments` arrives as a JSON-encoded string; enforce a size cap
-            // before the inner JSON parse to prevent a crafted oversized blob
-            // from consuming unbounded allocator memory (DoS guard).
-            let args_raw = event
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if args_raw.len() > MAX_ARGS_LEN {
-                eprintln!("[session] function-call arguments too large, dropping call");
-                return LoopAction::Continue;
-            }
-            // Parse the arguments JSON string, defaulting to null so a malformed
-            // blob still reaches the tool (which validates its own schema).
-            let args = serde_json::from_str(args_raw).unwrap_or(Value::Null);
 
+            // Only now that the cap has admitted the call do we parse the
+            // (already size-capped) arguments. Default to null so a malformed blob
+            // still reaches the tool, which validates its own schema.
+            let args = serde_json::from_str(&pending.args_raw).unwrap_or(Value::Null);
+            let call = FunctionCall {
+                call_id: pending.call_id,
+                name: pending.name,
+                args,
+            };
             let dispatcher = Arc::clone(dispatcher);
             let tx = write_tx.clone();
             dispatch_tasks.spawn(async move {
-                let result = dispatcher.dispatch(FunctionCall { call_id, name, args }).await;
+                let result = dispatcher.dispatch(call).await;
                 // Bounded channel: if the writer is gone (session stopped) these
                 // simply fail and the task ends.
                 let _ = tx.send(Message::Text(result.conversation_item_create.to_string().into())).await;
@@ -506,10 +422,7 @@ where
             });
             LoopAction::Continue
         }
-        Some("response.done") => {
-            let Some(usage) = parse_usage(&event) else {
-                return LoopAction::Continue;
-            };
+        ProviderEvent::Usage(usage) => {
             // Add usage and read the result, then DROP the guard before any
             // .await (never hold the lock across an await — deadlock risk).
             let month = current_yyyymm();
@@ -539,27 +452,14 @@ where
             }
             LoopAction::Continue
         }
-        _ => LoopAction::Continue,
+        // PR1: OpenAI's parse_frame never emits AudioDelta (the audio_handler seam
+        // already consumes audio.delta); both arms simply continue. PR2 will route
+        // Gemini server audio through the AudioDelta arm here.
+        ProviderEvent::AudioDelta | ProviderEvent::Ignored => LoopAction::Continue,
     }
 }
 
 // ---- Tauri commands ----------------------------------------------------------
-
-/// Builds the WS upgrade request with the auth + beta headers.
-fn build_request(
-    auth: &RealtimeAuth,
-) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, &'static str> {
-    let mut request = REALTIME_URL
-        .into_client_request()
-        .map_err(|_| "invalid realtime url")?;
-    let headers = request.headers_mut();
-    headers.insert("Authorization", auth.bearer_header()?);
-    // gpt-realtime-2 is a GA model; the current Realtime WebSocket docs drop the
-    // `OpenAI-Beta: realtime=v1` header (it selected the now-superseded beta
-    // interface). The exact handshake headers + server event shapes are verified
-    // against the live API in koe-ef8 (Windows E2E).
-    Ok(request)
-}
 
 /// Starts a Realtime session. Gated on completed onboarding and a non-exceeded
 /// budget; the BYOK key is fetched and used only to build the handshake header.
@@ -587,6 +487,12 @@ pub async fn start_session(
         return Err("onboarding not completed".to_string());
     }
 
+    // Resolve the voice provider from the persisted selection before touching the
+    // key or the socket. `google/*` is a typed "not yet supported" error (PR2);
+    // unknown values are rejected (defense-in-depth — settings already validates
+    // on load). No status is emitted yet (the UI is still idle at this point).
+    let provider = select_provider(&app_settings.voice_provider_model)?;
+
     let month = current_yyyymm();
     // Restore the running monthly total so a restart does not reset the budget.
     let rec_for_restore = Arc::clone(&recorder.0);
@@ -611,7 +517,7 @@ pub async fn start_session(
 
     emit_session_status(&app, &seq.0, "connecting", None);
 
-    let request = build_request(&auth).map_err(|e| e.to_string())?;
+    let request = provider.build_request(&auth).map_err(|e| e.to_string())?;
     drop(auth); // the credential must not outlive header construction
 
     // Connect with explicit frame/message size limits so a crafted server cannot
@@ -636,16 +542,18 @@ pub async fn start_session(
     let (mut sink, stream) = ws_stream.split();
 
     // Advertise tools so the model can issue function calls (else the dispatch
-    // loop is permanently idle).
-    let session_update = build_session_update(&dispatcher.0.tool_schemas());
-    sink.send(Message::Text(session_update.to_string().into()))
-        .await
-        .map_err(|_| {
+    // loop is permanently idle). The provider supplies the exact setup frames
+    // (OpenAI: one `session.update`); each is sent in order over the sink.
+    for frame in provider.initial_frames(&dispatcher.0.tool_schemas()) {
+        sink.send(frame).await.map_err(|_| {
             // Emit error status before returning so the frontend transitions out
             // of the "connected" state that was emitted at the WS-connect step.
+            // Generic wording (not "session.update") since the provider may send
+            // a different / multi-frame setup sequence.
             emit_session_status(&app, &seq.0, "error", Some("session setup failed"));
-            "session.update failed".to_string()
+            "session setup failed".to_string()
         })?;
+    }
 
     // Single writer owns the sink → concurrent dispatch tasks can't interleave.
     let (write_tx, mut write_rx) = mpsc::channel::<Message>(WRITE_CHANNEL_CAP);
@@ -742,6 +650,7 @@ pub async fn start_session(
     // stop_session signals it via shutdown_tx rather than holding its handle.
     tokio::spawn(run_read_loop(
         stream,
+        provider,
         write_tx,
         cost,
         recorder_arc,
@@ -794,26 +703,9 @@ mod tests {
 
     use base64::Engine as _;
     use crate::cost_tracker::{BudgetConfig, NANODOLLARS_PER_USD};
-    use crate::realtime_types::{DispatchResult, NoopDispatcher};
+    use crate::realtime_provider::OpenAiRealtime;
+    use crate::realtime_types::{DispatchResult, NoopDispatcher, ToolSchema};
     use crate::storage::adapter::{ConversationEvent, Note, RecorderError};
-
-    // ---- RealtimeAuth redaction ----------------------------------------------
-
-    #[test]
-    fn realtime_auth_debug_is_redacted() {
-        let auth = RealtimeAuth::Byok(SecretString::new("sk-supersecret".into()));
-        let dbg = format!("{auth:?}");
-        assert!(!dbg.contains("supersecret"), "Debug must not leak the key");
-        assert_eq!(dbg, "RealtimeAuth::Byok(***)");
-    }
-
-    #[test]
-    fn bearer_header_carries_the_key_but_auth_does_not_serialize() {
-        let auth = RealtimeAuth::Byok(SecretString::new("sk-abc".into()));
-        let h = auth.bearer_header().expect("header");
-        assert_eq!(h.to_str().unwrap(), "Bearer sk-abc");
-        // (compile-time) RealtimeAuth has no Serialize/Clone derive — see type def.
-    }
 
     // ---- current_yyyymm ------------------------------------------------------
 
@@ -824,46 +716,6 @@ mod tests {
         let month = ym % 100;
         assert!((2024..=2100).contains(&year), "year {year}");
         assert!((1..=12).contains(&month), "month {month}");
-    }
-
-    // ---- session.update ------------------------------------------------------
-
-    #[test]
-    fn session_update_includes_tools() {
-        let tools = vec![ToolSchema {
-            kind: "function".into(),
-            name: "write_note".into(),
-            description: "save a note".into(),
-            parameters: serde_json::json!({ "type": "object" }),
-        }];
-        let v = build_session_update(&tools);
-        assert_eq!(v["type"], "session.update");
-        assert_eq!(v["session"]["tools"][0]["name"], "write_note");
-        assert_eq!(v["session"]["tool_choice"], "auto");
-    }
-
-    // ---- usage parse ---------------------------------------------------------
-
-    #[test]
-    fn parse_usage_extracts_token_details() {
-        let event = serde_json::json!({
-            "type": "response.done",
-            "response": { "usage": {
-                "input_token_details": { "audio_tokens": 100, "text_tokens": 10, "cached_tokens": 5 },
-                "output_token_details": { "audio_tokens": 200, "text_tokens": 20 }
-            }}
-        });
-        let u = parse_usage(&event).expect("usage");
-        assert_eq!(u.audio_input_tokens, 100);
-        assert_eq!(u.text_input_tokens, 10);
-        assert_eq!(u.cached_input_tokens, 5);
-        assert_eq!(u.audio_output_tokens, 200);
-        assert_eq!(u.text_output_tokens, 20);
-    }
-
-    #[test]
-    fn parse_usage_missing_usage_is_none() {
-        assert!(parse_usage(&serde_json::json!({ "type": "response.done" })).is_none());
     }
 
     // ---- read loop: frame injection ------------------------------------------
@@ -952,6 +804,7 @@ mod tests {
         })];
         run_read_loop(
             frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1018,6 +871,7 @@ mod tests {
 
         run_read_loop(
             frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1067,6 +921,7 @@ mod tests {
         ];
         run_read_loop(
             frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost.clone(),
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1102,6 +957,7 @@ mod tests {
         sd_tx.send(()).unwrap();
         run_read_loop(
             frame_stream(vec![]),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1156,6 +1012,7 @@ mod tests {
         let stream = futures_util::stream::iter(vec![Err(WsError::ConnectionClosed)]);
         run_read_loop(
             stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1200,6 +1057,7 @@ mod tests {
         ]);
         run_read_loop(
             stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1235,6 +1093,7 @@ mod tests {
         let frames = vec![usage.clone(), usage.clone(), usage.clone(), usage];
         run_read_loop(
             frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(FailingRecorder) as Arc<dyn RecorderAdapter>,
@@ -1278,6 +1137,7 @@ mod tests {
         ]);
         run_read_loop(
             stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1338,6 +1198,7 @@ mod tests {
         ]);
         run_read_loop(
             stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1380,6 +1241,7 @@ mod tests {
         let sac = Arc::clone(&stop_audio_called);
         run_read_loop(
             frame_stream(vec![]),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1425,6 +1287,7 @@ mod tests {
         })];
         run_read_loop(
             frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1474,6 +1337,7 @@ mod tests {
         ]);
         run_read_loop(
             stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1518,6 +1382,7 @@ mod tests {
         ]);
         run_read_loop(
             stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1580,6 +1445,7 @@ mod tests {
         // mic_running=false → abnormal exit path.
         run_read_loop(
             frame_stream(vec![]),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
@@ -1662,6 +1528,7 @@ mod tests {
         let stream = futures_util::stream::iter(vec![Ok(Message::Close(None))]);
         run_read_loop(
             stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
             cost,
             Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
