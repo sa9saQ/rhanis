@@ -49,6 +49,33 @@ use crate::events::SequenceCounter;
 /// Default human-decision deadline. After this the request fails closed.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum number of DANGER approvals that may be PENDING (awaiting an operator
+/// decision) at once. A new DANGER request that would exceed this is refused
+/// immediately — fail-closed (never auto-approved) — instead of opening yet
+/// another modal. This caps the approval gate's own state against a burst of
+/// DANGER `function_call`s from a malicious/compromised model server (koe-rxh):
+///
+/// - **Modal flood** — structurally bounded: at most this many
+///   `tool-approval-required` modals ever reach the operator at once.
+/// - **Approval-map growth** — bounded: the `pending` map cannot grow without
+///   bound under a sustained DANGER burst.
+/// - **Dispatch-slot starvation** — *partially* mitigated, NOT fully closed:
+///   each pending DANGER holds one in-flight dispatch slot for up to the 30s
+///   deadline (tool_dispatcher). In steady state, capping pending approvals far
+///   below the dispatch cap (`MAX_INFLIGHT_DISPATCHES` = 64, koe-wj2) keeps most
+///   slots free. BUT this cap is enforced inside [`ApprovalGate::register`],
+///   which a dispatch task only reaches AFTER session_manager has already
+///   `spawn`ed it onto the in-flight JoinSet — so a fast back-to-back burst can
+///   transiently fill all 64 slots before the over-cap tasks reach `register`
+///   and decline, briefly skipping legitimate SAFE/CAUTION calls. Fully closing
+///   that race needs a risk-aware admission BEFORE spawn (refuse an over-cap
+///   DANGER call without consuming a slot); tracked as follow-up koe-e2b.
+///
+/// Chosen generously enough that a realistic batch of genuine DANGER operations
+/// (e.g. "delete these few files") is never refused, yet far below the dispatch
+/// cap so steady-state slot pressure stays low.
+const MAX_PENDING_APPROVALS: usize = 8;
+
 /// Hard cap on the redacted summary length before it crosses to the WebView.
 /// Defense-in-depth: the caller (koe-2gy tool_dispatcher) owns redaction, but a
 /// cap bounds a pathological/oversized summary from a misbehaving caller so it
@@ -192,6 +219,9 @@ pub struct ApprovalGate {
     /// Shared activity-event sequence (one ordering space with `ToolEvent`).
     seq: Arc<SequenceCounter>,
     timeout: Duration,
+    /// Max concurrently-PENDING approvals; a request beyond this fails closed
+    /// without opening a modal (see [`MAX_PENDING_APPROVALS`]).
+    max_pending: usize,
 }
 
 impl ApprovalGate {
@@ -200,6 +230,7 @@ impl ApprovalGate {
             pending: Mutex::new(HashMap::new()),
             seq,
             timeout: DEFAULT_TIMEOUT,
+            max_pending: MAX_PENDING_APPROVALS,
         }
     }
 
@@ -208,6 +239,15 @@ impl ApprovalGate {
     fn with_timeout(seq: Arc<SequenceCounter>, timeout: Duration) -> Self {
         Self {
             timeout,
+            ..Self::new(seq)
+        }
+    }
+
+    /// Test/diagnostic constructor with a custom pending-approval cap.
+    #[cfg(test)]
+    fn with_max_pending(seq: Arc<SequenceCounter>, max_pending: usize) -> Self {
+        Self {
+            max_pending,
             ..Self::new(seq)
         }
     }
@@ -231,9 +271,7 @@ impl ApprovalGate {
     /// Reserves an `approvalId` + a `sequence`, registers a pending oneshot, and
     /// returns the receiver. Split out from [`request_approval`] so the routing
     /// logic is testable without a Tauri `AppHandle`.
-    fn register(&self) -> (String, u64, oneshot::Receiver<ApprovalDecision>) {
-        let approval_id = Self::gen_id();
-        let sequence = self.seq.next();
+    fn register(&self) -> Option<(String, u64, oneshot::Receiver<ApprovalDecision>)> {
         let (tx, rx) = oneshot::channel();
         let expires_at = Instant::now() + self.timeout;
         // A poisoned lock means a prior holder panicked; recover the guard rather
@@ -247,8 +285,21 @@ impl ApprovalGate {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Pending-approval cap (koe-rxh): refuse a new request that would exceed
+        // the cap WITHOUT reserving an id/sequence or opening a modal. Checked
+        // under the same lock as the insert below, so two concurrent requests can
+        // never both slip past the cap. The caller (`request_approval`) fails
+        // closed (Declined) on `None`.
+        if pending.len() >= self.max_pending {
+            return None;
+        }
+        // Reserve id + sequence only now that the request is admitted, so a
+        // refused (over-cap) request leaves no observable trace: it neither
+        // advances the activity sequence nor consumes a CSPRNG id.
+        let approval_id = Self::gen_id();
+        let sequence = self.seq.next();
         pending.insert(approval_id.clone(), PendingApproval { tx, expires_at });
-        (approval_id, sequence, rx)
+        Some((approval_id, sequence, rx))
     }
 
     /// Awaits the decision for `approval_id`, enforcing the fail-closed deadline.
@@ -293,7 +344,15 @@ impl ApprovalGate {
     ) -> ApprovalOutcome {
         use tauri::Emitter;
 
-        let (approval_id, sequence, rx) = self.register();
+        let (approval_id, sequence, rx) = match self.register() {
+            Some(reg) => reg,
+            // Pending-approval cap reached (koe-rxh): refuse this DANGER request
+            // without emitting a modal. Fail-closed — the tool does not run — and
+            // the in-flight dispatch slot is freed immediately, so a burst of
+            // DANGER calls cannot starve legitimate SAFE/CAUTION dispatches or
+            // flood the operator with modals.
+            None => return ApprovalOutcome::Declined,
+        };
         // RAII safety net: if this future is dropped (e.g. the dispatch task is
         // aborted on session stop / budget trip) before `await_decision` removes
         // the entry, the guard removes it so no orphaned sender leaks in
@@ -488,8 +547,8 @@ mod tests {
     #[test]
     fn register_produces_unique_ids_and_monotonic_sequence() {
         let g = gate();
-        let (id0, seq0, _rx0) = g.register();
-        let (id1, seq1, _rx1) = g.register();
+        let (id0, seq0, _rx0) = g.register().expect("register within cap");
+        let (id1, seq1, _rx1) = g.register().expect("register within cap");
         assert_ne!(id0, id1);
         assert_eq!(seq0, 0);
         assert_eq!(seq1, 1);
@@ -501,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_approve_yields_approved_and_clears_pending() {
         let g = gate();
-        let (id, _seq, rx) = g.register();
+        let (id, _seq, rx) = g.register().expect("register within cap");
         // Decision can be delivered before the await; oneshot buffers it.
         g.resolve(&id, ApprovalDecision::Approve).expect("resolve");
         assert_eq!(g.await_decision(&id, rx).await, ApprovalOutcome::Approved);
@@ -511,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_deny_yields_declined() {
         let g = gate();
-        let (id, _seq, rx) = g.register();
+        let (id, _seq, rx) = g.register().expect("register within cap");
         g.resolve(&id, ApprovalDecision::Deny).expect("resolve");
         assert_eq!(g.await_decision(&id, rx).await, ApprovalOutcome::Declined);
         assert_eq!(g.pending_len(), 0);
@@ -529,7 +588,7 @@ mod tests {
     #[test]
     fn resolve_twice_rejects_the_duplicate() {
         let g = gate();
-        let (id, _seq, _rx) = g.register();
+        let (id, _seq, _rx) = g.register().expect("register within cap");
         assert!(g.resolve(&id, ApprovalDecision::Approve).is_ok());
         // Second resolve finds no entry (removed on first) → rejected.
         assert_eq!(
@@ -543,7 +602,7 @@ mod tests {
         // A resolve that arrives after the awaiting side already gave up (rx
         // dropped) must report failure, not a phantom success.
         let g = gate();
-        let (id, _seq, rx) = g.register();
+        let (id, _seq, rx) = g.register().expect("register within cap");
         drop(rx);
         assert_eq!(
             g.resolve(&id, ApprovalDecision::Approve),
@@ -559,7 +618,7 @@ mod tests {
             Arc::new(SequenceCounter::new()),
             Duration::from_millis(20),
         );
-        let (id, _seq, rx) = g.register();
+        let (id, _seq, rx) = g.register().expect("register within cap");
         // No resolve — the deadline must elapse and decline.
         assert_eq!(g.await_decision(&id, rx).await, ApprovalOutcome::Declined);
         assert_eq!(g.pending_len(), 0);
@@ -570,7 +629,7 @@ mod tests {
         // Simulate the app dropping the pending sender (teardown) without a
         // decision: the awaiting side must fail closed.
         let g = gate();
-        let (id, _seq, rx) = g.register();
+        let (id, _seq, rx) = g.register().expect("register within cap");
         // Remove + drop the sender out from under the receiver.
         g.remove_pending(&id);
         assert_eq!(g.await_decision(&id, rx).await, ApprovalOutcome::Declined);
@@ -584,7 +643,7 @@ mod tests {
             Arc::new(SequenceCounter::new()),
             Duration::from_millis(15),
         );
-        let (id, _seq, rx) = g.register();
+        let (id, _seq, rx) = g.register().expect("register within cap");
         assert_eq!(g.await_decision(&id, rx).await, ApprovalOutcome::Declined);
         assert_eq!(
             g.resolve(&id, ApprovalDecision::Approve),
@@ -681,7 +740,7 @@ mod tests {
         // before a decision: the PendingGuard (held in request_approval's frame)
         // drops and removes the entry, so no orphaned sender leaks in `pending`.
         let g = gate();
-        let (id, _seq, _rx) = g.register();
+        let (id, _seq, _rx) = g.register().expect("register within cap");
         assert_eq!(g.pending_len(), 1);
         {
             let _guard = PendingGuard {
@@ -700,5 +759,50 @@ mod tests {
         let g = gate();
         let huge = "x".repeat(100);
         assert_eq!(g.resolve(&huge, ApprovalDecision::Approve), Err("unknown approval"));
+    }
+
+    // ---- pending-approval cap (koe-rxh: modal-flood + starvation guard) -------
+
+    #[test]
+    fn register_refuses_new_requests_at_pending_cap() {
+        // At the cap a further register is refused (None) so the caller fails
+        // closed without opening another modal; the already-pending entries stay.
+        let g = ApprovalGate::with_max_pending(Arc::new(SequenceCounter::new()), 3);
+        let _a = g.register().expect("1st within cap");
+        let _b = g.register().expect("2nd within cap");
+        let _c = g.register().expect("3rd within cap");
+        assert!(g.register().is_none(), "4th request must be refused at the cap");
+        assert_eq!(g.pending_len(), 3, "a refused request must not be registered");
+    }
+
+    #[test]
+    fn freeing_a_pending_slot_lets_a_new_request_register() {
+        // The cap counts CURRENTLY-pending approvals: once one resolves/expires and
+        // frees its slot, a new DANGER request can register again (the cap is a
+        // concurrency bound, not a lifetime quota).
+        let g = ApprovalGate::with_max_pending(Arc::new(SequenceCounter::new()), 2);
+        let (id_a, _s, _rx_a) = g.register().expect("1st within cap");
+        let _b = g.register().expect("2nd within cap");
+        assert!(g.register().is_none(), "at cap");
+        g.remove_pending(&id_a); // a decision arrives / the deadline elapses for A
+        assert!(
+            g.register().is_some(),
+            "a freed slot must allow a new registration"
+        );
+        assert_eq!(g.pending_len(), 2);
+    }
+
+    #[test]
+    fn refused_over_cap_request_has_no_side_effect_on_sequence() {
+        // A refused (over-cap) request reserves neither an id nor a sequence, so
+        // the abuse path cannot advance the shared activity sequence. With cap=1:
+        // accept (seq 0) → refuse (no seq.next) → free → accept (seq 1, no gap).
+        let g = ApprovalGate::with_max_pending(Arc::new(SequenceCounter::new()), 1);
+        let (id0, seq0, _rx0) = g.register().expect("1st within cap");
+        assert_eq!(seq0, 0);
+        assert!(g.register().is_none(), "at cap → refused");
+        g.remove_pending(&id0); // free the only slot
+        let (_id1, seq1, _rx1) = g.register().expect("after slot freed");
+        assert_eq!(seq1, 1, "the refused request must not have advanced the sequence");
     }
 }
