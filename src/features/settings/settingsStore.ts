@@ -16,6 +16,7 @@ import {
   saveBudgetConfig as ipcSaveBudgetConfig,
   setToolProviderEnabled as ipcSetToolProviderEnabled,
   setVoiceProvider as ipcSetVoiceProvider,
+  type ToolProvider,
 } from "../../lib/tauri/ipc";
 import type { AppSettings } from "./types";
 
@@ -37,9 +38,9 @@ interface SettingsState {
   /** Persists the selected voice provider/model (koe-31u), then re-fetches. */
   saveVoiceProvider: (value: string) => Promise<void>;
   /** Enables/disables a 手足 tool provider (koe-31u), then re-fetches. */
-  setToolProviderEnabled: (provider: string, enabled: boolean) => Promise<void>;
+  setToolProviderEnabled: (provider: ToolProvider, enabled: boolean) => Promise<void>;
   /** Deletes a 手足 tool key + clears its flag atomically (koe-31u), then re-fetches. */
-  deleteToolProviderKey: (provider: string) => Promise<void>;
+  deleteToolProviderKey: (provider: ToolProvider) => Promise<void>;
 }
 
 export const useSettingsStore = create<SettingsState>((set) => ({

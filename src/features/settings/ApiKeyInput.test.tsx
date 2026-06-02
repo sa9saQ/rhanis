@@ -77,7 +77,8 @@ describe("ApiKeyInput", () => {
     });
 
     expect(setProviderApiKey).toHaveBeenCalledWith("xai", "xai-secret");
-    expect(hasProviderApiKey).toHaveBeenCalledWith("xai");
+    // The presence-confirm runs after the save resolves (a second await).
+    await waitFor(() => expect(hasProviderApiKey).toHaveBeenCalledWith("xai"));
     expect(setProviderApiKey).not.toHaveBeenCalledWith("openai", expect.anything());
   });
 
@@ -97,6 +98,25 @@ describe("ApiKeyInput", () => {
     expect(alert.textContent!.length).toBeGreaterThan(0);
   });
 
+  it("does not show a save error if only the presence-confirm fails (save succeeded)", async () => {
+    setProviderApiKey.mockResolvedValue(undefined); // save OK
+    hasProviderApiKey.mockRejectedValue(new Error("vault temporarily busy")); // confirm fails
+    const onKeyStatusChange = vi.fn();
+    render(<ApiKeyInput onKeyStatusChange={onKeyStatusChange} />);
+    const input = document.querySelector("input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-x" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /保存|save/i }));
+    });
+
+    // The save succeeded → no save-failure alert, key treated as present
+    // optimistically, and the input is cleared.
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(onKeyStatusChange).toHaveBeenCalledWith(true);
+    expect(input.value).toBe("");
+  });
+
   it("confirms key presence via hasProviderApiKey after save", async () => {
     hasProviderApiKey.mockResolvedValue(true);
     render(<ApiKeyInput />);
@@ -107,7 +127,8 @@ describe("ApiKeyInput", () => {
       fireEvent.click(screen.getByRole("button", { name: /保存|save/i }));
     });
 
-    expect(hasProviderApiKey).toHaveBeenCalledWith("openai");
+    // The presence-confirm runs after the save resolves (a second await).
+    await waitFor(() => expect(hasProviderApiKey).toHaveBeenCalledWith("openai"));
   });
 
   it("calls deleteProviderApiKey with the provider when delete is clicked", async () => {

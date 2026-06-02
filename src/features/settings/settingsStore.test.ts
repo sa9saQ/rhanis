@@ -173,7 +173,7 @@ describe("settingsStore.setToolProviderEnabled", () => {
   it("propagates IPC errors (does not silently swallow)", async () => {
     setToolProviderEnabled.mockRejectedValue(new Error("unsupported tool provider"));
     await expect(
-      useSettingsStore.getState().setToolProviderEnabled("bad", true),
+      useSettingsStore.getState().setToolProviderEnabled("xai", true),
     ).rejects.toThrow();
   });
 });

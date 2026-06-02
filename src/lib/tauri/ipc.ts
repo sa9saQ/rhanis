@@ -15,6 +15,16 @@ import type {
 } from "../../features/activity/types";
 import type { AppSettings } from "../../features/settings/types";
 
+/**
+ * Allowlisted provider ids — mirror the Rust `provider_key_name` /
+ * `tool_provider_key_name` allowlists. Typing the command params as these unions
+ * catches a caller typo at compile time instead of only at the backend's
+ * runtime rejection.
+ */
+export type VoiceProvider = "openai" | "google";
+export type ToolProvider = "xai" | "x" | "search";
+export type Provider = VoiceProvider | ToolProvider;
+
 /** Backend event channels. */
 export const EVENT = {
   toolEvent: "tool-event",
@@ -154,13 +164,13 @@ export function setVoiceProvider(value: string): Promise<void> {
 
 /** Enables/disables a 手足 (tool) provider. Records intent only — not the key.
  *  Enabling is rejected backend-side if no key is stored for the provider. */
-export function setToolProviderEnabled(provider: string, enabled: boolean): Promise<void> {
+export function setToolProviderEnabled(provider: ToolProvider, enabled: boolean): Promise<void> {
   return invoke(COMMAND.setToolProviderEnabled, { provider, enabled });
 }
 
-/** Deletes a 手足 tool key AND clears its enable flag atomically (flag-first
- *  ordering, so a partial failure can't leave an "enabled but key-less" state). */
-export function deleteToolProviderKey(provider: string): Promise<void> {
+/** Deletes a 手足 tool key AND clears its enable flag atomically (one backend
+ *  lock-hold, so a concurrent enable can't leave an "enabled but key-less" state). */
+export function deleteToolProviderKey(provider: ToolProvider): Promise<void> {
   return invoke(COMMAND.deleteToolProviderKey, { provider });
 }
 
@@ -169,17 +179,17 @@ export function deleteToolProviderKey(provider: string): Promise<void> {
  * 手足: `xai` / `x` / `search`). The key is never returned to the WebView
  * afterwards (no get-* command exists for any provider).
  */
-export function setProviderApiKey(provider: string, key: string): Promise<void> {
+export function setProviderApiKey(provider: Provider, key: string): Promise<void> {
   return invoke(COMMAND.setProviderApiKey, { provider, key });
 }
 
 /** Returns whether a key is stored for `provider`, without returning its value. */
-export function hasProviderApiKey(provider: string): Promise<boolean> {
+export function hasProviderApiKey(provider: Provider): Promise<boolean> {
   return invoke<boolean>(COMMAND.hasProviderApiKey, { provider });
 }
 
 /** Deletes the stored key for `provider`. */
-export function deleteProviderApiKey(provider: string): Promise<void> {
+export function deleteProviderApiKey(provider: Provider): Promise<void> {
   return invoke(COMMAND.deleteProviderApiKey, { provider });
 }
 

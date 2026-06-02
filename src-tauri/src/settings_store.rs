@@ -225,9 +225,16 @@ impl ManagedSettings {
     /// lock is held only across the synchronous load+save (no `.await` inside),
     /// so it never blocks the async runtime. If `f` returns `Err`, nothing is
     /// saved (the in-memory mutation is discarded — no partial write).
-    fn update<F>(&self, f: F) -> Result<(), String>
+    /// Runs `f` while holding the settings write lock, handing it the store so a
+    /// command can keep settings **and** an external store (the secret vault)
+    /// consistent across more than one operation without another writer racing
+    /// in between. The lock is held only across synchronous work (no `.await`
+    /// inside), so it never blocks the async runtime. NOTE: `f` must use the
+    /// `store` arg and must NOT re-enter `update`/`replace` (the lock is not
+    /// reentrant — that would deadlock).
+    fn with_write_lock<F, T>(&self, f: F) -> Result<T, String>
     where
-        F: FnOnce(&mut AppSettings) -> Result<(), String>,
+        F: FnOnce(&dyn SettingsStore) -> Result<T, String>,
     {
         // PoisonError → fixed message (a poisoned lock means a prior writer
         // panicked; surface it as "unavailable", never as a silent success).
@@ -235,9 +242,21 @@ impl ManagedSettings {
             .1
             .lock()
             .map_err(|_| SettingsError::Unavailable.to_string())?;
-        let mut current = self.0.load().map_err(|e| e.to_string())?;
-        f(&mut current)?;
-        self.0.save(&current).map_err(|e| e.to_string())
+        f(self.0.as_ref())
+    }
+
+    /// `load → mutate → save` under the write lock so two concurrent mutating
+    /// commands can't read the same base and clobber each other. If `f` returns
+    /// `Err`, nothing is saved (the in-memory mutation is discarded).
+    fn update<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut AppSettings) -> Result<(), String>,
+    {
+        self.with_write_lock(|store| {
+            let mut current = store.load().map_err(|e| e.to_string())?;
+            f(&mut current)?;
+            store.save(&current).map_err(|e| e.to_string())
+        })
     }
 
     /// Saves a fully-constructed settings object under the write lock. Used by
@@ -245,11 +264,7 @@ impl ManagedSettings {
     /// load-modify), so that path is serialised with the other writers too — no
     /// settings write bypasses the lock.
     fn replace(&self, settings: &AppSettings) -> Result<(), String> {
-        let _guard = self
-            .1
-            .lock()
-            .map_err(|_| SettingsError::Unavailable.to_string())?;
-        self.0.save(settings).map_err(|e| e.to_string())
+        self.with_write_lock(|store| store.save(settings).map_err(|e| e.to_string()))
     }
 }
 
@@ -367,23 +382,27 @@ pub async fn set_tool_provider_enabled(
     // Backend invariant: a tool can only be enabled while its key is actually
     // stored. Don't trust the UI's disabled checkbox — a direct or stale WebView
     // call must not persist a credential-less "enabled" provider for the future
-    // tool path (koe-eal) to trust. Fail-closed: an Err from has_api_key (locked
+    // tool path (koe-eal) to trust. The key-presence check AND the flag write
+    // run under ONE settings-lock hold, so a concurrent delete_tool_provider_key
+    // can't slip between them. Fail-closed: an Err from has_api_key (locked
     // vault) blocks the enable too.
-    if enabled && !secret.0.has_api_key(key_name).map_err(|e| e.to_string())? {
-        return Err("set an API key before enabling this tool".into());
-    }
-    settings.update(|s| {
+    settings.with_write_lock(|store| {
+        if enabled && !secret.0.has_api_key(key_name).map_err(|e| e.to_string())? {
+            return Err("set an API key before enabling this tool".into());
+        }
+        let mut s = store.load().map_err(|e| e.to_string())?;
         set_tool_flag(&mut s.tool_providers, &provider, enabled);
-        Ok(())
+        store.save(&s).map_err(|e| e.to_string())
     })
 }
 
-/// Deletes a 手足 tool key **and** clears its enable flag. The flag is cleared
-/// FIRST so a partial failure can never leave the unsafe "enabled but key-less"
-/// state: if the key delete then fails, we are left with disabled + key-present
-/// (benign — the tool is simply off). This is the atomic counterpart to the
-/// enable guard above; the frontend routes tool-key deletes through here rather
-/// than the generic delete + a best-effort flag clear.
+/// Deletes a 手足 tool key **and** clears its enable flag, both under ONE
+/// settings-lock hold so a concurrent `set_tool_provider_enabled(true)` can't
+/// re-enable the provider in between (which would leave the unsafe enabled=true +
+/// key-absent state). Order within the lock: clear the flag, then delete the key
+/// — a partial failure (the delete errors) therefore leaves disabled + key-
+/// present (benign — the tool is simply off). The frontend routes tool-key
+/// deletes through here rather than the generic delete + a best-effort flag clear.
 #[tauri::command]
 pub async fn delete_tool_provider_key(
     provider: String,
@@ -391,11 +410,12 @@ pub async fn delete_tool_provider_key(
     secret: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<(), String> {
     let key_name = tool_provider_key_name(&provider)?;
-    settings.update(|s| {
+    settings.with_write_lock(|store| {
+        let mut s = store.load().map_err(|e| e.to_string())?;
         set_tool_flag(&mut s.tool_providers, &provider, false);
-        Ok(())
-    })?;
-    secret.0.delete_api_key(key_name).map_err(|e| e.to_string())
+        store.save(&s).map_err(|e| e.to_string())?;
+        secret.0.delete_api_key(key_name).map_err(|e| e.to_string())
+    })
 }
 
 /// Maps a 手足 tool provider id to its secret record name (tools only — voice

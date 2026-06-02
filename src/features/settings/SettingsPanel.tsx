@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { hasProviderApiKey } from "../../lib/tauri/ipc";
+import { hasProviderApiKey, type ToolProvider } from "../../lib/tauri/ipc";
 import { useSettingsStore } from "./settingsStore";
 import { ApiKeyInput } from "./ApiKeyInput";
 import { VoiceProviderSelector } from "./VoiceProviderSelector";
@@ -78,7 +78,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
     }
   }
 
-  async function handleToolToggle(provider: string, enabled: boolean) {
+  async function handleToolToggle(provider: ToolProvider, enabled: boolean) {
     setActionError(null);
     try {
       await setToolProviderEnabled(provider, enabled);

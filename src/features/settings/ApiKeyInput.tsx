@@ -9,7 +9,12 @@
 
 import { useRef, useState } from "react";
 
-import { deleteProviderApiKey, hasProviderApiKey, setProviderApiKey } from "../../lib/tauri/ipc";
+import {
+  deleteProviderApiKey,
+  hasProviderApiKey,
+  setProviderApiKey,
+  type Provider,
+} from "../../lib/tauri/ipc";
 
 interface ApiKeyInputProps {
   /**
@@ -17,7 +22,7 @@ interface ApiKeyInputProps {
    * vault record via a closed allowlist. Defaults to "openai" so the original
    * OpenAI key UX is unchanged.
    */
-  provider?: string;
+  provider?: Provider;
   /** Field label (e.g. "OpenAI APIキー", "XAI (Grok) APIキー"). */
   label?: string;
   /** Input placeholder. */
@@ -60,16 +65,31 @@ export function ApiKeyInput({
     setSaving(true);
     setError(null);
     try {
-      await setProviderApiKey(provider, value);
-      // Clear the input immediately — the key must not linger in React state or DOM.
+      try {
+        await setProviderApiKey(provider, value);
+      } catch {
+        // Save itself failed → surface a fixed message (do NOT leak the raw
+        // backend error, which may carry a path / PII) and keep the input so the
+        // user can retry without retyping.
+        setError("APIキーの保存に失敗しました。もう一度お試しください。");
+        return;
+      }
+      // Save succeeded → clear the input immediately (the key must not linger in
+      // React state or DOM).
       setValue("");
       setShow(false);
-      // Confirm presence via has (not by returning the key value).
-      const confirmed = await hasProviderApiKey(provider);
-      onKeyStatusChange?.(confirmed);
-    } catch {
-      // Do NOT surface the raw backend error — it may carry a path / PII.
-      setError("APIキーの保存に失敗しました。もう一度お試しください。");
+      // Confirm presence via has (not by returning the key value). A failure
+      // HERE must NOT be reported as a save failure — the key IS already stored;
+      // treat it as present optimistically so the user isn't misled into retyping.
+      // NB: await unconditionally (a separate statement) — folding it into
+      // `onKeyStatusChange?.(await …)` would skip the call entirely when the
+      // optional callback is absent (optional-call short-circuit).
+      try {
+        const confirmed = await hasProviderApiKey(provider);
+        onKeyStatusChange?.(confirmed);
+      } catch {
+        onKeyStatusChange?.(true);
+      }
     } finally {
       inFlightSave.current = false;
       setSaving(false);
