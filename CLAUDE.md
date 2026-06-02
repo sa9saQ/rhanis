@@ -117,9 +117,10 @@ Enitar (`/home/zsaku/projects/Enitar/`) は同ユーザーの確立済 Tauri+Rea
 
 ## Testing
 - Rust: `cargo test --manifest-path src-tauri/Cargo.toml`（WSL 可、純粋ロジックの単体テスト）
-- Frontend: M1 で Vitest 追加予定（まだ未導入）
+- Frontend: Vitest 導入済（`pnpm install` 後 `pnpm test`）。typecheck は `./node_modules/.bin/tsc --noEmit`（`npx tsc` は supply-chain-gate hook が `trpc` への typo と誤検知するので直叩き推奨）
 - E2E: ネイティブ Windows で `pnpm tauri dev`（音声・WebSocket 込み）
 - TDD: 実装ファイル新規作成時は `#[cfg(test)] mod tests` を同ファイルに同梱
+- **WSL の ALSA ビルド回避（cpal が libasound に link、Rust ビルド毎に必須）**: `/tmp` はセッション間でクリアされるので毎回再展開 — `dpkg-deb -x ~/projects/koe/libasound2-dev_*.deb /tmp/claude-1000/alsa-dev` + `ln -sf /usr/lib/x86_64-linux-gnu/libasound.so.2.0.0 /tmp/claude-1000/alsa-dev/usr/lib/x86_64-linux-gnu/libasound.so`（dev .deb は `.so` symlink のみ同梱、実体は system runtime にある）。`PKG_CONFIG_PATH=<extract>/pkgconfig` + `RUSTFLAGS="-L<extract>"` を export して `cargo test`。worktree の fresh target は `CARGO_TARGET_DIR` で既存 worktree の target を指すと cold build（数分）を回避できる
 
 ## Build & Deploy
 - Dev: `pnpm tauri dev`（ネイティブ Windows）
@@ -134,9 +135,10 @@ M1 では `.env` 不使用。API キーはユーザーがアプリ UI で入力 
 | （該当なし、M1） | — | — |
 
 ## Branches / Milestones
-- `main`: M1 backend 完成（PR #1–#15 merged）。cost_tracker / secret_store（stronghold BYOK）/ activity 可視化 / recorder（SQLite）/ settings + 予算オンボーディング / approval_gate（SAFE・CAUTION・DANGER の 3 段）/ tool_dispatcher / session_manager（WebSocket + RealtimeAuth + コスト gate）/ audio_bridge（cpal マイク + rodio 再生）/ M1 tools 4 本 が実装・マージ済
-- **M1 残**: ネイティブ Windows 実機での E2E（`koe-ef8`、依存は全て ✓ で着手可）と hardening（`koe-pr3` audio race / `koe-8kw` read_file の Windows handle walk / `koe-wj2` dispatch の DoS guard 等）。WSL ではマイク（cpal）が動かないため E2E は Windows 必須
-- **製品方向（2026-06）**: multi-provider キー設定基盤 `koe-31u`（声 = OpenAI / Google 選択 + 手足 tool 用キー）→ 接続層の trait 化 `koe-zv3`（OpenAI Realtime ⇄ Gemini Live）+ 手足 tool `koe-eal`。許可ポリシー UI は `koe-351`
+- `main`: M1 backend 完成（PR #1–#20 merged）。cost_tracker / secret_store（stronghold BYOK + multi-provider 対応 koe-31u）/ activity 可視化 / recorder（SQLite）/ settings + 予算オンボーディング + 声 provider / 手足 tool キー UI / approval_gate（SAFE・CAUTION・DANGER の 3 段）/ tool_dispatcher（in-flight 上限 DoS guard koe-wj2）/ session_manager（WebSocket + RealtimeAuth + コスト gate）/ audio_bridge（cpal マイク + rodio 再生）/ M1 tools 4 本 が実装・マージ済
+- **M1 残**: ネイティブ Windows 実機での E2E（`koe-ef8`、依存は全て ✓ で着手可）と hardening（`koe-pr3` audio race / `koe-8kw` read_file の Windows handle walk 等）。WSL ではマイク（cpal）が動かないため E2E は Windows 必須
+- **製品方向（2026-06）**: multi-provider キー設定基盤 `koe-31u` ✅ merged（#20。声 = OpenAI / Google 選択 + 手足 tool キーの暗号保管 + 設定 UI）→ 次: 接続層 trait 化 `koe-zv3`（OpenAI Realtime ⇄ Gemini Live 実切替。koe-31u が persist した `voice_provider_model` を consume）+ 手足 tool `koe-eal`（x_search 等を tool_dispatcher に追加。`tool_providers` フラグと各プロバイダキーを consume）。許可ポリシー UI は `koe-351`（settings 層を koe-31u と共有するので衝突注意）
+- **follow-up（review 派生）**: `koe-rxh`（P2 DANGER 承認待ちが dispatch 枠を占有する starvation の pending-approval cap）/ `koe-a4h`（P3 audio_bridge.rs:932 の clippy never_loop）
 - タスクの最新状態は markdown ではなく **bd**（`bd ready` / `bd show <id>`）が真実の源。本節は節目の要約のみに留める
 
 詳細マイルストーンは `~/.claude/plans/virtual-riding-hearth.md` 参照。
