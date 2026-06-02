@@ -2,6 +2,7 @@ mod approval_gate;
 mod audio_bridge;
 mod cost_tracker;
 mod events;
+mod realtime_provider;
 mod realtime_types;
 mod secret_store;
 mod session_manager;
