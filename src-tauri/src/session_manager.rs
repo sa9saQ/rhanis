@@ -41,7 +41,7 @@ use crate::audio_bridge::{ManagedAudioBridge, MAX_WS_TEXT_BYTES};
 use crate::cost_tracker::CostTracker;
 use crate::events::{ManagedSequenceCounter, SequenceCounter};
 use crate::realtime_provider::{select_provider, ProviderEvent, RealtimeAuth, RealtimeProvider};
-use crate::realtime_types::{DispatcherSeam, ManagedDispatcher};
+use crate::realtime_types::{DispatcherSeam, FunctionCall, ManagedDispatcher};
 use crate::secret_store::{ManagedSecretStore, OPENAI_KEY_NAME};
 use crate::settings_store::ManagedSettings;
 use crate::storage::adapter::{ManagedRecorder, RecorderAdapter};
@@ -375,15 +375,16 @@ where
     F: Fn(&str, Option<&str>),
 {
     match provider.parse_frame(event) {
-        ProviderEvent::FunctionCall(call) => {
+        ProviderEvent::FunctionCall(pending) => {
             // Reap finished dispatches so the in-flight count reflects reality,
             // then bound it (DoS guard, koe-wj2 — see MAX_INFLIGHT_DISPATCHES for
             // the threat model and the koe-rxh approval-gate caveat). The per-frame
-            // argument size cap (MAX_ARGS_LEN) lives in the provider's parse_frame
-            // — an over-cap frame arrives here as `Ignored`, not `FunctionCall` —
-            // so this concurrency cap only reads the live dispatch JoinSet.
-            // Skipping returns LoopAction::Continue (fail-soft): the session keeps
-            // running and the dropped call_id is intentionally left unanswered.
+            // argument size cap (MAX_ARGS_LEN) already ran in parse_frame (over-cap
+            // frames arrive here as `Ignored`); the call's arguments are still
+            // UNPARSED at this point, so a saturated burst is rejected below WITHOUT
+            // paying the JSON parse — matching the pre-trait order (cap before arg
+            // parse). Skipping returns LoopAction::Continue (fail-soft): the session
+            // keeps running and the dropped call_id is intentionally left unanswered.
             while dispatch_tasks.try_join_next().is_some() {}
             if dispatch_tasks.len() >= MAX_INFLIGHT_DISPATCHES {
                 // Log once per saturation episode (latched). A sustained flood
@@ -401,6 +402,15 @@ where
             // episode logs once more.
             *cap_warned = false;
 
+            // Only now that the cap has admitted the call do we parse the
+            // (already size-capped) arguments. Default to null so a malformed blob
+            // still reaches the tool, which validates its own schema.
+            let args = serde_json::from_str(&pending.args_raw).unwrap_or(Value::Null);
+            let call = FunctionCall {
+                call_id: pending.call_id,
+                name: pending.name,
+                args,
+            };
             let dispatcher = Arc::clone(dispatcher);
             let tx = write_tx.clone();
             dispatch_tasks.spawn(async move {
@@ -692,7 +702,7 @@ mod tests {
     use base64::Engine as _;
     use crate::cost_tracker::{BudgetConfig, NANODOLLARS_PER_USD};
     use crate::realtime_provider::OpenAiRealtime;
-    use crate::realtime_types::{DispatchResult, FunctionCall, NoopDispatcher, ToolSchema};
+    use crate::realtime_types::{DispatchResult, NoopDispatcher, ToolSchema};
     use crate::storage::adapter::{ConversationEvent, Note, RecorderError};
 
     // ---- current_yyyymm ------------------------------------------------------

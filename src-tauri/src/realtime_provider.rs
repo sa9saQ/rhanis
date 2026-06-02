@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::audio_bridge::MAX_ARGS_LEN;
 use crate::cost_tracker::Usage;
-use crate::realtime_types::{FunctionCall, ToolSchema};
+use crate::realtime_types::ToolSchema;
 use crate::secret_store::SecretString;
 
 /// OpenAI Realtime WebSocket endpoint (gpt-realtime-2 GA model).
@@ -77,13 +77,26 @@ impl fmt::Debug for RealtimeAuth {
 
 // ---- normalized events -------------------------------------------------------
 
+/// A function call whose arguments are size-capped but NOT yet JSON-parsed. The
+/// read loop parses `args_raw` only AFTER the in-flight dispatch cap admits the
+/// call, so a saturated burst is rejected without paying the per-frame parse —
+/// the pre-trait code checked the cap before parsing arguments (koe-wj2 DoS
+/// guard). Carrying the raw string keeps the size cap (applied in `parse_frame`)
+/// while deferring the parse to the loop.
+pub struct PendingCall {
+    pub call_id: String,
+    pub name: String,
+    pub args_raw: String,
+}
+
 /// One server frame normalized across providers. [`RealtimeProvider::parse_frame`]
 /// maps a provider's wire event (OpenAI `response.*`, later Gemini
 /// `BidiGenerateContent`) to one of these so the session loop stays
 /// provider-agnostic.
 pub enum ProviderEvent {
     /// A tool call to dispatch (OpenAI: `response.function_call_arguments.done`).
-    FunctionCall(FunctionCall),
+    /// Carries raw, size-capped, UNPARSED arguments — see [`PendingCall`].
+    FunctionCall(PendingCall),
     /// A usage report to add to the cost tracker (OpenAI: `response.done`).
     Usage(Usage),
     /// Server audio output. PR1's OpenAI impl never emits this — the
@@ -164,13 +177,10 @@ impl RealtimeProvider for OpenAiRealtime {
                     .unwrap_or_default()
                     .to_string();
                 // `arguments` arrives as a JSON-encoded string; enforce a size cap
-                // BEFORE the inner JSON parse so a crafted oversized blob cannot
-                // consume unbounded allocator memory (DoS guard). Over-cap frames
-                // are dropped (Ignored) — the model's call is intentionally left
-                // unanswered, matching the pre-trait inline behaviour. The
-                // concurrency cap (MAX_INFLIGHT_DISPATCHES) + reap stay in
-                // `session_manager::handle_text` (they read the live dispatch
-                // JoinSet), so this only bounds the per-frame allocation.
+                // on its raw length BEFORE keeping it so a crafted oversized blob
+                // cannot consume unbounded allocator memory (DoS guard). Over-cap
+                // frames are dropped (Ignored) — the model's call is intentionally
+                // left unanswered, matching the pre-trait inline behaviour.
                 let args_raw = event
                     .get("arguments")
                     .and_then(Value::as_str)
@@ -179,10 +189,16 @@ impl RealtimeProvider for OpenAiRealtime {
                     eprintln!("[session] function-call arguments too large, dropping call");
                     return ProviderEvent::Ignored;
                 }
-                // Default to null so a malformed blob still reaches the tool
-                // (which validates its own schema).
-                let args = serde_json::from_str(args_raw).unwrap_or(Value::Null);
-                ProviderEvent::FunctionCall(FunctionCall { call_id, name, args })
+                // Carry the arguments UNPARSED. `session_manager::handle_text`
+                // parses them only after the MAX_INFLIGHT_DISPATCHES cap admits the
+                // call, so a saturated burst is dropped without paying the per-frame
+                // JSON parse (the pre-trait code checked the cap before parsing the
+                // arguments — koe-wj2 DoS guard).
+                ProviderEvent::FunctionCall(PendingCall {
+                    call_id,
+                    name,
+                    args_raw: args_raw.to_string(),
+                })
             }
             Some("response.done") => match parse_usage(event) {
                 Some(usage) => ProviderEvent::Usage(usage),
@@ -328,10 +344,11 @@ mod tests {
             "call_id": "c1", "name": "write_note", "arguments": "{\"text\":\"hi\"}"
         });
         match p.parse_frame(&ev) {
-            ProviderEvent::FunctionCall(fc) => {
-                assert_eq!(fc.call_id, "c1");
-                assert_eq!(fc.name, "write_note");
-                assert_eq!(fc.args["text"], "hi");
+            ProviderEvent::FunctionCall(pending) => {
+                assert_eq!(pending.call_id, "c1");
+                assert_eq!(pending.name, "write_note");
+                // args are carried raw (unparsed) until the dispatch cap admits.
+                assert_eq!(pending.args_raw, "{\"text\":\"hi\"}");
             }
             _ => panic!("expected FunctionCall"),
         }
@@ -339,15 +356,16 @@ mod tests {
 
     #[test]
     fn parse_frame_function_call_missing_fields_default() {
-        // Missing call_id/name → empty strings; malformed args → null (the tool
-        // validates its own schema). Mirrors the pre-trait inline defaults.
+        // Missing call_id/name → empty strings; missing arguments → empty raw
+        // string (the read loop falls back to null on parse failure). Mirrors the
+        // pre-trait defaults.
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({ "type": "response.function_call_arguments.done" });
         match p.parse_frame(&ev) {
-            ProviderEvent::FunctionCall(fc) => {
-                assert_eq!(fc.call_id, "");
-                assert_eq!(fc.name, "");
-                assert_eq!(fc.args, Value::Null);
+            ProviderEvent::FunctionCall(pending) => {
+                assert_eq!(pending.call_id, "");
+                assert_eq!(pending.name, "");
+                assert_eq!(pending.args_raw, "");
             }
             _ => panic!("expected FunctionCall"),
         }
