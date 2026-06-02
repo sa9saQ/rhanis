@@ -11,8 +11,12 @@ import { create } from "zustand";
 
 import {
   completeOnboarding as ipcCompleteOnboarding,
+  deleteToolProviderKey as ipcDeleteToolProviderKey,
   getAppSettings,
   saveBudgetConfig as ipcSaveBudgetConfig,
+  setToolProviderEnabled as ipcSetToolProviderEnabled,
+  setVoiceProvider as ipcSetVoiceProvider,
+  type ToolProvider,
 } from "../../lib/tauri/ipc";
 import type { AppSettings } from "./types";
 
@@ -31,6 +35,12 @@ interface SettingsState {
     recorderAdapter: string,
   ) => Promise<void>;
   saveBudget: (enabled: boolean, monthlyLimitUsd: number | null) => Promise<void>;
+  /** Persists the selected voice provider/model (koe-31u), then re-fetches. */
+  saveVoiceProvider: (value: string) => Promise<void>;
+  /** Enables/disables a 手足 tool provider (koe-31u), then re-fetches. */
+  setToolProviderEnabled: (provider: ToolProvider, enabled: boolean) => Promise<void>;
+  /** Deletes a 手足 tool key + clears its flag atomically (koe-31u), then re-fetches. */
+  deleteToolProviderKey: (provider: ToolProvider) => Promise<void>;
 }
 
 export const useSettingsStore = create<SettingsState>((set) => ({
@@ -63,6 +73,25 @@ export const useSettingsStore = create<SettingsState>((set) => ({
 
   saveBudget: async (enabled, monthlyLimitUsd) => {
     await ipcSaveBudgetConfig(enabled, monthlyLimitUsd);
+    const settings = await getAppSettings();
+    set((s) => ({ ...s, settings }));
+  },
+
+  saveVoiceProvider: async (value) => {
+    await ipcSetVoiceProvider(value);
+    // Re-fetch the authoritative persisted state (avoids a stale local copy).
+    const settings = await getAppSettings();
+    set((s) => ({ ...s, settings }));
+  },
+
+  setToolProviderEnabled: async (provider, enabled) => {
+    await ipcSetToolProviderEnabled(provider, enabled);
+    const settings = await getAppSettings();
+    set((s) => ({ ...s, settings }));
+  },
+
+  deleteToolProviderKey: async (provider) => {
+    await ipcDeleteToolProviderKey(provider);
     const settings = await getAppSettings();
     set((s) => ({ ...s, settings }));
   },

@@ -21,7 +21,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::cost_tracker::{usd_to_nanodollars, BudgetConfig};
-use crate::secret_store::{ManagedSecretStore, OPENAI_KEY_NAME};
+use crate::secret_store::{
+    ManagedSecretStore, OPENAI_KEY_NAME, SEARCH_KEY_NAME, XAI_KEY_NAME, X_API_KEY_NAME,
+};
 
 // ---------------------------------------------------------------------------
 // AppSettings
@@ -53,10 +55,42 @@ pub struct AppSettings {
     /// Which recorder backend to use. M1 only supports `"sqlite"`.
     #[serde(default = "default_recorder_adapter")]
     pub recorder_adapter: String,
+
+    /// Selected voice provider/model as a single `"provider/model"` string
+    /// (e.g. `"openai/gpt-realtime-2"`). koe-31u only PERSISTS this; the actual
+    /// connection switch is koe-zv3 (which parses it). Non-safety metadata, so it
+    /// carries a serde default — an older settings file migrates silently.
+    #[serde(default = "default_voice_provider_model")]
+    pub voice_provider_model: String,
+
+    /// Which 手足 (tool) providers the user has enabled. Stores ONLY the enable
+    /// flag — the key itself lives in the secret store (queried live via
+    /// `has_provider_api_key`), never persisted here. A typed struct (not a map)
+    /// so a hand-edited file cannot inject arbitrary keys.
+    #[serde(default)]
+    pub tool_providers: ToolProviderFlags,
+}
+
+/// Per-provider enable flags for the 手足 (tool) keys (koe-31u). Keys live in the
+/// secret store; this only records "the user wants this tool active". koe-eal
+/// consumes these to decide which tools to register. Non-safety metadata, fully
+/// defaulted so an older file (without this object) loads as all-disabled.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolProviderFlags {
+    #[serde(default)]
+    pub xai: bool,
+    #[serde(default)]
+    pub x: bool,
+    #[serde(default)]
+    pub search: bool,
 }
 
 fn default_recorder_adapter() -> String {
     "sqlite".into()
+}
+
+fn default_voice_provider_model() -> String {
+    "openai/gpt-realtime-2".into()
 }
 
 impl Default for AppSettings {
@@ -65,6 +99,8 @@ impl Default for AppSettings {
             onboarding_completed: false,
             budget: BudgetConfig::default(),
             recorder_adapter: default_recorder_adapter(),
+            voice_provider_model: default_voice_provider_model(),
+            tool_providers: ToolProviderFlags::default(),
         }
     }
 }
@@ -170,10 +206,67 @@ impl SettingsStore for JsonSettingsStore {
 
 /// Tauri managed-state wrapper around the active [`SettingsStore`].
 ///
-/// M1: single-writer UI; compound load-modify-write in the settings commands
-/// is not lock-guarded — the UI serialises saves and `set_recorder_adapter` has
-/// no concurrent caller. Revisit if concurrent settings writers are added.
-pub struct ManagedSettings(pub Arc<dyn SettingsStore>);
+/// Field `.0` is the store (read by `get_app_settings` / `session_manager`).
+/// Field `.1` is a write lock that serialises the **compound load-modify-save**
+/// command sequences via [`ManagedSettings::update`], so concurrent settings
+/// writers (e.g. rapid 手足 tool-toggle clicks, each its own async IPC) cannot
+/// lose each other's updates (last-writer-wins). Construct with
+/// [`ManagedSettings::new`]. Reads need no lock — saves are atomic temp+rename,
+/// so a concurrent read sees the whole old or whole new file, never a torn one.
+pub struct ManagedSettings(pub Arc<dyn SettingsStore>, std::sync::Mutex<()>);
+
+impl ManagedSettings {
+    pub fn new(store: Arc<dyn SettingsStore>) -> Self {
+        Self(store, std::sync::Mutex::new(()))
+    }
+
+    /// Runs `load → mutate → save` under the write lock so two concurrent
+    /// mutating commands can't read the same base and clobber each other. The
+    /// lock is held only across the synchronous load+save (no `.await` inside),
+    /// so it never blocks the async runtime. If `f` returns `Err`, nothing is
+    /// saved (the in-memory mutation is discarded — no partial write).
+    /// Runs `f` while holding the settings write lock, handing it the store so a
+    /// command can keep settings **and** an external store (the secret vault)
+    /// consistent across more than one operation without another writer racing
+    /// in between. The lock is held only across synchronous work (no `.await`
+    /// inside), so it never blocks the async runtime. NOTE: `f` must use the
+    /// `store` arg and must NOT re-enter `update`/`replace` (the lock is not
+    /// reentrant — that would deadlock).
+    fn with_write_lock<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&dyn SettingsStore) -> Result<T, String>,
+    {
+        // PoisonError → fixed message (a poisoned lock means a prior writer
+        // panicked; surface it as "unavailable", never as a silent success).
+        let _guard = self
+            .1
+            .lock()
+            .map_err(|_| SettingsError::Unavailable.to_string())?;
+        f(self.0.as_ref())
+    }
+
+    /// `load → mutate → save` under the write lock so two concurrent mutating
+    /// commands can't read the same base and clobber each other. If `f` returns
+    /// `Err`, nothing is saved (the in-memory mutation is discarded).
+    fn update<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut AppSettings) -> Result<(), String>,
+    {
+        self.with_write_lock(|store| {
+            let mut current = store.load().map_err(|e| e.to_string())?;
+            f(&mut current)?;
+            store.save(&current).map_err(|e| e.to_string())
+        })
+    }
+
+    /// Saves a fully-constructed settings object under the write lock. Used by
+    /// `complete_onboarding`, which builds the object from scratch (not a
+    /// load-modify), so that path is serialised with the other writers too — no
+    /// settings write bypasses the lock.
+    fn replace(&self, settings: &AppSettings) -> Result<(), String> {
+        self.with_write_lock(|store| store.save(settings).map_err(|e| e.to_string()))
+    }
+}
 
 /// Returns the current app settings. Contains **no** secret values; safe for
 /// the WebView.
@@ -222,9 +315,13 @@ pub async fn complete_onboarding(
         onboarding_completed: true,
         budget,
         recorder_adapter,
+        // Voice/tool selections are made post-onboarding in Settings, so first-run
+        // takes the defaults (OpenAI voice, all tools disabled).
+        voice_provider_model: default_voice_provider_model(),
+        tool_providers: ToolProviderFlags::default(),
     };
 
-    settings.0.save(&new_settings).map_err(|e| e.to_string())
+    settings.replace(&new_settings)
 }
 
 /// Updates the budget configuration after onboarding. Preserves the existing
@@ -236,10 +333,10 @@ pub async fn save_budget_config(
     settings: tauri::State<'_, ManagedSettings>,
 ) -> Result<(), String> {
     let budget = build_budget_config(enabled, monthly_limit_usd)?;
-
-    let mut current = settings.0.load().map_err(|e| e.to_string())?;
-    current.budget = budget;
-    settings.0.save(&current).map_err(|e| e.to_string())
+    settings.update(|s| {
+        s.budget = budget;
+        Ok(())
+    })
 }
 
 /// Updates the recorder adapter. M1 only accepts `"sqlite"`.
@@ -249,10 +346,98 @@ pub async fn set_recorder_adapter(
     settings: tauri::State<'_, ManagedSettings>,
 ) -> Result<(), String> {
     validate_recorder_adapter(&name)?;
+    settings.update(|s| {
+        s.recorder_adapter = name;
+        Ok(())
+    })
+}
 
-    let mut current = settings.0.load().map_err(|e| e.to_string())?;
-    current.recorder_adapter = name;
-    settings.0.save(&current).map_err(|e| e.to_string())
+/// Sets the selected voice provider/model (koe-31u). PERSISTS only — the actual
+/// connection switch is koe-zv3. Validated against the known set so a direct IPC
+/// call cannot store an unsupported value (fail-closed). Preserves other fields.
+#[tauri::command]
+pub async fn set_voice_provider(
+    value: String,
+    settings: tauri::State<'_, ManagedSettings>,
+) -> Result<(), String> {
+    validate_voice_provider_model(&value)?;
+    settings.update(|s| {
+        s.voice_provider_model = value;
+        Ok(())
+    })
+}
+
+/// Enables/disables a 手足 (tool) provider (koe-31u). Records intent only — the
+/// key itself is managed via the secret-store commands. Unknown providers are
+/// rejected (fixed error, fail-closed). Flips only the targeted flag.
+#[tauri::command]
+pub async fn set_tool_provider_enabled(
+    provider: String,
+    enabled: bool,
+    settings: tauri::State<'_, ManagedSettings>,
+    secret: tauri::State<'_, ManagedSecretStore>,
+) -> Result<(), String> {
+    // Resolve + validate the provider first (fixed Err, never echoes the id).
+    let key_name = tool_provider_key_name(&provider)?;
+    // Backend invariant: a tool can only be enabled while its key is actually
+    // stored. Don't trust the UI's disabled checkbox — a direct or stale WebView
+    // call must not persist a credential-less "enabled" provider for the future
+    // tool path (koe-eal) to trust. The key-presence check AND the flag write
+    // run under ONE settings-lock hold, so a concurrent delete_tool_provider_key
+    // can't slip between them. Fail-closed: an Err from has_api_key (locked
+    // vault) blocks the enable too.
+    settings.with_write_lock(|store| {
+        if enabled && !secret.0.has_api_key(key_name).map_err(|e| e.to_string())? {
+            return Err("set an API key before enabling this tool".into());
+        }
+        let mut s = store.load().map_err(|e| e.to_string())?;
+        set_tool_flag(&mut s.tool_providers, &provider, enabled);
+        store.save(&s).map_err(|e| e.to_string())
+    })
+}
+
+/// Deletes a 手足 tool key **and** clears its enable flag, both under ONE
+/// settings-lock hold so a concurrent `set_tool_provider_enabled(true)` can't
+/// re-enable the provider in between (which would leave the unsafe enabled=true +
+/// key-absent state). Order within the lock: clear the flag, then delete the key
+/// — a partial failure (the delete errors) therefore leaves disabled + key-
+/// present (benign — the tool is simply off). The frontend routes tool-key
+/// deletes through here rather than the generic delete + a best-effort flag clear.
+#[tauri::command]
+pub async fn delete_tool_provider_key(
+    provider: String,
+    settings: tauri::State<'_, ManagedSettings>,
+    secret: tauri::State<'_, ManagedSecretStore>,
+) -> Result<(), String> {
+    let key_name = tool_provider_key_name(&provider)?;
+    settings.with_write_lock(|store| {
+        let mut s = store.load().map_err(|e| e.to_string())?;
+        set_tool_flag(&mut s.tool_providers, &provider, false);
+        store.save(&s).map_err(|e| e.to_string())?;
+        secret.0.delete_api_key(key_name).map_err(|e| e.to_string())
+    })
+}
+
+/// Maps a 手足 tool provider id to its secret record name (tools only — voice
+/// providers are not togglable here). Unknown ids get a fixed Err.
+fn tool_provider_key_name(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "xai" => Ok(XAI_KEY_NAME),
+        "x" => Ok(X_API_KEY_NAME),
+        "search" => Ok(SEARCH_KEY_NAME),
+        _ => Err("unsupported tool provider".into()),
+    }
+}
+
+/// Sets the flag for an already-validated tool provider. `provider` MUST have
+/// passed [`tool_provider_key_name`]; an unrecognised id is unreachable.
+fn set_tool_flag(flags: &mut ToolProviderFlags, provider: &str, enabled: bool) {
+    match provider {
+        "xai" => flags.xai = enabled,
+        "x" => flags.x = enabled,
+        "search" => flags.search = enabled,
+        _ => unreachable!("provider validated by tool_provider_key_name"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +449,26 @@ fn validate_recorder_adapter(name: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("unsupported recorder adapter".into())
+    }
+}
+
+/// The voice provider/model strings koe recognises. koe-31u only PERSISTS the
+/// choice (koe-zv3 acts on it). Both are listed so a value the UI offers now
+/// (OpenAI) or a value a later koe-zv3 build writes (Google) validates; the M1 UI
+/// presents Google as a disabled preview. The exact Google model id is confirmed
+/// when koe-zv3 wires the Gemini Live connection.
+const KNOWN_VOICE_PROVIDER_MODELS: &[&str] =
+    &["openai/gpt-realtime-2", "google/gemini-2.5-flash-live"];
+
+fn is_known_voice_provider_model(value: &str) -> bool {
+    KNOWN_VOICE_PROVIDER_MODELS.contains(&value)
+}
+
+fn validate_voice_provider_model(value: &str) -> Result<(), String> {
+    if is_known_voice_provider_model(value) {
+        Ok(())
+    } else {
+        Err("unsupported voice provider".into())
     }
 }
 
@@ -286,6 +491,14 @@ const MAX_MONTHLY_LIMIT_NANODOLLARS: u64 = 1_000_000 * crate::cost_tracker::NANO
 /// - a **disabled** (explicit-unlimited) budget must have a zero limit.
 fn validate_app_settings(s: &AppSettings) -> Result<(), SettingsError> {
     if s.recorder_adapter != "sqlite" {
+        return Err(SettingsError::Corrupt);
+    }
+    // Voice selection must be a known provider/model. An absent field migrates to
+    // the default ("openai/gpt-realtime-2", in the known set), so an older file
+    // still loads; an unknown value (tampered) fails closed. tool_providers needs
+    // no validation — every bool combination is valid and an absent object
+    // defaults to all-disabled.
+    if !is_known_voice_provider_model(&s.voice_provider_model) {
         return Err(SettingsError::Corrupt);
     }
     if s.budget.enabled {
@@ -368,6 +581,9 @@ mod tests {
         assert!(!s.budget.enabled);
         assert_eq!(s.budget.monthly_limit_nanodollars, 0);
         assert_eq!(s.recorder_adapter, "sqlite");
+        assert_eq!(s.voice_provider_model, "openai/gpt-realtime-2");
+        assert_eq!(s.tool_providers, ToolProviderFlags::default());
+        assert!(!s.tool_providers.xai && !s.tool_providers.x && !s.tool_providers.search);
     }
 
     // ---- Load absent → default --------------------------------------------
@@ -391,6 +607,8 @@ mod tests {
                 monthly_limit_nanodollars: 50_000_000_000,
             },
             recorder_adapter: "sqlite".into(),
+            voice_provider_model: "openai/gpt-realtime-2".into(),
+            tool_providers: ToolProviderFlags { xai: true, x: false, search: true },
         };
         store.save(&original).expect("save");
         let loaded = store.load().expect("load");
@@ -587,6 +805,149 @@ mod tests {
         assert!(validate_recorder_adapter("").is_err());
     }
 
+    // ---- Multi-provider settings (koe-31u) --------------------------------
+
+    #[test]
+    fn load_migrates_file_without_voice_or_tool_fields() {
+        // An already-onboarded user's file predates koe-31u: no
+        // voice_provider_model, no tool_providers. It MUST load with the new
+        // fields defaulted (not fail), or the migration would brick the app.
+        let (store, _dir) = temp_store();
+        std::fs::write(
+            &store.path,
+            br#"{"onboarding_completed":true,"budget":{"enabled":false,"monthly_limit_nanodollars":0},"recorder_adapter":"sqlite"}"#,
+        )
+        .expect("seed legacy file");
+        let s = store.load().expect("legacy file migrates silently");
+        assert_eq!(s.voice_provider_model, "openai/gpt-realtime-2");
+        assert_eq!(s.tool_providers, ToolProviderFlags::default());
+    }
+
+    #[test]
+    fn load_rejects_unknown_voice_provider() {
+        let (store, _dir) = temp_store();
+        std::fs::write(
+            &store.path,
+            br#"{"onboarding_completed":true,"budget":{"enabled":false,"monthly_limit_nanodollars":0},"recorder_adapter":"sqlite","voice_provider_model":"evil/model"}"#,
+        )
+        .expect("seed");
+        assert!(matches!(store.load(), Err(SettingsError::Corrupt)));
+    }
+
+    #[test]
+    fn load_accepts_known_voice_and_tool_flags() {
+        let (store, _dir) = temp_store();
+        std::fs::write(
+            &store.path,
+            br#"{"onboarding_completed":true,"budget":{"enabled":false,"monthly_limit_nanodollars":0},"recorder_adapter":"sqlite","voice_provider_model":"google/gemini-2.5-flash-live","tool_providers":{"xai":true,"x":false,"search":true}}"#,
+        )
+        .expect("seed");
+        let s = store.load().expect("valid file loads");
+        assert_eq!(s.voice_provider_model, "google/gemini-2.5-flash-live");
+        assert!(s.tool_providers.xai && !s.tool_providers.x && s.tool_providers.search);
+    }
+
+    #[test]
+    fn validate_voice_provider_model_allows_known_rejects_unknown() {
+        assert!(validate_voice_provider_model("openai/gpt-realtime-2").is_ok());
+        assert!(validate_voice_provider_model("google/gemini-2.5-flash-live").is_ok());
+        assert!(validate_voice_provider_model("openai/gpt-4o").is_err());
+        assert!(validate_voice_provider_model("openai").is_err());
+        assert!(validate_voice_provider_model("").is_err());
+    }
+
+    #[test]
+    fn tool_provider_flags_default_all_false() {
+        let f = ToolProviderFlags::default();
+        assert!(!f.xai && !f.x && !f.search);
+    }
+
+    #[test]
+    fn tool_provider_flag_update_preserves_other_settings() {
+        // Mirrors set_tool_provider_enabled's load-modify-write: flipping one flag
+        // must not disturb budget / recorder / voice / the other flags.
+        let (store, _dir) = temp_store();
+        let base = AppSettings {
+            onboarding_completed: true,
+            budget: BudgetConfig {
+                enabled: true,
+                monthly_limit_nanodollars: 25_000_000_000,
+            },
+            recorder_adapter: "sqlite".into(),
+            voice_provider_model: "openai/gpt-realtime-2".into(),
+            tool_providers: ToolProviderFlags::default(),
+        };
+        store.save(&base).expect("seed");
+        let mut current = store.load().expect("load");
+        current.tool_providers.x = true; // flip exactly one
+        store.save(&current).expect("save");
+        let reloaded = store.load().expect("reload");
+        assert!(reloaded.tool_providers.x);
+        assert!(!reloaded.tool_providers.xai && !reloaded.tool_providers.search);
+        assert_eq!(reloaded.budget, base.budget);
+        assert_eq!(reloaded.recorder_adapter, "sqlite");
+        assert_eq!(reloaded.voice_provider_model, "openai/gpt-realtime-2");
+    }
+
+    #[test]
+    fn managed_update_persists_and_skips_save_on_err() {
+        // ManagedSettings::update applies + persists on Ok; on a closure Err it
+        // leaves the on-disk file unchanged (no partial write) — the guard that
+        // set_tool_provider_enabled relies on for an unknown provider. The write
+        // lock also serialises concurrent load-modify-save so rapid tool toggles
+        // can't lose each other's updates (R-C / Codex High).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn SettingsStore> =
+            Arc::new(JsonSettingsStore::new(dir.path().join("koe-settings.json")));
+        store.save(&AppSettings::default()).expect("seed");
+        let managed = ManagedSettings::new(Arc::clone(&store));
+
+        managed
+            .update(|s| {
+                s.voice_provider_model = "google/gemini-2.5-flash-live".into();
+                Ok(())
+            })
+            .expect("update ok");
+        assert_eq!(
+            store.load().expect("load").voice_provider_model,
+            "google/gemini-2.5-flash-live"
+        );
+
+        let before = store.load().expect("load");
+        let res = managed.update(|s| {
+            s.tool_providers.xai = true; // mutate the in-memory copy …
+            Err("rejected".to_string()) // … then reject → must NOT save
+        });
+        assert!(res.is_err());
+        assert_eq!(
+            store.load().expect("load"),
+            before,
+            "a failed update must not persist a partial change"
+        );
+    }
+
+    #[test]
+    fn tool_provider_key_name_maps_and_rejects() {
+        assert_eq!(tool_provider_key_name("xai").unwrap(), XAI_KEY_NAME);
+        assert_eq!(tool_provider_key_name("x").unwrap(), X_API_KEY_NAME);
+        assert_eq!(tool_provider_key_name("search").unwrap(), SEARCH_KEY_NAME);
+        // Voice providers are not togglable as tools, and unknown ids fail closed.
+        assert!(tool_provider_key_name("openai").is_err());
+        assert!(tool_provider_key_name("google").is_err());
+        assert!(tool_provider_key_name("").is_err());
+    }
+
+    #[test]
+    fn set_tool_flag_flips_only_target() {
+        let mut f = ToolProviderFlags::default();
+        set_tool_flag(&mut f, "x", true);
+        assert!(f.x && !f.xai && !f.search);
+        set_tool_flag(&mut f, "xai", true);
+        assert!(f.x && f.xai && !f.search);
+        set_tool_flag(&mut f, "x", false);
+        assert!(!f.x && f.xai && !f.search);
+    }
+
     // ---- Structural guard: settings commands are registered in lib.rs ------
 
     fn lib_rs_code_only() -> String {
@@ -605,6 +966,9 @@ mod tests {
             "complete_onboarding",
             "save_budget_config",
             "set_recorder_adapter",
+            "set_voice_provider",
+            "set_tool_provider_enabled",
+            "delete_tool_provider_key",
         ] {
             assert!(
                 code.contains(cmd),

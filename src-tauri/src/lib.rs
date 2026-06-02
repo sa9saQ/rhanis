@@ -19,12 +19,14 @@ use approval_gate::{resolve_tool_approval, ApprovalGate, ManagedApprovalGate};
 use audio_bridge::ManagedAudioBridge;
 use events::{ManagedSequenceCounter, SequenceCounter};
 use secret_store::{
-    delete_openai_api_key, has_openai_api_key, set_openai_api_key, KeychainPassword,
-    ManagedSecretStore, StrongholdSecretStore,
+    delete_openai_api_key, delete_provider_api_key, has_openai_api_key, has_provider_api_key,
+    set_openai_api_key, set_provider_api_key, KeychainPassword, ManagedSecretStore,
+    StrongholdSecretStore,
 };
 use settings_store::{
-    complete_onboarding, get_app_settings, save_budget_config, set_recorder_adapter,
-    JsonSettingsStore, ManagedSettings,
+    complete_onboarding, delete_tool_provider_key, get_app_settings, save_budget_config,
+    set_recorder_adapter, set_tool_provider_enabled, set_voice_provider, JsonSettingsStore,
+    ManagedSettings,
 };
 use realtime_types::ManagedDispatcher;
 use session_manager::{start_session, stop_session, ManagedSession};
@@ -96,7 +98,7 @@ pub fn run() {
             // recorder adapter choice. Rust-owned JSON; no WebView file surface.
             let settings_path = data_dir.join("koe-settings.json");
             let settings = JsonSettingsStore::new(settings_path);
-            app.manage(ManagedSettings(Arc::new(settings)));
+            app.manage(ManagedSettings::new(Arc::new(settings)));
 
             // Realtime session (koe-e3m): the RealToolDispatcher managed above
             // (koe-2gy) is read by session_manager via tauri::State<ManagedDispatcher>.
@@ -114,11 +116,17 @@ pub fn run() {
             set_openai_api_key,
             has_openai_api_key,
             delete_openai_api_key,
+            set_provider_api_key,
+            has_provider_api_key,
+            delete_provider_api_key,
             resolve_tool_approval,
             get_app_settings,
             complete_onboarding,
             save_budget_config,
             set_recorder_adapter,
+            set_voice_provider,
+            set_tool_provider_enabled,
+            delete_tool_provider_key,
             start_session,
             stop_session,
         ])

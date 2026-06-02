@@ -16,15 +16,21 @@ import {
   EVENT,
   completeOnboarding,
   deleteOpenaiApiKey,
+  deleteProviderApiKey,
+  deleteToolProviderKey,
   getAppSettings,
   hasOpenaiApiKey,
+  hasProviderApiKey,
   onApprovalRequired,
   onSessionStatus,
   onToolEvent,
   resolveToolApproval,
   saveBudgetConfig,
   setOpenaiApiKey,
+  setProviderApiKey,
   setRecorderAdapter,
+  setToolProviderEnabled,
+  setVoiceProvider,
 } from "./ipc";
 import type { ApprovalRequest, SessionStatusEvent, ToolEvent } from "../../features/activity/types";
 
@@ -171,5 +177,47 @@ describe("deleteOpenaiApiKey", () => {
   it("invokes delete_openai_api_key with no args", async () => {
     await deleteOpenaiApiKey();
     expect(invoke).toHaveBeenCalledWith(COMMAND.deleteOpenaiApiKey);
+  });
+});
+
+describe("multi-provider key + voice/tool commands (koe-31u)", () => {
+  it("setVoiceProvider invokes set_voice_provider with {value}", async () => {
+    await setVoiceProvider("openai/gpt-realtime-2");
+    expect(invoke).toHaveBeenCalledWith(COMMAND.setVoiceProvider, {
+      value: "openai/gpt-realtime-2",
+    });
+  });
+
+  it("setToolProviderEnabled invokes set_tool_provider_enabled with {provider, enabled}", async () => {
+    await setToolProviderEnabled("xai", true);
+    expect(invoke).toHaveBeenCalledWith(COMMAND.setToolProviderEnabled, {
+      provider: "xai",
+      enabled: true,
+    });
+  });
+
+  it("setProviderApiKey invokes set_provider_api_key with {provider, key}", async () => {
+    await setProviderApiKey("xai", "xai-secret");
+    expect(invoke).toHaveBeenCalledWith(COMMAND.setProviderApiKey, {
+      provider: "xai",
+      key: "xai-secret",
+    });
+  });
+
+  it("hasProviderApiKey invokes has_provider_api_key with {provider} and returns the boolean", async () => {
+    invoke.mockResolvedValueOnce(true);
+    const result = await hasProviderApiKey("search");
+    expect(invoke).toHaveBeenCalledWith(COMMAND.hasProviderApiKey, { provider: "search" });
+    expect(result).toBe(true);
+  });
+
+  it("deleteProviderApiKey invokes delete_provider_api_key with {provider}", async () => {
+    await deleteProviderApiKey("x");
+    expect(invoke).toHaveBeenCalledWith(COMMAND.deleteProviderApiKey, { provider: "x" });
+  });
+
+  it("deleteToolProviderKey invokes delete_tool_provider_key with {provider}", async () => {
+    await deleteToolProviderKey("xai");
+    expect(invoke).toHaveBeenCalledWith(COMMAND.deleteToolProviderKey, { provider: "xai" });
   });
 });

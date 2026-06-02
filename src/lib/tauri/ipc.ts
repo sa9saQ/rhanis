@@ -15,6 +15,16 @@ import type {
 } from "../../features/activity/types";
 import type { AppSettings } from "../../features/settings/types";
 
+/**
+ * Allowlisted provider ids — mirror the Rust `provider_key_name` /
+ * `tool_provider_key_name` allowlists. Typing the command params as these unions
+ * catches a caller typo at compile time instead of only at the backend's
+ * runtime rejection.
+ */
+export type VoiceProvider = "openai" | "google";
+export type ToolProvider = "xai" | "x" | "search";
+export type Provider = VoiceProvider | ToolProvider;
+
 /** Backend event channels. */
 export const EVENT = {
   toolEvent: "tool-event",
@@ -30,10 +40,18 @@ export const COMMAND = {
   completeOnboarding: "complete_onboarding",
   saveBudgetConfig: "save_budget_config",
   setRecorderAdapter: "set_recorder_adapter",
+  // Multi-provider settings (koe-31u)
+  setVoiceProvider: "set_voice_provider",
+  setToolProviderEnabled: "set_tool_provider_enabled",
+  deleteToolProviderKey: "delete_tool_provider_key",
   // Secret store commands (secret_store.rs)
   setOpenaiApiKey: "set_openai_api_key",
   hasOpenaiApiKey: "has_openai_api_key",
   deleteOpenaiApiKey: "delete_openai_api_key",
+  // Multi-provider secret commands (koe-31u) — write + presence only, no get-*
+  setProviderApiKey: "set_provider_api_key",
+  hasProviderApiKey: "has_provider_api_key",
+  deleteProviderApiKey: "delete_provider_api_key",
   // Session lifecycle commands (koe-e3m)
   startSession: "start_session",
   stopSession: "stop_session",
@@ -128,6 +146,51 @@ export function hasOpenaiApiKey(): Promise<boolean> {
 /** Deletes the stored OpenAI API key. */
 export function deleteOpenaiApiKey(): Promise<void> {
   return invoke(COMMAND.deleteOpenaiApiKey);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-provider key + voice/tool settings commands (koe-31u)
+//
+// Provider ids are resolved by a closed allowlist on the Rust side, so an
+// unknown provider is rejected before the vault is touched. As with OpenAI,
+// keys are write-only from the WebView — there is deliberately NO
+// get_*_api_key command for any provider.
+// ---------------------------------------------------------------------------
+
+/** Persists the selected voice provider/model (e.g. "openai/gpt-realtime-2"). */
+export function setVoiceProvider(value: string): Promise<void> {
+  return invoke(COMMAND.setVoiceProvider, { value });
+}
+
+/** Enables/disables a 手足 (tool) provider. Records intent only — not the key.
+ *  Enabling is rejected backend-side if no key is stored for the provider. */
+export function setToolProviderEnabled(provider: ToolProvider, enabled: boolean): Promise<void> {
+  return invoke(COMMAND.setToolProviderEnabled, { provider, enabled });
+}
+
+/** Deletes a 手足 tool key AND clears its enable flag atomically (one backend
+ *  lock-hold, so a concurrent enable can't leave an "enabled but key-less" state). */
+export function deleteToolProviderKey(provider: ToolProvider): Promise<void> {
+  return invoke(COMMAND.deleteToolProviderKey, { provider });
+}
+
+/**
+ * Stores an API key for an allowlisted provider (voice: `openai` / `google`,
+ * 手足: `xai` / `x` / `search`). The key is never returned to the WebView
+ * afterwards (no get-* command exists for any provider).
+ */
+export function setProviderApiKey(provider: Provider, key: string): Promise<void> {
+  return invoke(COMMAND.setProviderApiKey, { provider, key });
+}
+
+/** Returns whether a key is stored for `provider`, without returning its value. */
+export function hasProviderApiKey(provider: Provider): Promise<boolean> {
+  return invoke<boolean>(COMMAND.hasProviderApiKey, { provider });
+}
+
+/** Deletes the stored key for `provider`. */
+export function deleteProviderApiKey(provider: Provider): Promise<void> {
+  return invoke(COMMAND.deleteProviderApiKey, { provider });
 }
 
 // ---------------------------------------------------------------------------

@@ -1,36 +1,38 @@
-// TDD tests for ApiKeyInput component.
+// TDD tests for the (now provider-generic) ApiKeyInput component.
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const setOpenaiApiKey = vi.fn();
-const hasOpenaiApiKey = vi.fn();
-const deleteOpenaiApiKey = vi.fn();
+const setProviderApiKey = vi.fn();
+const hasProviderApiKey = vi.fn();
+const deleteProviderApiKey = vi.fn();
 
 vi.mock("../../lib/tauri/ipc", () => ({
-  setOpenaiApiKey: (...args: unknown[]) => setOpenaiApiKey(...args),
-  hasOpenaiApiKey: (...args: unknown[]) => hasOpenaiApiKey(...args),
-  deleteOpenaiApiKey: (...args: unknown[]) => deleteOpenaiApiKey(...args),
+  setProviderApiKey: (...args: unknown[]) => setProviderApiKey(...args),
+  hasProviderApiKey: (...args: unknown[]) => hasProviderApiKey(...args),
+  deleteProviderApiKey: (...args: unknown[]) => deleteProviderApiKey(...args),
+  // Unused-by-this-component exports, present so the mock matches the module shape.
   getAppSettings: vi.fn(),
   completeOnboarding: vi.fn(),
   saveBudgetConfig: vi.fn(),
   setRecorderAdapter: vi.fn(),
+  setVoiceProvider: vi.fn(),
+  setToolProviderEnabled: vi.fn(),
 }));
 
 import { ApiKeyInput } from "./ApiKeyInput";
 
 beforeEach(() => {
-  setOpenaiApiKey.mockReset();
-  hasOpenaiApiKey.mockReset();
-  deleteOpenaiApiKey.mockReset();
-  setOpenaiApiKey.mockResolvedValue(undefined);
-  hasOpenaiApiKey.mockResolvedValue(false);
-  deleteOpenaiApiKey.mockResolvedValue(undefined);
+  setProviderApiKey.mockReset();
+  hasProviderApiKey.mockReset();
+  deleteProviderApiKey.mockReset();
+  setProviderApiKey.mockResolvedValue(undefined);
+  hasProviderApiKey.mockResolvedValue(false);
+  deleteProviderApiKey.mockResolvedValue(undefined);
 });
 
 describe("ApiKeyInput", () => {
   it("renders a password input by default", () => {
     render(<ApiKeyInput />);
-    // password inputs have no role="textbox"; query by type attribute directly
     const passwordInput = document.querySelector('input[type="password"]');
     expect(passwordInput).not.toBeNull();
   });
@@ -48,8 +50,8 @@ describe("ApiKeyInput", () => {
     expect(input.type).toBe("password");
   });
 
-  it("saves the key and clears the input on success", async () => {
-    hasOpenaiApiKey.mockResolvedValue(true);
+  it("saves the key for the default 'openai' provider and clears the input", async () => {
+    hasProviderApiKey.mockResolvedValue(true);
     render(<ApiKeyInput />);
     const input = document.querySelector("input") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "sk-test-key" } });
@@ -59,31 +61,29 @@ describe("ApiKeyInput", () => {
       fireEvent.click(saveBtn);
     });
 
-    expect(setOpenaiApiKey).toHaveBeenCalledWith("sk-test-key");
-    // Input must be cleared after save (key must not linger in DOM/state)
+    // Default provider is "openai" → call carries the provider id explicitly.
+    expect(setProviderApiKey).toHaveBeenCalledWith("openai", "sk-test-key");
     expect(input.value).toBe("");
   });
 
-  it("shows a fixed JP error message on IPC failure, does not leak raw error", async () => {
-    setOpenaiApiKey.mockRejectedValue(new Error("internal/path/leaked sk-secret"));
-    render(<ApiKeyInput />);
+  it("routes to the given provider (xai), NOT openai", async () => {
+    hasProviderApiKey.mockResolvedValue(true);
+    render(<ApiKeyInput provider="xai" label="XAI (Grok) APIキー" placeholder="xai-…" />);
     const input = document.querySelector("input") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-test-key" } });
+    fireEvent.change(input, { target: { value: "xai-secret" } });
 
-    const saveBtn = screen.getByRole("button", { name: /保存|save/i });
     await act(async () => {
-      fireEvent.click(saveBtn);
+      fireEvent.click(screen.getByRole("button", { name: /保存|save/i }));
     });
 
-    const alert = screen.getByRole("alert");
-    expect(alert).not.toHaveTextContent("sk-secret");
-    expect(alert).not.toHaveTextContent("/path");
-    // Shows a fixed JP message
-    expect(alert.textContent!.length).toBeGreaterThan(0);
+    expect(setProviderApiKey).toHaveBeenCalledWith("xai", "xai-secret");
+    // The presence-confirm runs after the save resolves (a second await).
+    await waitFor(() => expect(hasProviderApiKey).toHaveBeenCalledWith("xai"));
+    expect(setProviderApiKey).not.toHaveBeenCalledWith("openai", expect.anything());
   });
 
-  it("confirms key presence via hasOpenaiApiKey after save", async () => {
-    hasOpenaiApiKey.mockResolvedValue(true);
+  it("shows a fixed JP error message on IPC failure, does not leak raw error", async () => {
+    setProviderApiKey.mockRejectedValue(new Error("internal/path/leaked sk-secret"));
     render(<ApiKeyInput />);
     const input = document.querySelector("input") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "sk-test-key" } });
@@ -92,20 +92,66 @@ describe("ApiKeyInput", () => {
       fireEvent.click(screen.getByRole("button", { name: /保存|save/i }));
     });
 
-    expect(hasOpenaiApiKey).toHaveBeenCalled();
+    const alert = screen.getByRole("alert");
+    expect(alert).not.toHaveTextContent("sk-secret");
+    expect(alert).not.toHaveTextContent("/path");
+    expect(alert.textContent!.length).toBeGreaterThan(0);
   });
 
-  it("calls deleteOpenaiApiKey when delete button is clicked", async () => {
+  it("does not show a save error if only the presence-confirm fails (save succeeded)", async () => {
+    setProviderApiKey.mockResolvedValue(undefined); // save OK
+    hasProviderApiKey.mockRejectedValue(new Error("vault temporarily busy")); // confirm fails
+    const onKeyStatusChange = vi.fn();
+    render(<ApiKeyInput onKeyStatusChange={onKeyStatusChange} />);
+    const input = document.querySelector("input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-x" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /保存|save/i }));
+    });
+
+    // The save succeeded → no save-failure alert, key treated as present
+    // optimistically, and the input is cleared.
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(onKeyStatusChange).toHaveBeenCalledWith(true);
+    expect(input.value).toBe("");
+  });
+
+  it("confirms key presence via hasProviderApiKey after save", async () => {
+    hasProviderApiKey.mockResolvedValue(true);
+    render(<ApiKeyInput />);
+    const input = document.querySelector("input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-test-key" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /保存|save/i }));
+    });
+
+    // The presence-confirm runs after the save resolves (a second await).
+    await waitFor(() => expect(hasProviderApiKey).toHaveBeenCalledWith("openai"));
+  });
+
+  it("calls deleteProviderApiKey with the provider when delete is clicked", async () => {
     render(<ApiKeyInput hasKey={true} />);
     const deleteBtn = screen.getByRole("button", { name: /削除|delete/i });
     await act(async () => {
       fireEvent.click(deleteBtn);
     });
-    expect(deleteOpenaiApiKey).toHaveBeenCalled();
+    expect(deleteProviderApiKey).toHaveBeenCalledWith("openai");
+  });
+
+  it("uses the onDelete override instead of deleteProviderApiKey when provided", async () => {
+    const onDelete = vi.fn().mockResolvedValue(undefined);
+    render(<ApiKeyInput provider="xai" hasKey={true} onDelete={onDelete} />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /削除|delete/i }));
+    });
+    expect(onDelete).toHaveBeenCalled();
+    expect(deleteProviderApiKey).not.toHaveBeenCalled();
   });
 
   it("does not show the saved key value in the DOM after save (key must not linger)", async () => {
-    hasOpenaiApiKey.mockResolvedValue(true);
+    hasProviderApiKey.mockResolvedValue(true);
     render(<ApiKeyInput />);
     const input = document.querySelector("input") as HTMLInputElement;
     const secretKey = "sk-super-secret-12345";
@@ -115,7 +161,6 @@ describe("ApiKeyInput", () => {
       fireEvent.click(screen.getByRole("button", { name: /保存|save/i }));
     });
 
-    // The key value must not appear in the DOM after save
     await waitFor(() => {
       expect(document.body.innerHTML).not.toContain(secretKey);
     });

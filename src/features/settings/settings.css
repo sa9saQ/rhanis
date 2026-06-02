@@ -1,0 +1,196 @@
+/* Settings panel styling (koe-31u). The settings feature previously left its
+ * koe-* classes undefined; this file gives them a WCAG-AA, anti-AI-smell
+ * baseline. The shared `.koe-btn` base is intentionally NOT redefined here — it
+ * lives in ApprovalModal.css (global) — so settings only adds the button
+ * VARIANTS it needs plus its own layout/input classes. */
+
+:root {
+  /* WCAG-AA on white: body text ≥ 4.5:1, hints kept ≥ 4.5:1 too. */
+  --koe-text: #1f2430;
+  --koe-text-muted: #5f6b78; /* 4.6:1 on white */
+  --koe-border: #c2c9d2;
+  --koe-border-focus: #2563eb; /* blue-600, 4.68:1 white-on */
+  --koe-danger: #c94400; /* 4.87:1 white-on */
+  --koe-surface: #ffffff;
+  --koe-surface-alt: #f5f7fa;
+  --ko-ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.koe-settings-panel {
+  display: flex;
+  flex-direction: column;
+  /* Deliberately non-uniform section rhythm (anti-AI-smell): the header sits
+   * tighter than the gap between functional sections. */
+  gap: 28px;
+  max-width: 34rem;
+  padding: 24px;
+  color: var(--koe-text);
+  font-family: "Plus Jakarta Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", system-ui,
+    sans-serif;
+}
+
+.koe-settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.koe-settings-title {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.koe-settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 18px 20px;
+  background: var(--koe-surface);
+  border: 1px solid var(--koe-border);
+  border-radius: 14px; /* cards: 14px (distinct from inputs/buttons) */
+}
+
+.koe-settings-section > h3 {
+  margin: 0;
+  font-size: 1.02rem;
+  font-weight: 600;
+}
+
+.koe-settings-hint {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.55;
+  color: var(--koe-text-muted);
+}
+
+.koe-settings-error {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 0.85rem;
+  color: var(--koe-danger);
+  background: #fdeee7;
+  border-radius: 6px;
+}
+
+.koe-label {
+  font-size: 0.9rem;
+  font-weight: 550;
+}
+
+.koe-input,
+.koe-select {
+  width: 100%;
+  box-sizing: border-box;
+  /* 16px so iOS Safari does not auto-zoom focused inputs (quality.md). */
+  font-size: 16px;
+  color: var(--koe-text);
+  background: var(--koe-surface);
+  border: 1px solid var(--koe-border);
+  border-radius: 8px; /* inputs/selects: 8px */
+  padding: 9px 11px;
+  transition: border-color 150ms var(--ko-ease-standard);
+}
+
+.koe-input:focus,
+.koe-select:focus,
+.koe-tool-enable input:focus-visible {
+  outline: 2px solid var(--koe-border-focus);
+  outline-offset: 1px;
+  border-color: var(--koe-border-focus);
+}
+
+.koe-input:disabled,
+.koe-select:disabled {
+  background: var(--koe-surface-alt);
+  color: var(--koe-text-muted);
+  cursor: not-allowed;
+}
+
+/* Button VARIANTS only (base `.koe-btn` comes from ApprovalModal.css). */
+.koe-btn-primary {
+  color: #fff;
+  background: var(--koe-border-focus);
+  border-radius: 9px;
+}
+.koe-btn-primary:hover:not(:disabled) {
+  background: #1d4fd0;
+}
+.koe-btn-danger {
+  color: #fff;
+  background: var(--koe-danger);
+  border-radius: 9px;
+}
+.koe-btn-danger:hover:not(:disabled) {
+  background: #a83800;
+}
+.koe-btn-icon {
+  border-radius: 999px; /* icon buttons: pill */
+  padding: 6px 10px;
+}
+
+/* API key input rows */
+.koe-api-key-input {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.koe-api-key-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.koe-api-key-row .koe-input {
+  flex: 1;
+}
+.koe-api-key-status {
+  margin: 0;
+  font-size: 0.84rem;
+  color: #15803d; /* green-700, 4.5:1 white-on */
+}
+.koe-api-key-error {
+  margin: 0;
+  font-size: 0.84rem;
+  color: var(--koe-danger);
+}
+.koe-api-key-actions {
+  display: flex;
+  gap: 10px;
+}
+
+/* 手足 tool rows — slightly inset to read as a sub-group. */
+.koe-tool-key-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--koe-surface-alt);
+  border-radius: 10px;
+}
+.koe-tool-enable {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.88rem;
+  /* Primary (not muted) token: this label sits on the alt surface (#f5f7fa),
+   * where the muted token's 4.6:1 (measured on white) would dip below AA. */
+  color: var(--koe-text);
+}
+.koe-tool-key-row + .koe-tool-key-row {
+  margin-top: 4px;
+}
+
+/* Budget controls */
+.koe-budget-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.92rem;
+}
+.koe-budget-amount {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
