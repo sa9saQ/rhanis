@@ -927,18 +927,19 @@ fn run_audio_command_loop<P>(
     P: FnMut(Vec<u8>) -> bool,
 {
     let exit = 'outer: loop {
-        // 1. CONTROL first — drain everything pending (non-blocking).  A stop wins
-        //    immediately over any queued PCM (P1-1).
-        loop {
-            match ctrl_rx.try_recv() {
-                Ok(AudioControl::FlushThenStop) => break 'outer LoopExit::FlushThenStop,
-                Ok(AudioControl::StopNow) => break 'outer LoopExit::StopNow,
-                Err(std::sync::mpsc::TryRecvError::Empty) => break, // no control pending
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // All control senders dropped (process teardown / bridge drop).
-                    // Treat as immediate stop — no tail flush.
-                    break 'outer LoopExit::StopNow;
-                }
+        // 1. CONTROL first — check once (non-blocking).  A stop wins immediately
+        //    over any queued PCM (P1-1).  Every `AudioControl` variant is a
+        //    terminal stop, so a single non-blocking check is sufficient: at most
+        //    one control message is ever acted on, and any later one is observed on
+        //    the next iteration's check.  (Empty falls through to the DATA recv.)
+        match ctrl_rx.try_recv() {
+            Ok(AudioControl::FlushThenStop) => break 'outer LoopExit::FlushThenStop,
+            Ok(AudioControl::StopNow) => break 'outer LoopExit::StopNow,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {} // no control pending → DATA
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // All control senders dropped (process teardown / bridge drop).
+                // Treat as immediate stop — no tail flush.
+                break 'outer LoopExit::StopNow;
             }
         }
 
@@ -1263,7 +1264,12 @@ mod tests {
         // The rounding formula: (-1.0 × 32767.0 + 0.5).max(-32768).min(32767) = -32766.5.max(-32768) = -32766.5 → -32766 as i16.
         // Let's just confirm it is well within the negative half and in range.
         assert!(i < 0);
-        assert!(i >= i16::MIN);
+        // -1.0 lands a strongly-negative sample near i16::MIN (the comment above
+        // works it out to -32766).  Assert it falls in the bottom half rather than
+        // pinning the exact rounding result (brittle); the i16 type itself already
+        // guarantees it can never underflow past i16::MIN, so a `>= i16::MIN`
+        // check would be vacuously true.
+        assert!(i < i16::MIN / 2);
     }
 
     #[test]
@@ -1845,12 +1851,10 @@ mod tests {
             let running = Arc::new(AtomicBool::new(true));
             'outer: loop {
                 // CONTROL first.
-                loop {
-                    match ctrl_rx.try_recv() {
-                        Ok(AudioControl::FlushThenStop) | Ok(AudioControl::StopNow) => break 'outer,
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
-                    }
+                match ctrl_rx.try_recv() {
+                    Ok(AudioControl::FlushThenStop) | Ok(AudioControl::StopNow) => break 'outer,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {} // no control → DATA
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
                 }
                 // DATA with short timeout.
                 match data_rx.recv_timeout(std::time::Duration::from_millis(20)) {
@@ -1933,12 +1937,10 @@ mod tests {
         // DATA recv_timeout + flag check on timeout.
         let handle = std::thread::spawn(move || {
             'outer: loop {
-                loop {
-                    match ctrl_rx.try_recv() {
-                        Ok(AudioControl::FlushThenStop) | Ok(AudioControl::StopNow) => break 'outer,
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
-                    }
+                match ctrl_rx.try_recv() {
+                    Ok(AudioControl::FlushThenStop) | Ok(AudioControl::StopNow) => break 'outer,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {} // no control → DATA
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
                 }
                 match data_rx.recv_timeout(std::time::Duration::from_millis(20)) {
                     Ok(AudioCommand::EnqueuePcm(_)) => {}
