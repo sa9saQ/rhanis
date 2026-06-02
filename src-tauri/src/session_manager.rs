@@ -548,8 +548,10 @@ pub async fn start_session(
         sink.send(frame).await.map_err(|_| {
             // Emit error status before returning so the frontend transitions out
             // of the "connected" state that was emitted at the WS-connect step.
+            // Generic wording (not "session.update") since the provider may send
+            // a different / multi-frame setup sequence.
             emit_session_status(&app, &seq.0, "error", Some("session setup failed"));
-            "session.update failed".to_string()
+            "session setup failed".to_string()
         })?;
     }
 

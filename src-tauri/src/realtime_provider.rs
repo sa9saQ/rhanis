@@ -236,14 +236,20 @@ fn parse_usage(event: &Value) -> Option<Usage> {
 
 // ---- provider selection ------------------------------------------------------
 
-/// Resolves the persisted `voice_provider_model` (`"openai/…"`, `"google/…"`) to
-/// a provider impl. `google/*` is a typed "not yet supported" error (PR2);
-/// unknown values are rejected. The settings layer already validates the value
-/// on load, so this is the defense-in-depth boundary at session start.
+/// Resolves the persisted `voice_provider_model` to a provider impl by matching
+/// the FULL `"provider/model"` string. `"openai/gpt-realtime-2"` is the only model
+/// PR1 wires; `"google/gemini-2.5-flash-live"` is a typed "not yet supported"
+/// error (PR2); everything else is rejected — including an `"openai/<other>"`
+/// that would otherwise silently connect to `build_request`'s fixed
+/// gpt-realtime-2 endpoint, and path tricks like `"openai/../google"`.
+/// settings_store's `KNOWN_VOICE_PROVIDER_MODELS` already restricts the persisted
+/// value on load; this is the defense-in-depth boundary at session start. PR2
+/// adds Gemini and lets `OpenAiRealtime` carry the model name for more OpenAI
+/// models.
 pub fn select_provider(voice_provider_model: &str) -> Result<Arc<dyn RealtimeProvider>, String> {
-    match voice_provider_model.split('/').next() {
-        Some("openai") => Ok(Arc::new(OpenAiRealtime::new())),
-        Some("google") => Err("voice provider not yet supported".to_string()),
+    match voice_provider_model {
+        "openai/gpt-realtime-2" => Ok(Arc::new(OpenAiRealtime::new())),
+        "google/gemini-2.5-flash-live" => Err("voice provider not yet supported".to_string()),
         _ => Err("unknown voice provider".to_string()),
     }
 }
@@ -437,5 +443,15 @@ mod tests {
     fn select_provider_unknown_is_rejected() {
         assert!(select_provider("evil/model").is_err());
         assert!(select_provider("").is_err());
+    }
+
+    #[test]
+    fn select_provider_rejects_other_openai_models_and_path_tricks() {
+        // PR1 wires only gpt-realtime-2; an "openai/<other>" must NOT silently
+        // connect to it (build_request's URL is fixed), and a prefix/path trick
+        // must not route to OpenAI.
+        assert!(select_provider("openai/gpt-4o").is_err());
+        assert!(select_provider("openai/../google").is_err());
+        assert!(select_provider("openai").is_err());
     }
 }
