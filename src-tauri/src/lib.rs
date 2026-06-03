@@ -2,6 +2,7 @@ mod approval_gate;
 mod audio_bridge;
 mod cost_tracker;
 mod events;
+mod permission_policy;
 mod realtime_provider;
 mod realtime_types;
 mod secret_store;
@@ -26,8 +27,8 @@ use secret_store::{
 };
 use settings_store::{
     complete_onboarding, delete_tool_provider_key, get_app_settings, save_budget_config,
-    set_recorder_adapter, set_tool_provider_enabled, set_voice_provider, JsonSettingsStore,
-    ManagedSettings,
+    set_permission_policy, set_recorder_adapter, set_tool_provider_enabled, set_voice_provider,
+    JsonSettingsStore, ManagedSettings, SettingsPolicyProvider, SettingsStore,
 };
 use realtime_types::ManagedDispatcher;
 use session_manager::{start_session, stop_session, ManagedSession};
@@ -45,6 +46,12 @@ const KEYCHAIN_SNAPSHOT_ACCOUNT: &str = "stronghold-snapshot-key";
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Dialog plugin (koe-351): registered so the Rust side can open a native
+        // folder picker for the permission-policy editor. Reached ONLY through our
+        // own `pick_folder` command (below) — the WebView is NOT granted any
+        // `dialog:*` capability, so it gains no direct dialog command surface (same
+        // minimal-surface posture as the disabled stronghold JS plugin).
+        .plugin(tauri_plugin_dialog::init())
         // NOTE: the stronghold *plugin* is intentionally NOT registered. We use
         // only the `Stronghold` wrapper type from Rust (see secret_store.rs), so
         // no stronghold JavaScript commands exist and the WebView cannot reach
@@ -86,20 +93,26 @@ pub fn run() {
             let gate = Arc::new(ApprovalGate::new(Arc::clone(&sequence)));
             app.manage(ManagedApprovalGate(Arc::clone(&gate)));
 
-            // Tool dispatcher (koe-2gy). Shares the one gate + sequence and emits
-            // tool-events via the real AppHandle. write_note is registered now;
-            // koe-s7i plugs the remaining tools into the same registry.
+            // Settings persistence (koe-200 + koe-351): onboarding flag + budget +
+            // recorder + voice/tool selections + permission policy. Rust-owned
+            // JSON; no WebView file surface. Built BEFORE the dispatcher so the
+            // permission-policy provider can share the SAME store Arc (so a policy
+            // edit via `set_permission_policy` is seen by the next dispatch).
+            let settings_path = data_dir.join("koe-settings.json");
+            let settings_store: Arc<dyn SettingsStore> =
+                Arc::new(JsonSettingsStore::new(settings_path));
+            app.manage(ManagedSettings::new(Arc::clone(&settings_store)));
+
+            // Tool dispatcher (koe-2gy). Shares the one gate + sequence, emits
+            // tool-events via the real AppHandle, and composes the user permission
+            // policy (koe-351) read from the shared settings store on each dispatch.
             let io = Arc::new(AppDispatchIo::new(app.handle().clone(), Arc::clone(&gate)));
             let mut registry = ToolRegistry::new();
             tools::register_m1_tools(&mut registry, Arc::clone(&recorder));
-            let dispatcher = RealToolDispatcher::new(io, Arc::clone(&sequence), Arc::new(registry));
+            let policy = Arc::new(SettingsPolicyProvider(Arc::clone(&settings_store)));
+            let dispatcher =
+                RealToolDispatcher::new(io, Arc::clone(&sequence), Arc::new(registry), policy);
             app.manage(ManagedDispatcher(Arc::new(dispatcher)));
-
-            // Settings persistence (koe-200): onboarding flag + budget config +
-            // recorder adapter choice. Rust-owned JSON; no WebView file surface.
-            let settings_path = data_dir.join("koe-settings.json");
-            let settings = JsonSettingsStore::new(settings_path);
-            app.manage(ManagedSettings::new(Arc::new(settings)));
 
             // Realtime session (koe-e3m): the RealToolDispatcher managed above
             // (koe-2gy) is read by session_manager via tauri::State<ManagedDispatcher>.
@@ -128,9 +141,37 @@ pub fn run() {
             set_voice_provider,
             set_tool_provider_enabled,
             delete_tool_provider_key,
+            set_permission_policy,
+            pick_folder,
             start_session,
             stop_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Opens the OS native folder picker and returns the chosen absolute path (or
+/// `None` if the user cancelled). koe-351: the permission-policy editor calls
+/// this via `invoke("pick_folder")`. The dialog runs entirely Rust-side (the
+/// WebView has no `dialog:*` capability); only the resulting path string crosses
+/// the IPC boundary. A non-filesystem result (should not happen for a folder) is
+/// reported as a fixed error and never silently dropped.
+#[tauri::command]
+async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |picked| {
+        let _ = tx.send(picked);
+    });
+    let picked = rx
+        .await
+        .map_err(|_| "folder picker is unavailable".to_string())?;
+    match picked {
+        None => Ok(None),
+        Some(file_path) => file_path
+            .into_path()
+            .map(|p| Some(p.to_string_lossy().into_owned()))
+            .map_err(|_| "selected folder could not be resolved".to_string()),
+    }
 }

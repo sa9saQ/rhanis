@@ -14,11 +14,12 @@ import {
   deleteToolProviderKey as ipcDeleteToolProviderKey,
   getAppSettings,
   saveBudgetConfig as ipcSaveBudgetConfig,
+  setPermissionPolicy as ipcSetPermissionPolicy,
   setToolProviderEnabled as ipcSetToolProviderEnabled,
   setVoiceProvider as ipcSetVoiceProvider,
   type ToolProvider,
 } from "../../lib/tauri/ipc";
-import type { AppSettings } from "./types";
+import type { AppSettings, PermissionPolicy } from "./types";
 
 interface SettingsState {
   /** null until load() completes, or if load failed. */
@@ -41,6 +42,8 @@ interface SettingsState {
   setToolProviderEnabled: (provider: ToolProvider, enabled: boolean) => Promise<void>;
   /** Deletes a 手足 tool key + clears its flag atomically (koe-31u), then re-fetches. */
   deleteToolProviderKey: (provider: ToolProvider) => Promise<void>;
+  /** Persists the whole permission policy (koe-351), then re-fetches. */
+  savePermissionPolicy: (policy: PermissionPolicy) => Promise<void>;
 }
 
 export const useSettingsStore = create<SettingsState>((set) => ({
@@ -92,6 +95,14 @@ export const useSettingsStore = create<SettingsState>((set) => ({
 
   deleteToolProviderKey: async (provider) => {
     await ipcDeleteToolProviderKey(provider);
+    const settings = await getAppSettings();
+    set((s) => ({ ...s, settings }));
+  },
+
+  savePermissionPolicy: async (policy) => {
+    await ipcSetPermissionPolicy(policy);
+    // Re-fetch the authoritative persisted state (the backend may reject a
+    // malformed policy; on success this reflects exactly what was stored).
     const settings = await getAppSettings();
     set((s) => ({ ...s, settings }));
   },

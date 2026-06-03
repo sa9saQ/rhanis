@@ -194,3 +194,77 @@
   flex-direction: column;
   gap: 6px;
 }
+
+/* Permission policy editor (koe-351) */
+.koe-policy-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.koe-policy-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  background: var(--koe-surface-alt);
+  border: 1px solid var(--koe-border);
+  border-radius: 12px;
+}
+.koe-policy-group h4 {
+  margin: 0;
+  font-size: 0.96rem;
+}
+.koe-policy-subhead {
+  margin: 10px 0 0;
+  font-size: 0.86rem;
+  color: var(--koe-text-muted);
+}
+.koe-policy-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.koe-policy-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--koe-surface);
+  border: 1px solid var(--koe-border);
+  border-radius: 7px;
+  font-size: 0.88rem;
+}
+.koe-policy-path {
+  flex: 1;
+  overflow-wrap: anywhere;
+  font-family: SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.82rem;
+}
+.koe-policy-danger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 0.82rem;
+  color: var(--koe-text);
+}
+.koe-policy-empty {
+  padding: 6px 2px;
+  color: var(--koe-text-muted);
+  font-size: 0.85rem;
+}
+.koe-policy-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+.koe-policy-add .koe-input {
+  flex: 1 1 12rem;
+}
+.koe-policy-warning {
+  color: var(--koe-danger);
+}

@@ -7,6 +7,7 @@ const saveBudgetConfig = vi.fn();
 const setVoiceProvider = vi.fn();
 const setToolProviderEnabled = vi.fn();
 const deleteToolProviderKey = vi.fn();
+const setPermissionPolicy = vi.fn();
 
 vi.mock("../../lib/tauri/ipc", () => ({
   getAppSettings: (...args: unknown[]) => getAppSettings(...args),
@@ -15,13 +16,14 @@ vi.mock("../../lib/tauri/ipc", () => ({
   setVoiceProvider: (...args: unknown[]) => setVoiceProvider(...args),
   setToolProviderEnabled: (...args: unknown[]) => setToolProviderEnabled(...args),
   deleteToolProviderKey: (...args: unknown[]) => deleteToolProviderKey(...args),
+  setPermissionPolicy: (...args: unknown[]) => setPermissionPolicy(...args),
   hasOpenaiApiKey: vi.fn(),
   setOpenaiApiKey: vi.fn(),
   deleteOpenaiApiKey: vi.fn(),
 }));
 
 import { useSettingsStore } from "./settingsStore";
-import type { AppSettings } from "./types";
+import { EMPTY_PERMISSION_POLICY, type AppSettings, type PermissionPolicy } from "./types";
 
 const defaultSettings: AppSettings = {
   onboarding_completed: false,
@@ -29,6 +31,7 @@ const defaultSettings: AppSettings = {
   recorder_adapter: "sqlite",
   voice_provider_model: "openai/gpt-realtime-2",
   tool_providers: { xai: false, x: false, search: false },
+  permission_policy: EMPTY_PERMISSION_POLICY,
 };
 
 const completedSettings: AppSettings = {
@@ -37,6 +40,7 @@ const completedSettings: AppSettings = {
   recorder_adapter: "sqlite",
   voice_provider_model: "openai/gpt-realtime-2",
   tool_providers: { xai: false, x: false, search: false },
+  permission_policy: EMPTY_PERMISSION_POLICY,
 };
 
 beforeEach(() => {
@@ -46,6 +50,7 @@ beforeEach(() => {
   setVoiceProvider.mockReset();
   setToolProviderEnabled.mockReset();
   deleteToolProviderKey.mockReset();
+  setPermissionPolicy.mockReset();
   // Reset zustand store
   useSettingsStore.setState({
     settings: null,
@@ -198,6 +203,34 @@ describe("settingsStore.deleteToolProviderKey", () => {
     deleteToolProviderKey.mockRejectedValue(new Error("secret store is unavailable"));
     await expect(
       useSettingsStore.getState().deleteToolProviderKey("xai"),
+    ).rejects.toThrow();
+  });
+});
+
+describe("settingsStore.savePermissionPolicy", () => {
+  it("calls setPermissionPolicy IPC then re-fetches the authoritative settings", async () => {
+    setPermissionPolicy.mockResolvedValue(undefined);
+    const policy: PermissionPolicy = {
+      ...EMPTY_PERMISSION_POLICY,
+      allowed_url_hosts: ["openai.com"],
+    };
+    const updated: AppSettings = { ...completedSettings, permission_policy: policy };
+    getAppSettings.mockResolvedValue(updated);
+
+    await useSettingsStore.getState().savePermissionPolicy(policy);
+
+    expect(setPermissionPolicy).toHaveBeenCalledWith(policy);
+    // Reflects the re-fetched authoritative value (not a local optimistic copy).
+    expect(getAppSettings).toHaveBeenCalled();
+    expect(useSettingsStore.getState().settings?.permission_policy.allowed_url_hosts).toEqual([
+      "openai.com",
+    ]);
+  });
+
+  it("propagates IPC errors (does not silently swallow a rejected policy)", async () => {
+    setPermissionPolicy.mockRejectedValue(new Error("permission policy host is invalid"));
+    await expect(
+      useSettingsStore.getState().savePermissionPolicy(EMPTY_PERMISSION_POLICY),
     ).rejects.toThrow();
   });
 });
