@@ -174,4 +174,43 @@ describe("PermissionPolicyEditor", () => {
     await screen.findByRole("alert");
     expect(failInput.value).toBe("still-here.com");
   });
+
+  it("does not revert a concurrent save when the folder picker resolves (stale-closure race)", async () => {
+    // Stateful backend: setPermissionPolicy persists, getAppSettings echoes it,
+    // so the store's permission_policy reflects each save (what latestPolicy reads).
+    let backend: PermissionPolicy = EMPTY_PERMISSION_POLICY;
+    setPermissionPolicy.mockImplementation(async (p: PermissionPolicy) => {
+      backend = p;
+    });
+    getAppSettings.mockImplementation(async () => settingsWith(backend));
+    useSettingsStore.setState({ settings: settingsWith(backend), loaded: true, loadError: null });
+
+    // The picker stays pending until we resolve it by hand.
+    let resolvePick!: (v: string | null) => void;
+    pickFolder.mockReturnValue(
+      new Promise<string | null>((res) => {
+        resolvePick = res;
+      }),
+    );
+
+    render(<PermissionPolicyEditor />);
+    // 1) open the folder picker — its await is now in flight
+    fireEvent.click(screen.getByRole("button", { name: "許可フォルダをダイアログで選択" }));
+    // 2) while it is open, save a DIFFERENT change (a deny host)
+    fireEvent.change(screen.getByLabelText("禁止ドメイン"), { target: { value: "evil.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "禁止ドメインを追加" }));
+    await waitFor(() =>
+      expect(
+        useSettingsStore.getState().settings?.permission_policy.denied_url_hosts,
+      ).toEqual(["evil.com"]),
+    );
+    // 3) resolve the picker → it commits the allowed folder from the LATEST policy
+    resolvePick("/picked");
+    await waitFor(() =>
+      expect(backend.allowed_folders).toEqual([{ path: "/picked", allow_danger: false }]),
+    );
+    // The deny host saved in step 2 must STILL be present (not reverted by the
+    // picker's deferred commit building off a stale render snapshot).
+    expect(backend.denied_url_hosts).toEqual(["evil.com"]);
+  });
 });

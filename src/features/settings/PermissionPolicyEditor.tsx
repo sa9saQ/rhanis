@@ -68,18 +68,30 @@ export function PermissionPolicyEditor() {
     }
   }
 
+  // Reads the freshest PERSISTED policy at commit time — NOT the render-time
+  // `policy` snapshot. The folder picker awaits a dialog (`handlePickFolder`), and
+  // another setting can be saved during that await; building `commit` from the
+  // stale render snapshot would silently revert it (stale-closure / Zustand
+  // setState race — async-react.md). Every mutation merges from `latestPolicy()`
+  // and identifies entries by VALUE (not render index) so it stays correct even
+  // if the list changed since render.
+  function latestPolicy(): PermissionPolicy {
+    return useSettingsStore.getState().settings?.permission_policy ?? EMPTY_PERMISSION_POLICY;
+  }
+
   // ---- folder helpers ------------------------------------------------------
 
   async function addAllowedFolder(path: string) {
     const p = path.trim();
     if (!p) return;
-    if (policy.allowed_folders.some((f) => f.path === p)) {
+    const cur = latestPolicy();
+    if (cur.allowed_folders.some((f) => f.path === p)) {
       setError("そのフォルダはすでに許可リストにあります。");
       return;
     }
     const ok = await commit({
-      ...policy,
-      allowed_folders: [...policy.allowed_folders, { path: p, allow_danger: false }],
+      ...cur,
+      allowed_folders: [...cur.allowed_folders, { path: p, allow_danger: false }],
     });
     if (ok) setAllowedFolderText("");
   }
@@ -87,27 +99,31 @@ export function PermissionPolicyEditor() {
   async function addDeniedFolder(path: string) {
     const p = path.trim();
     if (!p) return;
-    if (policy.denied_folders.includes(p)) {
+    const cur = latestPolicy();
+    if (cur.denied_folders.includes(p)) {
       setError("その場所はすでに禁止リストにあります。");
       return;
     }
-    const ok = await commit({ ...policy, denied_folders: [...policy.denied_folders, p] });
+    const ok = await commit({ ...cur, denied_folders: [...cur.denied_folders, p] });
     if (ok) setDeniedFolderText("");
   }
 
-  function removeAllowedFolder(idx: number) {
-    void commit({ ...policy, allowed_folders: policy.allowed_folders.filter((_, i) => i !== idx) });
+  function removeAllowedFolder(path: string) {
+    const cur = latestPolicy();
+    void commit({ ...cur, allowed_folders: cur.allowed_folders.filter((f) => f.path !== path) });
   }
 
-  function removeDeniedFolder(idx: number) {
-    void commit({ ...policy, denied_folders: policy.denied_folders.filter((_, i) => i !== idx) });
+  function removeDeniedFolder(path: string) {
+    const cur = latestPolicy();
+    void commit({ ...cur, denied_folders: cur.denied_folders.filter((d) => d !== path) });
   }
 
-  function toggleAllowDanger(idx: number, allow: boolean) {
-    const allowed_folders: AllowedFolder[] = policy.allowed_folders.map((f, i) =>
-      i === idx ? { ...f, allow_danger: allow } : f,
+  function toggleAllowDanger(path: string, allow: boolean) {
+    const cur = latestPolicy();
+    const allowed_folders: AllowedFolder[] = cur.allowed_folders.map((f) =>
+      f.path === path ? { ...f, allow_danger: allow } : f,
     );
-    void commit({ ...policy, allowed_folders });
+    void commit({ ...cur, allowed_folders });
   }
 
   async function handlePickFolder(target: "allowed" | "denied") {
@@ -134,11 +150,12 @@ export function PermissionPolicyEditor() {
       setError("ホスト名の形式が正しくありません（例: openai.com）。");
       return;
     }
-    if (policy.allowed_url_hosts.includes(h)) {
+    const cur = latestPolicy();
+    if (cur.allowed_url_hosts.includes(h)) {
       setError("そのドメインはすでに許可リストにあります。");
       return;
     }
-    const ok = await commit({ ...policy, allowed_url_hosts: [...policy.allowed_url_hosts, h] });
+    const ok = await commit({ ...cur, allowed_url_hosts: [...cur.allowed_url_hosts, h] });
     if (ok) setAllowedHostText("");
   }
 
@@ -148,24 +165,27 @@ export function PermissionPolicyEditor() {
       setError("ホスト名の形式が正しくありません（例: evil.com）。");
       return;
     }
-    if (policy.denied_url_hosts.includes(h)) {
+    const cur = latestPolicy();
+    if (cur.denied_url_hosts.includes(h)) {
       setError("そのドメインはすでに禁止リストにあります。");
       return;
     }
-    const ok = await commit({ ...policy, denied_url_hosts: [...policy.denied_url_hosts, h] });
+    const ok = await commit({ ...cur, denied_url_hosts: [...cur.denied_url_hosts, h] });
     if (ok) setDeniedHostText("");
   }
 
-  function removeAllowedHost(idx: number) {
-    void commit({ ...policy, allowed_url_hosts: policy.allowed_url_hosts.filter((_, i) => i !== idx) });
+  function removeAllowedHost(host: string) {
+    const cur = latestPolicy();
+    void commit({ ...cur, allowed_url_hosts: cur.allowed_url_hosts.filter((x) => x !== host) });
   }
 
-  function removeDeniedHost(idx: number) {
-    void commit({ ...policy, denied_url_hosts: policy.denied_url_hosts.filter((_, i) => i !== idx) });
+  function removeDeniedHost(host: string) {
+    const cur = latestPolicy();
+    void commit({ ...cur, denied_url_hosts: cur.denied_url_hosts.filter((x) => x !== host) });
   }
 
   function toggleAllowAllUrls(allow: boolean) {
-    void commit({ ...policy, allow_all_urls: allow });
+    void commit({ ...latestPolicy(), allow_all_urls: allow });
   }
 
   return (
@@ -194,7 +214,7 @@ export function PermissionPolicyEditor() {
                   type="checkbox"
                   checked={f.allow_danger}
                   disabled={saving}
-                  onChange={(e) => toggleAllowDanger(idx, e.target.checked)}
+                  onChange={(e) => toggleAllowDanger(f.path, e.target.checked)}
                 />
                 <span>強い操作も自動</span>
               </label>
@@ -202,7 +222,7 @@ export function PermissionPolicyEditor() {
                 type="button"
                 className="koe-btn koe-btn-danger"
                 disabled={saving}
-                onClick={() => removeAllowedFolder(idx)}
+                onClick={() => removeAllowedFolder(f.path)}
                 aria-label={`許可フォルダを削除: ${f.path}`}
               >
                 削除
@@ -261,7 +281,7 @@ export function PermissionPolicyEditor() {
                 type="button"
                 className="koe-btn koe-btn-danger"
                 disabled={saving}
-                onClick={() => removeDeniedFolder(idx)}
+                onClick={() => removeDeniedFolder(path)}
                 aria-label={`禁止の場所を削除: ${path}`}
               >
                 削除
@@ -333,7 +353,7 @@ export function PermissionPolicyEditor() {
                 type="button"
                 className="koe-btn koe-btn-danger"
                 disabled={saving}
-                onClick={() => removeAllowedHost(idx)}
+                onClick={() => removeAllowedHost(host)}
                 aria-label={`許可ドメインを削除: ${host}`}
               >
                 削除
@@ -374,7 +394,7 @@ export function PermissionPolicyEditor() {
                 type="button"
                 className="koe-btn koe-btn-danger"
                 disabled={saving}
-                onClick={() => removeDeniedHost(idx)}
+                onClick={() => removeDeniedHost(host)}
                 aria-label={`禁止ドメインを削除: ${host}`}
               >
                 削除
