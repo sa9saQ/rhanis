@@ -4,6 +4,7 @@
 
 ## Project Overview
 - **What**: 起動しっぱなしのリアルタイム音声 AI 秘書（デスクトップアプリ）。GPT-Realtime-2 で人と話すように連続会話しながら、裏で PC 操作 / Web 検索 / 記録を実行し、AI が今何をしているかを画面で可視化する
+- **中心思想（2026-06-04 研究で確定、SoT=plan §中心思想 + bd epic koe-sua）**: 「校正された透明性（calibrated glass-box）」。考えていること（検証可能な行為＝実行tool/参照source）と校正済みの確信度（実正解率に合わせた3-4段ラベル）を声と画面で開示し、人間が「いつ介入するか」を判断できる。即答ブラックボックスへのアンチテーゼ。既存19製品+学術で「思考の透明化」だけが真空席（製品0・論文0）。詳細 = `~/research/koe-voice-agent-novelty-2026/report.md`
 - **Stack**: Tauri 2 + React 19 + TypeScript + Rust + OpenAI Realtime-2 (WebSocket BYOK)
 - **Languages**: TypeScript (frontend) + Rust (backend)
 - **収益モデル**: M1 = BYOK 単独。M4 = 運営キー主役 + BYOK 退避（2026-06-03 転換、SoT=プラン + bd koe-1mf）:
@@ -35,7 +36,7 @@ SettingsPanel                              cost_tracker ★
 - **会話**: GPT-Realtime-2 へ WebSocket 直接接続（BYOK。ephemeral key 方式は採用しない、ローカルにキーがあるため不要）
 - **マイク**: **Rust 側 cpal** で取得（WebView の getUserMedia / CSP / AudioWorklet 複雑性を回避）。音声再生は rodio
 - **tool 実行**: async tokio task で並行（会話ストリームを止めずに裏作業）
-- **可視化**: `app.emit("tool-event", payload)` → frontend `listen()`。Enitar の export-progress と同一構造
+- **可視化 → 透明化**: `app.emit("tool-event", payload)` → frontend `listen()`（Enitar の export-progress と同一構造）。中心思想に伴い `thinking-event`（今考えていること＋検証可能な行為＋校正済み確信度ラベル）を追加（bd koe-sua.1, M1）。ActivityLog は「作業ログ」から「思考の透明性」窓へ昇華（生CoTは出さず検証可能な行為を主軸、レイテンシ300-700msの「思考の窓」で開示）
 - **記録**: `RecorderAdapter` trait で差し替え可能（M1=SQLite, M2=Obsidian, M3=Notion）
 
 ## Directory Structure
@@ -138,6 +139,7 @@ M1 では `.env` 不使用。API キーはユーザーがアプリ UI で入力 
 ## Branches / Milestones
 - `main`: M1 backend 完成（PR #1–#25 merged）。cost_tracker / secret_store（stronghold BYOK + multi-provider 対応 koe-31u）/ activity 可視化 / recorder（SQLite）/ settings + 予算オンボーディング + 声 provider / 手足 tool キー UI / approval_gate（SAFE・CAUTION・DANGER の 3 段 + 同時 pending DANGER 承認 cap = modal-flood guard koe-rxh #23）/ tool_dispatcher（in-flight 上限 DoS guard koe-wj2）/ session_manager（WebSocket + **`RealtimeProvider` trait 抽象化 koe-zv3 #25** + RealtimeAuth + コスト gate）/ audio_bridge（cpal マイク + rodio 再生 + clippy never_loop/absurd 整理 koe-a4h #22）/ M1 tools 4 本 / **permission_policy（許可ポリシー層 koe-351 #29 — 禁止>許可>既定 fail-closed、組み込み baseline 非上書き、承認だけ緩める多層防御、フォルダ/URL CRUD UI）** が実装・マージ済
 - **M1 残**: ネイティブ Windows 実機での E2E（`koe-ef8`、依存は全て ✓ で着手可）と hardening（`koe-pr3` audio race / `koe-8kw` read_file の Windows handle walk 等）。WSL ではマイク（cpal）が動かないため E2E は Windows 必須
+- **中心思想 epic（2026-06-04 研究 `~/research/koe-voice-agent-novelty-2026/` で確定）**: 「校正された透明性（calibrated glass-box）」。bd epic `koe-sua` + 子 `koe-sua.1`〜`.6`（`.1` thinking-event M1 → `.2` 校正ラベル / `.3` Calibration Memory L4（koe-9ds を3層→4層化）/ `.4` ACIエンジン M2 → `.5` Adaptive Transparency M3 → `.6` idle curator M4・koe-bu1統合）。opt-in flag で段階導入。実験裏付け: E1（開示で熟考の窓+575ms/品質+29pt）/ E2（生confidence直出しは作業ログ以下6.5%<7.1%）/ E5（確信度記憶で約47h使用してAUROC0.59→0.82）/ E6（状態適応透明性がCCC0.64で固定方針に勝つ）。詳細 = plan §中心思想 / report.md
 - **製品方向（2026-06）**: multi-provider キー設定基盤 `koe-31u` ✅ merged（#20。声 = OpenAI / Google 選択 + 手足 tool キーの暗号保管 + 設定 UI）→ 接続層 trait 化 `koe-zv3` **PR1 ✅ merged**（#25 `81576bf`。`RealtimeProvider` trait 抽象化 + OpenAI 切り出しの挙動不変リファクタ。realtime_provider.rs 新設 = trait + `ProviderEvent` enum + `RealtimeAuth` 移動 + `OpenAiRealtime` + `select_provider`。333 tests green）→ **次**: `koe-y1j`（PR2 = `GeminiLive` impl + `google/*` 実配線 + audio 16kHz 入力 + fallback chain。Plan の PR2 セクション参照）+ 手足 tool `koe-eal`（x_search 等を tool_dispatcher に追加。`tool_providers` フラグと各プロバイダキーを consume）。許可ポリシー層 `koe-351` ✅ merged（#29 `c1740f9`。フォルダ/URL allowlist + 禁止 denylist + ビジュアル編集。禁止>許可>既定 fail-closed、組み込み baseline 非上書き、IDNA host マッチ、UI→settings_store→`SettingsPolicyProvider`→dispatcher 端まで配線。383 cargo + 187 vitest green）
 - **follow-up（review 派生）**: `koe-rxh` ✅ merged（#23, 承認待ち cap = modal-flood + approval-map guard）/ `koe-a4h` ✅ merged（#22, clippy never_loop/absurd）→ `koe-e2b`（P2, koe-rxh の R-C で Codex 捕捉。approval cap は `register()` で効くが dispatch slot 消費は task `spawn` 時点なので、64 DANGER 連射の spawn-burst で一時的に starvation が残る。根本解決 = spawn 前の risk-aware admission（DispatcherSeam に `try_admit`）。**koe-zv3 PR1 完了で着手しやすく**: handle_text が `ProviderEvent::FunctionCall(PendingCall)` 分岐 + typed value なので try_admit を cap check 周辺に挿せる、approval cap は backstop）/ `koe-2br`（P2 bug, koe-zv3 #25 で CodeRabbit Major 捕捉。`response.done` usage 解析失敗時の fail-open を fail-closed 化。既存挙動で「usage なし正常 vs malformed」区別 + koe-ef8 で実 payload 確認後）
 - **koe-351 派生 follow-up**: `koe-6as`（P2, 許可フォルダを `validation.rs` の `allowed_bases` に連動 = 承認だけでなく IO 書込境界も拡張、段階導入）/ `koe-gap`（P2, open_url query/userinfo・web_search 経由の exfil 深掘り、open_url 実装時に「外部送信」カテゴリ化）/ `koe-1zw`（P3, policy 再読込の dispatch 毎 load をキャッシュ化）/ `koe-eh4`（P3, model 制御の tool 名が event/approval payload に出る既存挙動の hardening）/ `koe-vxg`（P3, macOS baseline `/private/*`・`~/Library` + Windows case-fold テスト）
