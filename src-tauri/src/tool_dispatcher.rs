@@ -40,6 +40,7 @@ use serde_json::Value;
 
 use crate::approval_gate::{classify, ApprovalGate, ApprovalOutcome, ApprovalRisk};
 use crate::events::SequenceCounter;
+use crate::permission_policy::{decide, PolicyDecision, PolicyProvider};
 use crate::realtime_types::{
     function_call_output, BoxFuture, DispatchResult, DispatcherSeam, FunctionCall, ToolSchema,
 };
@@ -197,11 +198,25 @@ pub struct RealToolDispatcher {
     io: Arc<dyn DispatchIo>,
     seq: Arc<SequenceCounter>,
     registry: Arc<ToolRegistry>,
+    /// User permission policy seam (koe-351). Read per-dispatch so a settings
+    /// edit takes effect immediately; a load failure fails closed (see
+    /// `SettingsPolicyProvider` / `PolicyState::Unavailable`).
+    policy: Arc<dyn PolicyProvider>,
 }
 
 impl RealToolDispatcher {
-    pub fn new(io: Arc<dyn DispatchIo>, seq: Arc<SequenceCounter>, registry: Arc<ToolRegistry>) -> Self {
-        Self { io, seq, registry }
+    pub fn new(
+        io: Arc<dyn DispatchIo>,
+        seq: Arc<SequenceCounter>,
+        registry: Arc<ToolRegistry>,
+        policy: Arc<dyn PolicyProvider>,
+    ) -> Self {
+        Self {
+            io,
+            seq,
+            registry,
+            policy,
+        }
     }
 }
 
@@ -212,7 +227,8 @@ impl DispatcherSeam for RealToolDispatcher {
         let io = Arc::clone(&self.io);
         let seq = Arc::clone(&self.seq);
         let registry = Arc::clone(&self.registry);
-        Box::pin(async move { dispatch_impl(io, seq, registry, call).await })
+        let policy = Arc::clone(&self.policy);
+        Box::pin(async move { dispatch_impl(io, seq, registry, policy, call).await })
     }
 
     fn tool_schemas(&self) -> Vec<ToolSchema> {
@@ -225,6 +241,7 @@ async fn dispatch_impl(
     io: Arc<dyn DispatchIo>,
     seq: Arc<SequenceCounter>,
     registry: Arc<ToolRegistry>,
+    policy: Arc<dyn PolicyProvider>,
     call: FunctionCall,
 ) -> DispatchResult {
     let FunctionCall { call_id, name, args } = call;
@@ -260,12 +277,27 @@ async fn dispatch_impl(
         return function_call_output(&call_id, error_output("arguments too large"));
     }
 
-    // (5) DANGER → human gate (fail-closed). SAFE/CAUTION fall through to run.
-    // The gate decision derives from the canonical predicate so the policy lives
-    // in one place (`ApprovalRisk::requires_approval`) and cannot drift if a new
-    // tier is added.
-    if risk.requires_approval() {
-        let outcome = io.request_approval(name.clone(), risk, start_summary(&name)).await;
+    // (5) Gate decision = built-in tier COMPOSED with the user permission policy
+    // (koe-351). The policy can only ADD safety: `AutoApprove` skips the gate for
+    // an allow-listed target; `Default` keeps the tier behaviour (DANGER gates,
+    // SAFE/CAUTION run); `RequireApproval` forces the gate even for a tier that
+    // would otherwise run (deny-list / baseline / unresolved path / strict URL /
+    // policy-unavailable). It never relaxes a DANGER op except via an explicit
+    // per-folder opt-in. The shell DENY/ALLOW list + real-IO O_NOFOLLOW guards are
+    // independent and still apply (defense in depth).
+    let must_gate = match decide(&policy.current_policy(), &name, risk, &args) {
+        PolicyDecision::AutoApprove => false,
+        PolicyDecision::Default => risk.requires_approval(),
+        PolicyDecision::RequireApproval => true,
+    };
+    if must_gate {
+        // The approval-required event is always DANGER-tier: requiring confirmation
+        // IS the danger UX, and the frontend `ApprovalRisk` union only carries
+        // CAUTION/DANGER (never SAFE). The redacted summary never includes the
+        // path/url. A decline blocks the tool (fail-closed).
+        let outcome = io
+            .request_approval(name.clone(), ApprovalRisk::Danger, start_summary(&name))
+            .await;
         if outcome == ApprovalOutcome::Declined {
             io.emit_tool_event(make_event(
                 &seq, &name, &call_id, "error",
@@ -460,6 +492,20 @@ mod tests {
         }
     }
 
+    /// Returns a fixed [`PolicyState`] (koe-351). The default tests use an empty
+    /// loaded policy (auto-approve nothing → existing tier behaviour preserved).
+    struct MockPolicyProvider(crate::permission_policy::PolicyState);
+    impl PolicyProvider for MockPolicyProvider {
+        fn current_policy(&self) -> crate::permission_policy::PolicyState {
+            self.0.clone()
+        }
+    }
+    fn empty_policy() -> Arc<dyn PolicyProvider> {
+        Arc::new(MockPolicyProvider(crate::permission_policy::PolicyState::Loaded(
+            crate::permission_policy::PermissionPolicy::default(),
+        )))
+    }
+
     fn echo_registry() -> Arc<ToolRegistry> {
         let mut r = ToolRegistry::new();
         r.register(
@@ -482,8 +528,17 @@ mod tests {
     }
 
     async fn run(io: &Arc<MockIo>, registry: Arc<ToolRegistry>, c: FunctionCall) -> DispatchResult {
+        run_with_policy(io, registry, c, empty_policy()).await
+    }
+
+    async fn run_with_policy(
+        io: &Arc<MockIo>,
+        registry: Arc<ToolRegistry>,
+        c: FunctionCall,
+        policy: Arc<dyn PolicyProvider>,
+    ) -> DispatchResult {
         let seq = Arc::new(SequenceCounter::new());
-        dispatch_impl(io.clone() as Arc<dyn DispatchIo>, seq, registry, c).await
+        dispatch_impl(io.clone() as Arc<dyn DispatchIo>, seq, registry, policy, c).await
     }
 
     #[tokio::test]
@@ -715,5 +770,133 @@ mod tests {
         assert!(io.phases().is_empty());
         let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
         assert!(out.contains("too long"));
+    }
+
+    // ---- permission policy composition (koe-351) -----------------------------
+    //
+    // These prove the policy layer actually changes the gate decision in the
+    // dispatcher, including via the REAL settings store (the end-to-end wiring
+    // evidence: settings file → SettingsPolicyProvider → dispatcher → gate).
+
+    use crate::permission_policy::{AllowedFolder, PermissionPolicy, PolicyState};
+    use crate::settings_store::{AppSettings, JsonSettingsStore, SettingsPolicyProvider, SettingsStore};
+
+    fn loaded(policy: PermissionPolicy) -> Arc<dyn PolicyProvider> {
+        Arc::new(MockPolicyProvider(PolicyState::Loaded(policy)))
+    }
+
+    #[tokio::test]
+    async fn policy_unavailable_forces_gate_on_safe_read() {
+        // Settings unavailable → a SAFE read with an absolute path must be gated
+        // (the deny protections are NOT dropped). A decline blocks it.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let io = MockIo::new(ApprovalOutcome::Declined);
+        let provider: Arc<dyn PolicyProvider> = Arc::new(MockPolicyProvider(PolicyState::Unavailable));
+        let res = run_with_policy(
+            &io,
+            Arc::new(ToolRegistry::new()),
+            call("read_file", serde_json::json!({ "path": file.to_str().unwrap() })),
+            provider,
+        )
+        .await;
+        assert_eq!(io.phases(), vec!["start", "error"], "SAFE read must be force-gated when policy unavailable");
+        let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
+        assert!(out.contains("user declined"));
+    }
+
+    #[tokio::test]
+    async fn allowed_danger_folder_skips_gate_even_when_io_would_decline() {
+        // A delete_file inside an allow_danger folder auto-runs: the gate is
+        // skipped, so the Declining MockIo never blocks it (reaches "done").
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doomed.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let policy = PermissionPolicy {
+            allowed_folders: vec![AllowedFolder {
+                path: dir.path().canonicalize().unwrap().to_string_lossy().into_owned(),
+                allow_danger: true,
+            }],
+            ..Default::default()
+        };
+        let io = MockIo::new(ApprovalOutcome::Declined); // would block if gated
+        run_with_policy(
+            &io,
+            Arc::new(ToolRegistry::new()),
+            call("delete_file", serde_json::json!({ "path": file.to_str().unwrap() })),
+            loaded(policy),
+        )
+        .await;
+        assert_eq!(io.phases(), vec!["start", "done"], "opt-in DANGER must auto-run (gate skipped)");
+    }
+
+    /// EVIDENCE: a denied folder configured through the REAL JsonSettingsStore
+    /// forces a gate on a SAFE read — proving UI → settings_store → provider →
+    /// dispatcher is wired end to end (not just the in-memory mock).
+    #[tokio::test]
+    async fn denied_folder_via_real_settings_store_forces_gate() {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("koe-settings.json");
+        let store: Arc<dyn SettingsStore> = Arc::new(JsonSettingsStore::new(path));
+
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("secret.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let policy = PermissionPolicy {
+            denied_folders: vec![work.path().canonicalize().unwrap().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        store
+            .save(&AppSettings { permission_policy: policy, ..AppSettings::default() })
+            .expect("seed settings");
+        let provider: Arc<dyn PolicyProvider> = Arc::new(SettingsPolicyProvider(Arc::clone(&store)));
+
+        let io = MockIo::new(ApprovalOutcome::Declined);
+        let res = run_with_policy(
+            &io,
+            Arc::new(ToolRegistry::new()),
+            call("read_file", serde_json::json!({ "path": file.to_str().unwrap() })),
+            provider,
+        )
+        .await;
+        assert_eq!(io.phases(), vec!["start", "error"], "denied folder must force a gate via the real store");
+        let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
+        assert!(out.contains("user declined"));
+    }
+
+    /// EVIDENCE: an allow_danger folder configured through the REAL settings store
+    /// auto-executes a DANGER delete (gate skipped) — the relaxation half of the
+    /// same wiring.
+    #[tokio::test]
+    async fn allow_danger_via_real_settings_store_auto_executes() {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("koe-settings.json");
+        let store: Arc<dyn SettingsStore> = Arc::new(JsonSettingsStore::new(path));
+
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("doomed.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let policy = PermissionPolicy {
+            allowed_folders: vec![AllowedFolder {
+                path: work.path().canonicalize().unwrap().to_string_lossy().into_owned(),
+                allow_danger: true,
+            }],
+            ..Default::default()
+        };
+        store
+            .save(&AppSettings { permission_policy: policy, ..AppSettings::default() })
+            .expect("seed settings");
+        let provider: Arc<dyn PolicyProvider> = Arc::new(SettingsPolicyProvider(Arc::clone(&store)));
+
+        let io = MockIo::new(ApprovalOutcome::Declined); // would block if gated
+        run_with_policy(
+            &io,
+            Arc::new(ToolRegistry::new()),
+            call("delete_file", serde_json::json!({ "path": file.to_str().unwrap() })),
+            provider,
+        )
+        .await;
+        assert_eq!(io.phases(), vec!["start", "done"], "allow_danger must auto-run via the real store");
     }
 }

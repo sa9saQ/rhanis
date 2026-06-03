@@ -21,6 +21,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::cost_tracker::{usd_to_nanodollars, BudgetConfig};
+use crate::permission_policy::{
+    validate_permission_policy, PermissionPolicy, PolicyProvider, PolicyState,
+};
 use crate::secret_store::{
     ManagedSecretStore, OPENAI_KEY_NAME, SEARCH_KEY_NAME, XAI_KEY_NAME, X_API_KEY_NAME,
 };
@@ -69,6 +72,14 @@ pub struct AppSettings {
     /// so a hand-edited file cannot inject arbitrary keys.
     #[serde(default)]
     pub tool_providers: ToolProviderFlags,
+
+    /// User permission policy (koe-351): folder/URL allow + deny lists layered on
+    /// top of the built-in risk gate. Absent → [`PermissionPolicy::default()`] (an
+    /// empty policy that auto-approves NOTHING), so an older file migrates safely
+    /// and a missing policy is fail-closed by construction — unlike `budget`, the
+    /// safe default here IS the default value, so `#[serde(default)]` is correct.
+    #[serde(default)]
+    pub permission_policy: PermissionPolicy,
 }
 
 /// Per-provider enable flags for the 手足 (tool) keys (koe-31u). Keys live in the
@@ -101,6 +112,7 @@ impl Default for AppSettings {
             recorder_adapter: default_recorder_adapter(),
             voice_provider_model: default_voice_provider_model(),
             tool_providers: ToolProviderFlags::default(),
+            permission_policy: PermissionPolicy::default(),
         }
     }
 }
@@ -268,6 +280,25 @@ impl ManagedSettings {
     }
 }
 
+/// Bridges the settings store to the tool dispatcher's [`PolicyProvider`] seam
+/// (koe-351). Reads the policy from the store on EACH dispatch so a UI edit takes
+/// effect immediately. A load failure (corrupt/unreadable) maps to
+/// [`PolicyState::Unavailable`] — NOT an empty policy — so a transient failure
+/// cannot silently drop the user's deny list (the dispatcher then forces a human
+/// decision for any policy-relevant target). Holds the same `Arc<dyn SettingsStore>`
+/// that `ManagedSettings` wraps; reads need no write lock (saves are atomic
+/// temp+rename, so a read sees a whole old or whole new file, never a torn one).
+pub struct SettingsPolicyProvider(pub Arc<dyn SettingsStore>);
+
+impl PolicyProvider for SettingsPolicyProvider {
+    fn current_policy(&self) -> PolicyState {
+        match self.0.load() {
+            Ok(settings) => PolicyState::Loaded(settings.permission_policy),
+            Err(_) => PolicyState::Unavailable,
+        }
+    }
+}
+
 /// Returns the current app settings. Contains **no** secret values; safe for
 /// the WebView.
 #[tauri::command]
@@ -316,9 +347,11 @@ pub async fn complete_onboarding(
         budget,
         recorder_adapter,
         // Voice/tool selections are made post-onboarding in Settings, so first-run
-        // takes the defaults (OpenAI voice, all tools disabled).
+        // takes the defaults (OpenAI voice, all tools disabled, empty permission
+        // policy = auto-approve nothing).
         voice_provider_model: default_voice_provider_model(),
         tool_providers: ToolProviderFlags::default(),
+        permission_policy: PermissionPolicy::default(),
     };
 
     settings.replace(&new_settings)
@@ -418,6 +451,23 @@ pub async fn delete_tool_provider_key(
     })
 }
 
+/// Replaces the whole permission policy (koe-351). The policy is validated
+/// (bounds + host well-formedness) BEFORE persisting, so a malformed policy from
+/// a direct/stale IPC call is rejected with a fixed message and never written;
+/// the existing fail-closed evaluation (baseline + deny always win) does the rest
+/// at decision time. Preserves all other settings via the write lock.
+#[tauri::command]
+pub async fn set_permission_policy(
+    policy: PermissionPolicy,
+    settings: tauri::State<'_, ManagedSettings>,
+) -> Result<(), String> {
+    validate_permission_policy(&policy).map_err(|e| e.to_string())?;
+    settings.update(|s| {
+        s.permission_policy = policy;
+        Ok(())
+    })
+}
+
 /// Maps a 手足 tool provider id to its secret record name (tools only — voice
 /// providers are not togglable here). Unknown ids get a fixed Err.
 fn tool_provider_key_name(provider: &str) -> Result<&'static str, String> {
@@ -507,6 +557,12 @@ fn validate_app_settings(s: &AppSettings) -> Result<(), SettingsError> {
             return Err(SettingsError::Corrupt);
         }
     } else if s.budget.monthly_limit_nanodollars != 0 {
+        return Err(SettingsError::Corrupt);
+    }
+    // Permission policy bounds + host well-formedness (koe-351). A tampered file
+    // with an over-cap list or a malformed host entry fails closed on load, the
+    // same posture as the budget bounds above. The UI keeps legit input valid.
+    if validate_permission_policy(&s.permission_policy).is_err() {
         return Err(SettingsError::Corrupt);
     }
     Ok(())
@@ -609,6 +665,16 @@ mod tests {
             recorder_adapter: "sqlite".into(),
             voice_provider_model: "openai/gpt-realtime-2".into(),
             tool_providers: ToolProviderFlags { xai: true, x: false, search: true },
+            permission_policy: crate::permission_policy::PermissionPolicy {
+                allowed_folders: vec![crate::permission_policy::AllowedFolder {
+                    path: "/home/u/work".into(),
+                    allow_danger: true,
+                }],
+                denied_folders: vec!["/home/u/secret".into()],
+                allowed_url_hosts: vec!["openai.com".into()],
+                denied_url_hosts: vec!["evil.com".into()],
+                allow_all_urls: false,
+            },
         };
         store.save(&original).expect("save");
         let loaded = store.load().expect("load");
@@ -876,6 +942,7 @@ mod tests {
             recorder_adapter: "sqlite".into(),
             voice_provider_model: "openai/gpt-realtime-2".into(),
             tool_providers: ToolProviderFlags::default(),
+            permission_policy: PermissionPolicy::default(),
         };
         store.save(&base).expect("seed");
         let mut current = store.load().expect("load");
@@ -969,6 +1036,8 @@ mod tests {
             "set_voice_provider",
             "set_tool_provider_enabled",
             "delete_tool_provider_key",
+            "set_permission_policy", // koe-351
+            "pick_folder",           // koe-351 folder picker
         ] {
             assert!(
                 code.contains(cmd),
@@ -983,6 +1052,88 @@ mod tests {
         assert!(
             !code.contains("greet"),
             "greet scaffold command must be removed from lib.rs"
+        );
+    }
+
+    // ---- Permission policy (koe-351) --------------------------------------
+
+    #[test]
+    fn load_migrates_file_without_permission_policy() {
+        // A file predating koe-351 (no permission_policy) must load with an empty
+        // policy (auto-approve nothing), not fail.
+        let (store, _dir) = temp_store();
+        std::fs::write(
+            &store.path,
+            br#"{"onboarding_completed":true,"budget":{"enabled":false,"monthly_limit_nanodollars":0},"recorder_adapter":"sqlite"}"#,
+        )
+        .expect("seed legacy file");
+        let s = store.load().expect("legacy file migrates");
+        assert_eq!(s.permission_policy, PermissionPolicy::default());
+    }
+
+    #[test]
+    fn load_rejects_over_cap_permission_policy() {
+        // A tampered file with an over-cap deny list fails closed on load.
+        let (store, _dir) = temp_store();
+        let huge: Vec<String> = (0..300).map(|i| format!("/x/{i}")).collect();
+        let s = AppSettings {
+            permission_policy: PermissionPolicy {
+                denied_folders: huge,
+                ..Default::default()
+            },
+            ..AppSettings::default()
+        };
+        // Write the over-cap policy directly (bypassing the validating command).
+        let json = serde_json::to_vec(&s).unwrap();
+        std::fs::write(&store.path, json).unwrap();
+        assert!(matches!(store.load(), Err(SettingsError::Corrupt)));
+    }
+
+    #[test]
+    fn load_rejects_malformed_host_in_permission_policy() {
+        let (store, _dir) = temp_store();
+        let s = AppSettings {
+            permission_policy: PermissionPolicy {
+                denied_url_hosts: vec!["bad/host".into()],
+                ..Default::default()
+            },
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_vec(&s).unwrap();
+        std::fs::write(&store.path, json).unwrap();
+        assert!(matches!(store.load(), Err(SettingsError::Corrupt)));
+    }
+
+    #[test]
+    fn settings_policy_provider_loaded_and_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("koe-settings.json");
+        let store: Arc<dyn SettingsStore> = Arc::new(JsonSettingsStore::new(path.clone()));
+        let policy = PermissionPolicy {
+            allowed_url_hosts: vec!["openai.com".into()],
+            ..Default::default()
+        };
+        store
+            .save(&AppSettings {
+                permission_policy: policy.clone(),
+                ..AppSettings::default()
+            })
+            .expect("seed");
+
+        let provider = SettingsPolicyProvider(Arc::clone(&store));
+        assert_eq!(provider.current_policy(), PolicyState::Loaded(policy));
+
+        // A corrupt file → Unavailable (NOT an empty Loaded policy), so the
+        // dispatcher keeps forcing approval for policy-relevant targets.
+        std::fs::write(&path, b"} not json {").unwrap();
+        assert_eq!(provider.current_policy(), PolicyState::Unavailable);
+    }
+
+    #[test]
+    fn default_app_settings_has_empty_policy() {
+        assert_eq!(
+            AppSettings::default().permission_policy,
+            PermissionPolicy::default()
         );
     }
 }

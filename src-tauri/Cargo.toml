@@ -20,8 +20,19 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+# Native folder-picker for the permission-policy editor (koe-351). Used ONLY via
+# the Rust `DialogExt` API behind a `pick_folder` command — the JS plugin surface
+# (`@tauri-apps/plugin-dialog`) is intentionally NOT added, so the WebView gains
+# no dialog command (same minimal-surface posture as the disabled stronghold JS
+# plugin). The folder path round-trips through our own `pick_folder` invoke.
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# URL parsing + IDNA host normalization for the permission-policy URL allow/deny
+# matching (koe-351). Already pulled in transitively by reqwest; declared directly
+# because permission_policy.rs uses `url::Url` / `url::Host` for host suffix +
+# dot-boundary matching (defends against the evil-openai.com vs openai.com bypass).
+url = "2"
 # Secret store (BYOK). The stronghold *plugin* is NOT registered; we use the
 # `Stronghold` wrapper type directly from Rust so the WebView gets no JS surface.
 tauri-plugin-stronghold = "2"

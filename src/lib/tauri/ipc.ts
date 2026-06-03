@@ -13,7 +13,7 @@ import type {
   SessionStatusEvent,
   ToolEvent,
 } from "../../features/activity/types";
-import type { AppSettings } from "../../features/settings/types";
+import type { AppSettings, PermissionPolicy } from "../../features/settings/types";
 
 /**
  * Allowlisted provider ids — mirror the Rust `provider_key_name` /
@@ -44,6 +44,9 @@ export const COMMAND = {
   setVoiceProvider: "set_voice_provider",
   setToolProviderEnabled: "set_tool_provider_enabled",
   deleteToolProviderKey: "delete_tool_provider_key",
+  // Permission policy (koe-351)
+  setPermissionPolicy: "set_permission_policy",
+  pickFolder: "pick_folder",
   // Secret store commands (secret_store.rs)
   setOpenaiApiKey: "set_openai_api_key",
   hasOpenaiApiKey: "has_openai_api_key",
@@ -172,6 +175,30 @@ export function setToolProviderEnabled(provider: ToolProvider, enabled: boolean)
  *  lock-hold, so a concurrent enable can't leave an "enabled but key-less" state). */
 export function deleteToolProviderKey(provider: ToolProvider): Promise<void> {
   return invoke(COMMAND.deleteToolProviderKey, { provider });
+}
+
+// ---------------------------------------------------------------------------
+// Permission policy commands (koe-351)
+// ---------------------------------------------------------------------------
+
+/**
+ * Replaces the whole permission policy. The backend validates it (bounds + host
+ * well-formedness) before persisting and rejects a malformed policy; the
+ * fail-closed evaluation (baseline + deny always win) does the rest at decision
+ * time. Preserves all other settings.
+ */
+export function setPermissionPolicy(policy: PermissionPolicy): Promise<void> {
+  return invoke(COMMAND.setPermissionPolicy, { policy });
+}
+
+/**
+ * Opens the OS native folder picker (Rust-side) and resolves to the chosen
+ * absolute path, or `null` if the user cancelled. The dialog runs entirely in
+ * Rust — the WebView has no `dialog:*` capability; only the path string crosses
+ * the IPC boundary.
+ */
+export function pickFolder(): Promise<string | null> {
+  return invoke<string | null>(COMMAND.pickFolder);
 }
 
 /**

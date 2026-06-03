@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from "react";
 import { hasProviderApiKey, type ToolProvider } from "../../lib/tauri/ipc";
 import { useSettingsStore } from "./settingsStore";
 import { ApiKeyInput } from "./ApiKeyInput";
+import { PermissionPolicyEditor } from "./PermissionPolicyEditor";
 import { VoiceProviderSelector } from "./VoiceProviderSelector";
 import { nanodollarsToUsdDisplay } from "./utils";
 import type { ToolProviderFlags } from "./types";
@@ -173,6 +174,15 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
           {actionError}
         </p>
       )}
+
+      <section className="koe-settings-section">
+        <h3>許可ポリシー（フォルダ / URL）</h3>
+        <p className="koe-settings-hint">
+          AI が自動で触ってよい場所・サイト（許可）と、必ず確認させる場所（禁止）を決めます。優先順位は
+          「禁止 &gt; 許可 &gt; 既定」で、SSH 鍵や認証情報などは設定に関係なく常に保護されます。
+        </p>
+        <PermissionPolicyEditor />
+      </section>
 
       <section className="koe-settings-section">
         <h3>月次予算</h3>

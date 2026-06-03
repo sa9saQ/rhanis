@@ -46,6 +46,16 @@ const SENSITIVE_COMPONENTS: &[&str] = &[
     ".svn",
     ".hg",
     "node_modules",
+    // Credential-bearing dotfiles/dirs (koe-351): a broad user allow-list (e.g.
+    // the whole home/project dir) must NOT let the AI auto-touch these. Only
+    // high-confidence, low-false-positive secret names (`.env.example` is a
+    // distinct component and is NOT matched).
+    ".env",
+    ".netrc",
+    ".npmrc",
+    ".pgpass",
+    ".docker",
+    ".kube",
 ];
 
 #[cfg(windows)]
@@ -56,6 +66,14 @@ const SENSITIVE_COMPONENTS: &[&str] = &[
     ".git",
     ".local", // parity with the non-Windows list (e.g. a synced .local dir)
     "node_modules",
+    // Credential-bearing dotfiles/dirs (koe-351) — parity with the non-Windows
+    // list (these can appear under a synced/WSL home or a project dir on Windows).
+    ".env",
+    ".netrc",
+    ".npmrc",
+    ".pgpass",
+    ".docker",
+    ".kube",
     // Canonical Windows paths carry a drive-letter prefix, so system roots are
     // matched as components rather than via a leading-path prefix.
     "appdata",
@@ -64,6 +82,27 @@ const SENSITIVE_COMPONENTS: &[&str] = &[
     "syswow64",
     "programdata",
 ];
+
+/// Absolute system-directory roots that must never be auto-approved or touched,
+/// even inside a user allow-list (koe-351). Matched as a path PREFIX of the
+/// canonical path (component-wise, via [`is_within`]) — NOT a bare component —
+/// so `/etc/shadow` is caught while a normal `/home/u/project/etc/config` is not.
+/// Windows system roots are drive-prefixed and already covered as components in
+/// [`SENSITIVE_COMPONENTS`], so this is empty there.
+///
+/// `/tmp` and `/var` are deliberately omitted: temp dirs live there (`/var/tmp`,
+/// macOS `/var/folders`, `$TMPDIR`), and confusing a user's temp work with a
+/// system dir would break legitimate use. Full macOS coverage (`/private/*`,
+/// `/System`, `/Library`) needs `/private`-symlink-aware roots and is a M3
+/// follow-up (M1 ships Windows; dev/test runs on Linux).
+#[cfg(not(windows))]
+const SENSITIVE_ROOTS: &[&str] = &[
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/root",
+    "/run", "/sbin", "/srv", "/sys", "/usr",
+];
+
+#[cfg(windows)]
+const SENSITIVE_ROOTS: &[&str] = &[];
 
 /// Why a path was rejected. `Display` returns a **fixed** message per variant —
 /// it never echoes the offending path — so a rejection reason can be surfaced in
@@ -105,17 +144,44 @@ impl std::error::Error for PathValidationError {}
 /// True if any component of `path` matches a [`SENSITIVE_COMPONENTS`] entry
 /// (case-insensitive — Windows and macOS file systems are case-insensitive, and
 /// a case-only bypass like `.SSH` must not slip through).
-fn contains_sensitive(path: &Path) -> bool {
-    path.components().any(|c| {
+///
+/// `pub(crate)` so the permission policy (koe-351) can enforce the SAME
+/// non-overridable baseline before honouring a user allow-list.
+pub(crate) fn contains_sensitive(path: &Path) -> bool {
+    let component_match = path.components().any(|c| {
         let name = c.as_os_str().to_string_lossy().to_ascii_lowercase();
-        SENSITIVE_COMPONENTS.contains(&name.as_str())
-    })
+        if SENSITIVE_COMPONENTS.contains(&name.as_str()) {
+            return true;
+        }
+        // Dotenv variants beyond the exact `.env` (`.env.local`, `.env.production`,
+        // `.env.staging`, …) are credential files too and must not slip through a
+        // broad user allow-list (koe-351). Known non-secret templates
+        // (`.env.example` / `.sample` / `.template` / `.dist`) stay readable.
+        if let Some(suffix) = name.strip_prefix(".env.") {
+            return !matches!(suffix, "example" | "sample" | "template" | "dist");
+        }
+        false
+    });
+    if component_match {
+        return true;
+    }
+    // System-root prefix check (koe-351): on Unix, system dirs have no drive
+    // prefix, so a path like `/etc/shadow` has no individually-sensitive component
+    // name. Catch it by canonical-path prefix so a broad user allow-list can never
+    // auto-approve a system path.
+    SENSITIVE_ROOTS
+        .iter()
+        .any(|root| is_within(path, Path::new(root)))
 }
 
 /// True iff `candidate` is `base` itself or lies inside it. Uses component-wise
 /// `strip_prefix`, so `/home/u/Documents_evil/x` is correctly NOT inside
 /// `/home/u/Documents` (a naive `starts_with` on the string form would match).
-fn is_within(candidate: &Path, base: &Path) -> bool {
+///
+/// `pub(crate)` so the permission policy (koe-351) can reuse the same boundary
+/// check for its folder allow/deny lists. Both `candidate` and `base` MUST be
+/// canonicalized by the caller for the comparison to be meaningful.
+pub(crate) fn is_within(candidate: &Path, base: &Path) -> bool {
     candidate.strip_prefix(base).is_ok()
 }
 
@@ -128,6 +194,50 @@ fn within_any_allowed(candidate: &Path, allowed_bases: &[PathBuf]) -> bool {
         Ok(base_canon) => is_within(candidate, &base_canon),
         Err(_) => false,
     })
+}
+
+/// Resolves `input` to a canonical, boundary-comparable absolute path for the
+/// permission policy (koe-351), or `None` when it cannot be trusted. Unlike
+/// [`validate_read_path`]/[`validate_write_path`] this does NOT confine to an
+/// allow-list or require a regular file — it is the shared primitive the policy
+/// uses to ask "where does this path REALLY land?" before consulting the user's
+/// allow/deny folders.
+///
+/// Resolution mirrors `validate_write_path`'s logic so the approval decision and
+/// the eventual IO agree on the resolved location:
+/// - An existing path (file / dir / live symlink) → full `canonicalize` (resolves
+///   `..` and symlinks; a symlink that escapes is resolved to its real target,
+///   which then simply won't be inside an allowed folder).
+/// - A not-yet-existing target → canonicalize the parent and rejoin the file name,
+///   BUT if the leaf is itself a symlink (incl. a **dangling** one) return `None`:
+///   its real target is unknown/elsewhere, so it must not be auto-approved.
+/// - Anything unresolvable (missing parent, too long, empty) → `None`.
+///
+/// `None` means the policy fails closed (the caller forces a human decision).
+pub(crate) fn resolve_for_boundary(input: &str) -> Option<PathBuf> {
+    if input.len() > MAX_PATH_LENGTH || input.trim().is_empty() {
+        return None;
+    }
+    let raw = Path::new(input);
+    // Existing path → full canonicalize (resolves symlinks + `..`).
+    if let Ok(canon) = raw.canonicalize() {
+        return Some(canon);
+    }
+    // Non-existing target: resolve the parent, then reject a symlink leaf.
+    let file_name = raw.file_name()?;
+    let parent = raw.parent()?;
+    let parent_canon = parent.canonicalize().ok()?;
+    let candidate = parent_canon.join(file_name);
+    // A symlink at the (in-base-looking) leaf — including a dangling one whose
+    // target does not exist — could redirect the operation elsewhere, so it is
+    // not a trustworthy "new file in this folder". Fail closed.
+    if std::fs::symlink_metadata(&candidate)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// Validates a path to **read** an existing file, confining it to
@@ -527,5 +637,118 @@ mod tests {
             validate_write_path(&long, &bases).unwrap_err(),
             PathValidationError::TooLong
         );
+    }
+
+    // ---- expanded credential baseline (koe-351) ------------------------------
+
+    #[test]
+    fn contains_sensitive_catches_credential_dotfiles() {
+        // The koe-351 baseline expansion: a broad user allow-list must not be
+        // able to reach these even inside an otherwise-allowed dir.
+        for name in [".env", ".netrc", ".npmrc", ".pgpass", ".docker", ".kube"] {
+            let p = Path::new("/home/u/work").join(name).join("inner");
+            assert!(contains_sensitive(&p), "{name} must be sensitive");
+        }
+        // Case-only variants are caught too.
+        assert!(contains_sensitive(Path::new("/home/u/.ENV/x")));
+        // A look-alike that is a DISTINCT component is not matched.
+        assert!(!contains_sensitive(Path::new("/home/u/work/notes.txt")));
+    }
+
+    #[test]
+    fn contains_sensitive_catches_dotenv_variants_but_not_templates() {
+        // Secret dotenv variants beyond the exact `.env` must be caught even
+        // inside a broadly allow-listed folder (koe-351 baseline strengthening).
+        for secret in [".env.local", ".env.production", ".env.development", ".env.test", ".env.staging"] {
+            assert!(
+                contains_sensitive(&Path::new("/home/u/project").join(secret)),
+                "{secret} must be sensitive"
+            );
+        }
+        // Non-secret templates stay readable (placeholders, not credentials).
+        for template in [".env.example", ".env.sample", ".env.template", ".env.dist"] {
+            assert!(
+                !contains_sensitive(&Path::new("/home/u/project").join(template)),
+                "{template} must NOT be treated as a secret"
+            );
+        }
+        // Case-insensitive on the variant too.
+        assert!(contains_sensitive(Path::new("/home/u/.ENV.LOCAL/x")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn contains_sensitive_catches_system_roots_not_userspace() {
+        // System dirs (no individually-sensitive component) are caught by prefix.
+        for p in ["/etc/shadow", "/root/.bashrc", "/usr/bin/x", "/proc/1/environ", "/boot/grub/x"] {
+            assert!(contains_sensitive(Path::new(p)), "{p} must be sensitive");
+        }
+        // Userspace look-alikes are NOT caught (prefix, not substring/component).
+        assert!(!contains_sensitive(Path::new("/home/u/project/etc/config.yaml")));
+        assert!(!contains_sensitive(Path::new("/home/u/usr/notes.txt")));
+        // Temp dirs are NOT system roots (the tests rely on this — `/tmp`/`/var`
+        // are deliberately omitted from SENSITIVE_ROOTS).
+        assert!(!contains_sensitive(Path::new("/tmp/claude-1000/x")));
+        assert!(!contains_sensitive(Path::new("/var/tmp/x")));
+    }
+
+    // ---- resolve_for_boundary (koe-351 shared primitive) ---------------------
+
+    #[test]
+    fn resolve_for_boundary_resolves_existing_file_and_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let file = dir.path().join("note.txt");
+        fs::write(&file, b"x").unwrap();
+        assert_eq!(resolve_for_boundary(file.to_str().unwrap()), Some(base.join("note.txt")));
+        // A directory resolves too (policy may target a dir, e.g. delete_file).
+        assert_eq!(resolve_for_boundary(dir.path().to_str().unwrap()), Some(base));
+    }
+
+    #[test]
+    fn resolve_for_boundary_resolves_new_file_via_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let new = dir.path().join("fresh.txt"); // does not exist
+        assert_eq!(resolve_for_boundary(new.to_str().unwrap()), Some(base.join("fresh.txt")));
+    }
+
+    #[test]
+    fn resolve_for_boundary_rejects_unresolvable_and_empty() {
+        assert_eq!(resolve_for_boundary("/koe-nope-xyz/missing/file.txt"), None);
+        assert_eq!(resolve_for_boundary("   "), None);
+        assert_eq!(resolve_for_boundary(&"a".repeat(MAX_PATH_LENGTH + 1)), None);
+    }
+
+    #[test]
+    fn resolve_for_boundary_follows_existing_symlink_to_real_target() {
+        // An existing symlink resolves to its real (out-of-base) target, so the
+        // caller's within-allowed check then correctly sees it as outside.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let real = outside.path().join("real.txt");
+            fs::write(&real, b"x").unwrap();
+            let link = dir.path().join("link.txt");
+            symlink(&real, &link).unwrap();
+            assert_eq!(
+                resolve_for_boundary(link.to_str().unwrap()),
+                Some(real.canonicalize().unwrap())
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_for_boundary_rejects_dangling_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let missing = outside.path().join("will-create.txt");
+        let link = dir.path().join("dangling.txt");
+        symlink(&missing, &link).unwrap();
+        assert_eq!(resolve_for_boundary(link.to_str().unwrap()), None);
     }
 }
