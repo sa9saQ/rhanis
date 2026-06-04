@@ -103,17 +103,20 @@ pub(crate) struct ActiveSession {
 /// setup so two concurrent starts cannot both pass the `is_some()` check
 /// (double-start race). Field `.0` is `pub(crate)` (not `pub`) because
 /// `ActiveSession` is crate-private; field `.1` is the generation counter
-/// (koe-ego), read only inside this module.
+/// (koe-ego) — `start_session` mints from it and the read loop reads it to ask
+/// "has a newer start begun since mine?" at its terminal slot-clear. Read only
+/// inside this module.
 pub struct ManagedSession(
     pub(crate) Arc<TokioMutex<Option<ActiveSession>>>,
-    AtomicU64,
+    Arc<AtomicU64>,
 );
 
 impl ManagedSession {
     pub fn new() -> Self {
         // Generations start at 1 so 0 never collides with a live session (0 reads
-        // as "no session has started yet").
-        Self(Arc::new(TokioMutex::new(None)), AtomicU64::new(1))
+        // as "no session has started yet"). `Arc` so the read loop can hold the
+        // counter to check whether a newer start has begun since its own.
+        Self(Arc::new(TokioMutex::new(None)), Arc::new(AtomicU64::new(1)))
     }
 }
 
@@ -186,9 +189,13 @@ const MIC_POLL_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// - slot holds **our** `generation` → take it (clear) and emit the terminal
 ///   status (error-or-idle);
-/// - slot is **empty** → `stop_session` already took our handle (or we cleared it
-///   on a prior pass) and no newer session is present, so we still own the
-///   terminal transition: emit the status;
+/// - slot is **empty** → `stop_session` took our handle (or we cleared it on a
+///   prior pass). We own the terminal transition only if no newer start has begun
+///   since ours — checked via `latest_generation` (the counter has not advanced
+///   past us). A newer start — even one that FAILED before storing an
+///   `ActiveSession` — advanced the counter and owns its own transition, so we
+///   stay silent (else our `idle`/`error` could land over its `connecting`/`error`,
+///   e.g. wrongly clearing a failed reconnect to idle during a restart);
 /// - slot holds a **different** generation → a newer session replaced us during a
 ///   handover; leave its handle intact and emit **nothing** (that session owns its
 ///   own terminal transition). Clearing it would orphan a live WS (unstoppable →
@@ -209,6 +216,7 @@ const MIC_POLL_INTERVAL: Duration = Duration::from_millis(100);
 async fn finalize_session_slot<F>(
     session: &Arc<TokioMutex<Option<ActiveSession>>>,
     generation: u64,
+    latest_generation: &AtomicU64,
     terminal_error: Option<&str>,
     emit: &F,
 ) where
@@ -221,15 +229,17 @@ async fn finalize_session_slot<F>(
             true
         }
         // Slot empty: stop_session took our handle (or we cleared it on a prior
-        // pass). We treat this as still owning the terminal transition so a normal
-        // stop still emits its `idle`. Residual narrow race tracked as koe-kwa: if a
-        // newer session had started AND already finalized (cleared its own slot back
-        // to None) before this loop reaches finalize, this would also emit and could
-        // land an `idle` over that newer session's `error`. That needs this loop's
-        // task to starve for the newer session's entire connect+error lifecycle, so
-        // it does not occur on a non-saturated runtime; a "am I still the latest
-        // minted generation?" counter check would close it.
-        None => true,
+        // pass). We own the terminal transition only if NO newer start has begun
+        // since ours. `start_session` mints our generation then leaves the counter
+        // exactly one higher, so `latest == generation + 1` means we are still the
+        // latest start. Any newer start — including one that FAILED before storing
+        // an ActiveSession (connect/setup/audio error) — advanced the counter past
+        // us, so it owns the terminal transition and we stay silent; emitting here
+        // would land our `idle`/`error` over its `connecting`/`error` (koe-ego: a
+        // failed reconnect during a restart would otherwise be wrongly cleared to
+        // idle). The counter read is under this slot lock (same mutex the mint runs
+        // under), so it observes every prior mint.
+        None => latest_generation.load(Ordering::Relaxed) == generation + 1,
         Some(_) => false,
     };
     if owns_terminal {
@@ -287,6 +297,7 @@ async fn run_read_loop<S, F, A, SA>(
     emit: F,
     session: Arc<TokioMutex<Option<ActiveSession>>>,
     generation: u64,
+    latest_generation: Arc<AtomicU64>,
     audio_handler: A,
     mic_running: Arc<AtomicBool>,
     stop_audio: SA,
@@ -341,7 +352,7 @@ async fn run_read_loop<S, F, A, SA>(
         // Emit the terminal `error` under the slot lock (generation-guarded —
         // koe-ego), and only for our own slot: a stop->start handover must not
         // flash this dying loop's error over a newer, connected session.
-        finalize_session_slot(&session, generation, Some("mic device lost"), &emit).await;
+        finalize_session_slot(&session, generation, &latest_generation, Some("mic device lost"), &emit).await;
         return;
     }
 
@@ -463,7 +474,7 @@ async fn run_read_loop<S, F, A, SA>(
     // (a racing start_session's `connecting` can only follow this status), and
     // clearing here (not after the conversation-writer drain) means the slot
     // handover is never delayed by journalling.
-    finalize_session_slot(&session, generation, terminal_error, &emit).await;
+    finalize_session_slot(&session, generation, &latest_generation, terminal_error, &emit).await;
     // Close the journal channel and flush its tail before run_read_loop returns so
     // a record still in flight is persisted (the seam tests rely on this drain).
     // Unconditional: turns that already happened belong in the history even on an
@@ -737,6 +748,22 @@ pub async fn start_session(
     if guard.is_some() {
         return Err("session already active".to_string());
     }
+    // Mint this start attempt's generation (koe-ego) BEFORE the fallible setup
+    // (connect / session.update / audio), so even a start that FAILS before
+    // storing an ActiveSession still advances the counter. An exiting old loop
+    // reads this counter to detect that a newer start has begun and then stays
+    // silent at its terminal slot-clear (the `None` arm of finalize_session_slot);
+    // otherwise its `idle` could land over the newer start's `connecting`/`error`
+    // — e.g. a failed reconnect during a restart would be wrongly cleared to idle.
+    //
+    // `Relaxed` is sufficient: the mint runs while the slot mutex `guard` is held
+    // (from the is_some() check above) and the read loop reads BOTH the stored
+    // generation and this counter back through the same mutex, so the mutex
+    // supplies the happens-before. The atomic only hands out unique, monotonically
+    // increasing ids, which a single atomic's modification order guarantees even
+    // under Relaxed.
+    let generation = session.1.fetch_add(1, Ordering::Relaxed);
+    let latest_generation = Arc::clone(&session.1);
 
     let app_settings = settings.0.load().map_err(|_| "settings unavailable".to_string())?;
     if !app_settings.onboarding_completed {
@@ -902,22 +929,10 @@ pub async fn start_session(
     // On normal server-close exits the writer is left to drain gracefully.
     let writer_abort_handle = write_handle.abort_handle();
 
-    // Mint this session's generation (koe-ego). The read loop clears the slot /
-    // emits the terminal idle ONLY while *this* generation still occupies the
-    // slot, so a stop_session->start_session handover cannot have an old loop's
-    // teardown clear the new session's handle (which would orphan a live WS —
-    // unstoppable → BYOK double-charge — and flash the UI to idle).
-    //
-    // `Relaxed` is sufficient: every mint and every comparison happens under the
-    // slot mutex — this whole setup runs while `guard` is held (since the
-    // is_some() check), and the read loop reads the generation back through the
-    // same mutex — so the mutex supplies the happens-before. The atomic only has
-    // to hand out unique, monotonically increasing ids, which a single atomic's
-    // total modification order guarantees even under Relaxed.
-    let generation = session.1.fetch_add(1, Ordering::Relaxed);
-
     // Detached: the loop clears the session slot + emits idle on its own exit;
     // stop_session signals it via shutdown_tx rather than holding its handle.
+    // `generation` was minted above (right after the is_some check) and
+    // `latest_generation` is the shared counter the loop checks at finalize.
     tokio::spawn(run_read_loop(
         stream,
         provider,
@@ -929,6 +944,7 @@ pub async fn start_session(
         emit,
         session_for_loop,
         generation,
+        latest_generation,
         audio_handler,
         mic_running,
         stop_audio,
@@ -981,11 +997,19 @@ mod tests {
     use crate::storage::adapter::{ConversationEvent, Note, RecorderError};
 
     /// Generation passed to `run_read_loop` in tests whose `session` slot starts
-    /// empty (`None`): the value is immaterial in these tests because the slot
-    /// starts empty, so the clear takes the `None` branch. Tests that exercise the
+    /// empty (`None`): paired with [`test_counter`] so the `None` arm sees "I am
+    /// still the latest start" and emits as before. Tests that exercise the
     /// generation guard pass explicit `GEN_*` values instead (see the koe-ego
     /// handover tests).
     const TEST_GENERATION: u64 = 1;
+
+    /// The `latest_generation` counter for a loop running [`TEST_GENERATION`] with
+    /// no newer start: `TEST_GENERATION + 1` is exactly the value `start_session`
+    /// leaves after minting `TEST_GENERATION`, so the `None` arm treats this loop
+    /// as the latest start and still emits its terminal status.
+    fn test_counter() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(TEST_GENERATION + 1))
+    }
 
     /// Builds an `ActiveSession` standing in for a session that occupies the slot,
     /// with `generation` set. The `shutdown_tx` / `write_handle` are inert (a
@@ -1168,6 +1192,7 @@ mod tests {
             emit,
             Arc::clone(&slot),
             GEN_A,
+            Arc::new(AtomicU64::new(GEN_B + 1)), // a newer start (B) exists
             |_event: &serde_json::Value| {},
             Arc::new(AtomicBool::new(true)),
             |_graceful: bool| {},
@@ -1230,6 +1255,7 @@ mod tests {
             emit,
             Arc::clone(&slot),
             GEN_A,
+            Arc::new(AtomicU64::new(GEN_B + 1)), // a newer start (B) exists
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1280,6 +1306,7 @@ mod tests {
             emit,
             Arc::clone(&slot),
             GEN_A,
+            Arc::new(AtomicU64::new(GEN_B + 1)), // a newer start (B) exists
             |_| {},
             Arc::new(AtomicBool::new(false)), // mic NOT running → pre-loop early return
             |_| {},
@@ -1333,6 +1360,7 @@ mod tests {
             emit,
             Arc::clone(&slot),
             GEN_A,
+            Arc::new(AtomicU64::new(GEN_B + 1)), // a newer start (B) exists
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1380,6 +1408,7 @@ mod tests {
             emit,
             Arc::clone(&slot),
             GEN,
+            Arc::new(AtomicU64::new(GEN + 1)), // this loop is the latest start
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1395,6 +1424,55 @@ mod tests {
         assert!(
             emitted.iter().any(|(s, _)| s == "idle"),
             "clean exit must emit the terminal idle: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn none_arm_stays_silent_when_a_newer_start_has_begun() {
+        // koe-ego None-arm case (Codex MCP + Codex Cloud R-C): after stop_session
+        // takes our handle (slot None), a NEWER start_session can begin and even
+        // FAIL before storing an ActiveSession (connect/setup/audio error) — the
+        // slot stays None but the generation counter has advanced past us. The old
+        // loop's terminal slot-clear must then stay silent, so its `idle` cannot
+        // land over the newer (failed) start's `error` (else a failed reconnect
+        // during a restart would be wrongly cleared to idle).
+        const GEN_A: u64 = 1;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> = Arc::new(TokioMutex::new(None));
+        // Counter past GEN_A + 1: a newer start (generation GEN_A + 1) has begun,
+        // even though it left nothing in the slot (it failed before storing).
+        let counter = Arc::new(AtomicU64::new(GEN_A + 2));
+
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (log, emit) = collect_emit();
+
+        run_read_loop(
+            frame_stream(vec![]), // clean server-close exit (terminal_error = None → would-be idle)
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN_A,
+            Arc::clone(&counter),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+        )
+        .await;
+
+        let emitted: Vec<_> = log.lock().unwrap().clone();
+        assert!(
+            !emitted.iter().any(|(s, _)| s == "idle"),
+            "None-arm must stay silent when a newer start has begun: {emitted:?}"
         );
     }
 
@@ -1426,6 +1504,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1502,6 +1581,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1581,6 +1661,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1632,6 +1713,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1669,6 +1751,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1789,6 +1872,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1851,6 +1935,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1902,6 +1987,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1942,6 +2028,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1988,6 +2075,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -2025,6 +2113,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -2070,6 +2159,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -2132,6 +2222,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             audio_handler,
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -2176,6 +2267,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             mic_running,
             move |_| { sac.store(true, Ordering::SeqCst); },
@@ -2223,6 +2315,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             move |_| { sc.store(true, Ordering::SeqCst); },
@@ -2274,6 +2367,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -2320,6 +2414,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -2384,6 +2479,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(false)), // mic already lost → abnormal exit
             move |_| { sc.store(true, Ordering::SeqCst); },
@@ -2468,6 +2564,7 @@ mod tests {
             emit,
             Arc::new(TokioMutex::new(None)),
             TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
