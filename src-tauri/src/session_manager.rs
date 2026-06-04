@@ -219,6 +219,9 @@ async fn run_read_loop<S, F, A, SA>(
     // once per dropped frame — a sustained flood must not turn the fail-soft drop
     // into a stderr-backpressure DoS (koe-wj2 R-C / Codex).
     let mut cap_warned = false;
+    // Same latch discipline for journal-channel drops (koe-emd / CR): surface a
+    // dropped conversation record once per episode without a per-drop flood.
+    let mut journal_drop_warned = false;
     let deadline = tokio::time::sleep(SESSION_TIMEOUT);
     tokio::pin!(deadline);
     // Interval-based poll for cpal device loss (error_callback sets running=false).
@@ -304,7 +307,7 @@ async fn run_read_loop<S, F, A, SA>(
                         match handle_text(
                             &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
                             &dispatcher, &emit, &mut dispatch_tasks, &mut save_failures,
-                            &mut cap_warned,
+                            &mut cap_warned, &mut journal_drop_warned,
                         ).await {
                             LoopAction::Continue => {}
                             // handle_text already emitted the terminal error
@@ -425,6 +428,38 @@ fn spawn_conversation_writer(
     })
 }
 
+/// Enqueues a conversation record on the journal channel — non-blocking and
+/// fail-soft, but NOT silent. `try_send` adds no `await` to the caller (so the
+/// koe-wj2 function-call hot path is unchanged) and never blocks the read loop.
+///
+/// A drop is logged ONCE per episode (latched via `drop_warned`, re-armed on the
+/// next successful send) so a sustained flood cannot turn the drop into a
+/// stderr-backpressure DoS — while still surfacing the audit gap koe-emd exists
+/// to close (a silently-dropped record is exactly the "log is empty" failure we
+/// are fixing). `Closed` (writer task gone — an anomaly, the writer outlives the
+/// loop) is reported distinctly from `Full` (backlog saturated under flood).
+fn enqueue_record(
+    rec_tx: &mpsc::Sender<ConversationRecord>,
+    record: ConversationRecord,
+    drop_warned: &mut bool,
+) {
+    match rec_tx.try_send(record) {
+        Ok(()) => *drop_warned = false,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            if !*drop_warned {
+                eprintln!("[session] conversation journal backlog full, dropping records (writer slow)");
+                *drop_warned = true;
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            if !*drop_warned {
+                eprintln!("[session] conversation journal channel closed, dropping records");
+                *drop_warned = true;
+            }
+        }
+    }
+}
+
 /// Handles one decoded server frame via the provider's normalizer. Returns
 /// whether to keep looping.
 #[allow(clippy::too_many_arguments)]
@@ -440,6 +475,7 @@ async fn handle_text<F>(
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
     save_failures: &mut u32,
     cap_warned: &mut bool,
+    journal_drop_warned: &mut bool,
 ) -> LoopAction
 where
     F: Fn(&str, Option<&str>),
@@ -472,24 +508,31 @@ where
             // episode logs once more.
             *cap_warned = false;
 
-            // Journal the tool invocation (koe-emd). The tool NAME is a fixed,
-            // safe identifier — no arguments / result, so no PII / secret reaches
-            // the log; the result-content path stays owned by the dispatcher's
-            // own redaction. `try_send` is synchronous (no `await` in this hot
-            // path, so the koe-wj2 cap dynamics are unchanged) and FIFO-ordered
-            // with the surrounding transcripts; a full backlog drops the record
-            // (fail-soft) rather than blocking the loop. The name is bounded by
-            // MAX_TOOL_NAME_LEN — the same cap the dispatcher applies — so a
-            // hostile model cannot drive an oversized string into a persisted
-            // row; an over-long name is left unjournalled because the dispatcher
-            // will reject it ("tool name too long") and it never advances the
-            // conversation.
+            // Journal the tool INVOCATION (koe-emd) — i.e. "the model requested
+            // tool X", recorded when the function_call arrives, NOT a confirmed
+            // execution outcome. A later approval-deny / policy-block / dispatch
+            // error is not yet reflected here; an outcome/phase column on
+            // ConversationEvent (a schema migration) is tracked as a follow-up so
+            // the audit log can distinguish requested vs executed (see PR notes).
+            // The tool NAME is a fixed, safe identifier — no arguments / result,
+            // so no PII / secret reaches the log; the result-content path stays
+            // owned by the dispatcher's own redaction. Recorded synchronously here
+            // (not in the spawned dispatch task) so it keeps frame order with the
+            // surrounding transcripts. The name is bounded by MAX_TOOL_NAME_LEN —
+            // the same cap the dispatcher applies — so a hostile model cannot
+            // drive an oversized string into a persisted row; an over-long name is
+            // left unjournalled because the dispatcher will reject it ("tool name
+            // too long") and it never advances the conversation.
             if pending.name.len() <= MAX_TOOL_NAME_LEN {
-                let _ = rec_tx.try_send(ConversationRecord {
-                    role: "tool",
-                    kind: "tool",
-                    summary: pending.name.clone(),
-                });
+                enqueue_record(
+                    rec_tx,
+                    ConversationRecord {
+                        role: "tool",
+                        kind: "tool",
+                        summary: pending.name.clone(),
+                    },
+                    journal_drop_warned,
+                );
             }
 
             // Only now that the cap has admitted the call do we parse the
@@ -544,14 +587,19 @@ where
         }
         ProviderEvent::Transcript { role, text } => {
             // Journal a user / assistant speech turn (koe-emd). kind="speech"
-            // matches the existing sqlite tests. `try_send` is non-blocking and
-            // FIFO-ordered; a full backlog drops the turn (fail-soft) so a
-            // journal write can never stall or stop the conversation.
-            let _ = rec_tx.try_send(ConversationRecord {
-                role: role.as_role_str(),
-                kind: "speech",
-                summary: text,
-            });
+            // matches the existing sqlite tests. Non-blocking + FIFO-ordered; a
+            // full backlog drops the turn (fail-soft) so a journal write can never
+            // stall or stop the conversation, but the drop is surfaced (latched)
+            // rather than silent — see enqueue_record.
+            enqueue_record(
+                rec_tx,
+                ConversationRecord {
+                    role: role.as_role_str(),
+                    kind: "speech",
+                    summary: text,
+                },
+                journal_drop_warned,
+            );
             LoopAction::Continue
         }
         // PR1: OpenAI's parse_frame never emits AudioDelta (the audio_handler seam
