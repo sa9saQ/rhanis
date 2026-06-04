@@ -115,15 +115,24 @@ pub trait RecorderAdapter: Send + Sync {
     /// command that exposes them.
     fn list_recent_events(&self, limit: u32) -> Result<Vec<ConversationEvent>, RecorderError>;
 
-    /// Upserts the running cost total (nanodollars) for a month (`YYYYMM`), so
-    /// the monthly budget survives a restart. The `cost_tracker` domain layer
-    /// guarantees `month_yyyymm` validity; the store persists it verbatim.
-    /// Consumed by session_manager (koe-e3m).
+    /// Upserts the running cost total (nanodollars) for a month (`YYYYMM`) and
+    /// returns the **persisted** total after a MONOTONIC merge — the stored total
+    /// never decreases for a given month (koe-ixt). Within a month the
+    /// `cost_tracker` only ever grows the total (`saturating_add`; a rollover uses
+    /// a new `month_yyyymm` key), so a write with a *lower* total can only be a
+    /// stale / out-of-order writer — e.g. a stop→start handover where an older
+    /// session's late `response.done` save lands after a newer session already
+    /// wrote a higher total. Keeping the max prevents that rollback (undercount),
+    /// and returning the merged total lets session_manager (koe-e3m) gate the
+    /// monthly budget on the authoritative **cross-session** value rather than a
+    /// single session's stale local baseline (so a handover cannot run a newer
+    /// session fail-open). The `cost_tracker` domain layer guarantees
+    /// `month_yyyymm` validity; the store persists it verbatim.
     fn save_cost_snapshot(
         &self,
         month_yyyymm: u32,
         total_nanodollars: u64,
-    ) -> Result<(), RecorderError>;
+    ) -> Result<u64, RecorderError>;
 
     /// Loads the persisted cost total for a month, or `None` if absent. (koe-e3m)
     fn load_cost_snapshot(&self, month_yyyymm: u32) -> Result<Option<u64>, RecorderError>;

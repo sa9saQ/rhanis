@@ -110,7 +110,7 @@ mod tests {
         fn list_recent_events(&self, _limit: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
             unimplemented!("write_note never lists")
         }
-        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<(), RecorderError> {
+        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<u64, RecorderError> {
             unimplemented!("write_note never touches cost")
         }
         fn load_cost_snapshot(&self, _m: u32) -> Result<Option<u64>, RecorderError> {

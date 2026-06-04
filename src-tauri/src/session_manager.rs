@@ -673,19 +673,51 @@ async fn handle_text(
             LoopAction::Continue
         }
         ProviderEvent::Usage(usage) => {
-            // Add usage and read the result, then DROP the guard before any
-            // .await (never hold the lock across an await — deadlock risk).
-            let month = current_yyyymm();
-            let (total, over) = {
+            // Add usage to the SESSION-LOCAL tracker (handles month rollover +
+            // saturating add) and capture its running total, the EFFECTIVE
+            // accounting month, and the budget config, then DROP the guard before
+            // any .await (never hold the lock across an await — deadlock risk).
+            //
+            // We persist + gate on `c.current_month` (the month the usage was
+            // actually counted into), NOT the raw observed clock month: `add_usage`
+            // advances `current_month` only on a FORWARD month and otherwise keeps
+            // it (a backward clock skew / NTP step does not rewind it). Keying the
+            // snapshot and the readback on the tracker's effective month keeps them
+            // consistent with where the spend was counted — otherwise a backward
+            // clock across a month boundary would save/gate a DIFFERENT month and
+            // miss an already-over-cap current month (fail-open).
+            let observed_month = current_yyyymm();
+            let (effective_month, local_total, budget) = {
                 let mut c = cost.lock().await;
-                c.add_usage(&usage, month);
-                (c.month_total_nanodollars, c.is_over_budget())
+                let total = c.add_usage(&usage, observed_month);
+                (c.current_month, total, c.config)
             };
-            // Persist the running total (sync recorder → spawn_blocking).
+            // Persist monotonically and read back the AUTHORITATIVE persisted total
+            // (koe-ixt). The cost-snapshot row is shared across sessions, so during
+            // a stop->start handover where an OLDER session's read loop is still
+            // draining a late `response.done`, its save raises the persisted total
+            // and this readback reflects that spend too. Gating on the readback
+            // (>= local_total) means a NEWER session cannot keep charging fail-open
+            // on a stale local baseline after a sibling pushed the month over the
+            // cap (mechanism 4). The monotonic merge guarantees the readback never
+            // rolls backwards (mechanism 5), so it is a true lower bound on spend.
+            //
+            // Residual (bounded, accepted): two sessions overlapping only during a
+            // handover teardown contribute their late-frame spend as max(), not sum,
+            // so the persisted total can lag true spend by at most the older loop's
+            // few drained frames. Exact accounting across genuinely-concurrent
+            // sessions is the M2 atomic-reservation work already noted in
+            // cost_tracker.rs (M1 runs one session at a time via the slot guard).
             let rec = Arc::clone(recorder);
-            let saved = tokio::task::spawn_blocking(move || rec.save_cost_snapshot(month, total)).await;
-            match saved {
-                Ok(Ok(())) => *save_failures = 0,
+            let saved = tokio::task::spawn_blocking(move || {
+                rec.save_cost_snapshot(effective_month, local_total)
+            })
+            .await;
+            let authoritative_total = match saved {
+                Ok(Ok(persisted)) => {
+                    *save_failures = 0;
+                    persisted
+                }
                 _ => {
                     *save_failures += 1;
                     if *save_failures >= MAX_SNAPSHOT_SAVE_FAILURES {
@@ -695,12 +727,33 @@ async fn handle_text(
                         // the slot lock (koe-ego), not here.
                         return LoopAction::Stop("cost tracking unavailable");
                     }
+                    // The WRITE failed, but the persisted total is usually still
+                    // READABLE (e.g. write-lock contention / disk-full hit the
+                    // INSERT, not a SELECT). Read it back and gate on
+                    // max(persisted, local) so a handover sibling's over-cap spend
+                    // still stops THIS session across a transient write failure,
+                    // instead of charging fail-open on the stale local baseline for
+                    // up to MAX_SNAPSHOT_SAVE_FAILURES-1 more frames. If the read
+                    // ALSO fails (DB fully down) we degrade to the local total; the
+                    // failure counter above stays the durability backstop.
+                    let rec_read = Arc::clone(recorder);
+                    let loaded = tokio::task::spawn_blocking(move || {
+                        rec_read.load_cost_snapshot(effective_month)
+                    })
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten()
+                    .unwrap_or(0);
+                    loaded.max(local_total)
                 }
-            }
-            if over {
-                // Terminal error emitted by finalize_session_slot under the slot
-                // lock (koe-ego), not here, so a handover can't flash it over a
-                // newer session.
+            };
+            // Fail-closed against the AUTHORITATIVE (cross-session) total, not just
+            // this session's local total, so a handover sibling's spend stops THIS
+            // session too. Terminal error emitted by finalize_session_slot under the
+            // slot lock (koe-ego), not here, so a handover can't flash it over a
+            // newer session.
+            if budget.is_over(authoritative_total) {
                 return LoopAction::Stop("monthly budget exceeded"); // fail-closed
             }
             LoopAction::Continue
@@ -1072,8 +1125,10 @@ mod tests {
         fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
             unimplemented!()
         }
-        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<(), RecorderError> {
-            Ok(())
+        fn save_cost_snapshot(&self, _m: u32, n: u64) -> Result<u64, RecorderError> {
+            // No prior state → merged total == the written total (echo). Mirrors
+            // the real adapter's monotonic-merge return for a single-session test.
+            Ok(n)
         }
         fn load_cost_snapshot(&self, _m: u32) -> Result<Option<u64>, RecorderError> {
             Ok(None)
@@ -1118,8 +1173,8 @@ mod tests {
         fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
             unimplemented!()
         }
-        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<(), RecorderError> {
-            Ok(())
+        fn save_cost_snapshot(&self, _m: u32, n: u64) -> Result<u64, RecorderError> {
+            Ok(n)
         }
         fn load_cost_snapshot(&self, _m: u32) -> Result<Option<u64>, RecorderError> {
             Ok(None)
@@ -1732,6 +1787,239 @@ mod tests {
         assert!(disp.calls.lock().unwrap().is_empty(), "no dispatch after budget stop");
     }
 
+    // ---- koe-ixt: cost-snapshot stop->start handover (fail-open guard) --------
+
+    /// Recorder double modeling the SHARED cost-snapshot store exactly as the real
+    /// `SqliteAdapter` does after koe-ixt: a MONOTONIC-max merge that returns the
+    /// merged persisted total. The `persisted` map is `Arc`-shared so two
+    /// simulated session loops (an older one draining late usage, a newer one just
+    /// started) observe each other's saves through ONE store — the cross-session
+    /// coupling the fix relies on (in production a single `ManagedRecorder` Arc is
+    /// shared across sessions). Only the cost-snapshot methods are real.
+    struct SharedSnapshotRecorder {
+        persisted: Arc<StdMutex<std::collections::HashMap<u32, u64>>>,
+    }
+    impl SharedSnapshotRecorder {
+        fn new() -> (Self, Arc<StdMutex<std::collections::HashMap<u32, u64>>>) {
+            let persisted = Arc::new(StdMutex::new(std::collections::HashMap::new()));
+            (
+                Self {
+                    persisted: Arc::clone(&persisted),
+                },
+                persisted,
+            )
+        }
+    }
+    impl RecorderAdapter for SharedSnapshotRecorder {
+        fn save_note(&self, _t: &str) -> Result<i64, RecorderError> {
+            unimplemented!()
+        }
+        fn list_recent_notes(&self, _l: u32) -> Result<Vec<Note>, RecorderError> {
+            unimplemented!()
+        }
+        fn log_conversation_event(&self, _r: &str, _k: &str, _s: &str) -> Result<i64, RecorderError> {
+            unimplemented!()
+        }
+        fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
+            unimplemented!()
+        }
+        fn save_cost_snapshot(&self, m: u32, n: u64) -> Result<u64, RecorderError> {
+            // Monotonic-max merge (mirrors the real adapter): the stored total
+            // never decreases, so a lower / out-of-order write returns the kept max.
+            let mut map = self.persisted.lock().unwrap();
+            let merged = map.get(&m).copied().unwrap_or(0).max(n);
+            map.insert(m, merged);
+            Ok(merged)
+        }
+        fn load_cost_snapshot(&self, m: u32) -> Result<Option<u64>, RecorderError> {
+            Ok(self.persisted.lock().unwrap().get(&m).copied())
+        }
+        fn health_check(&self) -> Result<(), RecorderError> {
+            Ok(())
+        }
+    }
+
+    /// Drives one `response.done` usage frame through `handle_text` with the given
+    /// tracker + recorder and returns the resulting `LoopAction`. Centralizes the
+    /// 11-arg call so the handover test reads as a sequence of usage events.
+    async fn drive_usage(
+        usage: &Value,
+        provider: &Arc<dyn RealtimeProvider>,
+        recorder: &Arc<dyn RecorderAdapter>,
+        cost: &Arc<TokioMutex<CostTracker>>,
+    ) -> LoopAction {
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
+        let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
+        let mut dispatch_tasks = tokio::task::JoinSet::new();
+        let (mut save_failures, mut cap_warned, mut journal_drop_warned) = (0u32, false, false);
+        handle_text(
+            usage,
+            provider,
+            &write_tx,
+            cost,
+            recorder,
+            &rec_tx,
+            &dispatcher,
+            &mut dispatch_tasks,
+            &mut save_failures,
+            &mut cap_warned,
+            &mut journal_drop_warned,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn handover_late_usage_stops_newer_session_via_global_total() {
+        // koe-ixt mechanism 4 (fail-open). The stop->start cost handover, modeled
+        // with an explicit, deterministic save/usage ORDERING (no timing):
+        //   1. Sessions A and B both loaded the SAME $10 baseline (B started a
+        //      moment after A, before A's late save landed).
+        //   2. A's read loop is still draining one late `response.done` that pushes
+        //      the MONTH from $10 to $40 — over the $32 cap. A saves $40 to the
+        //      shared store and stops itself fail-closed.
+        //   3. B then receives a SMALL usage (+$1). B's LOCAL tracker is only $11
+        //      (< $32), but the shared persisted total is $40 (>= $32).
+        // B must stop fail-closed by gating on the authoritative cross-session
+        // total, NOT its stale local baseline. Before the fix (gate on local) B
+        // keeps charging fail-open — exactly the bug this issue closes.
+        let month = current_yyyymm();
+        let limit = 32 * NANODOLLARS_PER_USD; // $32 monthly cap
+        let baseline = 10 * NANODOLLARS_PER_USD; // both sessions loaded $10
+
+        // ONE shared store, as in production (a single ManagedRecorder Arc).
+        let (rec, persisted) = SharedSnapshotRecorder::new();
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(rec);
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: limit,
+        };
+
+        // --- (2) Session A's late usage: +$30 audio input (937_500 * 32_000 nano). ---
+        let cost_a = Arc::new(TokioMutex::new({
+            let mut t = CostTracker::new(budget, month);
+            t.month_total_nanodollars = baseline;
+            t
+        }));
+        let a_late = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 937_500u64 } } }
+        });
+        let a_result = drive_usage(&a_late, &provider, &recorder, &cost_a).await;
+        // A is over its OWN local cap ($40 >= $32) too, so it stops fail-closed.
+        assert!(
+            matches!(a_result, LoopAction::Stop("monthly budget exceeded")),
+            "A's own loop must stop once its late usage exceeds the cap"
+        );
+        // A's save raised the SHARED persisted monthly total to $40 (over the cap).
+        assert_eq!(
+            *persisted.lock().unwrap().get(&month).unwrap(),
+            40 * NANODOLLARS_PER_USD,
+            "A's late save must raise the shared persisted monthly total over the cap"
+        );
+
+        // --- (3) Session B's small usage: +$1 audio input (31_250 * 32_000 nano). ---
+        let cost_b = Arc::new(TokioMutex::new({
+            let mut t = CostTracker::new(budget, month);
+            t.month_total_nanodollars = baseline; // B loaded the SAME stale $10 baseline
+            t
+        }));
+        let b_small = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 31_250u64 } } }
+        });
+        let b_result = drive_usage(&b_small, &provider, &recorder, &cost_b).await;
+
+        // THE FIX: B fails closed on the global persisted total ($40 >= $32) even
+        // though its own local total is only $11. Pre-fix (local-only gate) this
+        // was LoopAction::Continue — the newer session billing fail-open.
+        assert!(
+            matches!(b_result, LoopAction::Stop("monthly budget exceeded")),
+            "newer session B must fail-closed on the global persisted total, not its stale local baseline (koe-ixt mechanism 4)"
+        );
+        // Proof the stop came from the GLOBAL total, not B's local one: B's local
+        // tracker alone is still under the cap.
+        assert!(
+            !cost_b.lock().await.is_over_budget(),
+            "B's local total ($11) must be under the cap — the stop must come from the shared global total"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_failure_with_over_cap_local_stops_fail_closed() {
+        // koe-ixt (R-B finding): a NEW fail-closed branch. When the snapshot SAVE
+        // fails transiently (below the MAX_SNAPSHOT_SAVE_FAILURES terminal
+        // threshold) but the session's LOCAL spend is already over the cap, the
+        // loop must STILL stop on "monthly budget exceeded" via the fallback gate —
+        // NOT keep charging until the failure counter trips. FailingRecorder fails
+        // the save AND returns None for the readback, so the fallback degrades to
+        // the local total, which is over the (tiny) cap → fail-closed on the first
+        // frame (distinct from the "cost tracking unavailable" terminal path, which
+        // needs MAX_SNAPSHOT_SAVE_FAILURES consecutive failures).
+        let month = current_yyyymm();
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig {
+                enabled: true,
+                monthly_limit_nanodollars: NANODOLLARS_PER_USD / 1_000_000, // tiny cap
+            },
+            month,
+        )));
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(FailingRecorder);
+        let usage = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 1_000_000u64 } } }
+        });
+        let result = drive_usage(&usage, &provider, &recorder, &cost).await;
+        assert!(
+            matches!(result, LoopAction::Stop("monthly budget exceeded")),
+            "an over-cap LOCAL spend must stop fail-closed on the first transient save failure, not charge on"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_is_persisted_under_the_tracker_effective_month_not_the_clock() {
+        // koe-ixt backward-clock guard: the snapshot is keyed on the tracker's
+        // EFFECTIVE accounting month (c.current_month), NOT the raw observed clock
+        // month. `add_usage` only advances current_month FORWARD, so a tracker
+        // already at a LATER month than the clock (modeling a backward clock skew /
+        // NTP step across a month boundary) keeps its month, and the usage must
+        // persist under THAT month — otherwise the save/gate would target the wrong
+        // month row and miss an already-over-cap current month (fail-open).
+        let future_month = 209912; // strictly ahead of any real current_yyyymm()
+        assert!(
+            future_month > current_yyyymm(),
+            "test premise: the tracker's month must be ahead of the wall clock"
+        );
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig {
+                enabled: false,
+                monthly_limit_nanodollars: 0,
+            },
+            future_month,
+        )));
+        let (rec, persisted) = SharedSnapshotRecorder::new();
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(rec);
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        let usage = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 100u64 } } }
+        });
+        let _ = drive_usage(&usage, &provider, &recorder, &cost).await;
+
+        let map = persisted.lock().unwrap();
+        assert!(
+            map.contains_key(&future_month),
+            "usage must persist under the tracker's effective month ({future_month}), got keys {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !map.contains_key(&current_yyyymm()),
+            "usage must NOT persist under the raw observed clock month"
+        );
+    }
+
     #[tokio::test]
     async fn shutdown_signal_breaks_loop() {
         let cost = Arc::new(TokioMutex::new(CostTracker::new(
@@ -1782,7 +2070,7 @@ mod tests {
         fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
             unimplemented!()
         }
-        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<(), RecorderError> {
+        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<u64, RecorderError> {
             Err(RecorderError::Db)
         }
         fn load_cost_snapshot(&self, _m: u32) -> Result<Option<u64>, RecorderError> {
@@ -1826,8 +2114,8 @@ mod tests {
         fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
             unimplemented!()
         }
-        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<(), RecorderError> {
-            Ok(())
+        fn save_cost_snapshot(&self, _m: u32, n: u64) -> Result<u64, RecorderError> {
+            Ok(n)
         }
         fn load_cost_snapshot(&self, _m: u32) -> Result<Option<u64>, RecorderError> {
             Ok(None)

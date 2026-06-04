@@ -169,19 +169,48 @@ impl RecorderAdapter for SqliteAdapter {
         &self,
         month_yyyymm: u32,
         total_nanodollars: u64,
-    ) -> Result<(), RecorderError> {
+    ) -> Result<u64, RecorderError> {
         let conn = self.lock()?;
-        // SQLite INTEGER is i64. Store the u64 via a *bit* reinterpretation
-        // (`as i64`) and read it back with `as u64` (see load_cost_snapshot):
-        // this round-trips all 64 bits exactly, so a saturated u64::MAX budget
-        // total survives a restart unchanged instead of clamping at i64::MAX.
+        // Monotonic merge (koe-ixt mechanism 5): the persisted monthly total must
+        // never DECREASE for a given month. The in-memory CostTracker only ever
+        // grows the total within a month (saturating_add; a rollover uses a
+        // different month_yyyymm key), so a write with a LOWER total can only be a
+        // stale / out-of-order writer — e.g. a stop->start handover where an older
+        // session's late `response.done` save lands after a newer session already
+        // wrote a higher total. Letting it win would roll the budget total
+        // backwards (undercount -> fail-open on the cap). We keep the MAX and
+        // return the merged total so the caller gates on the authoritative
+        // cross-session value.
+        //
+        // The max is computed in Rust, NOT via SQL `MAX()`: SQLite INTEGER is i64,
+        // and the u64 total is stored by *bit* reinterpretation (`as i64`) and read
+        // back with `as u64`, which round-trips all 64 bits exactly (so a saturated
+        // u64::MAX total survives a restart instead of clamping at i64::MAX). A
+        // saturated u64::MAX therefore persists as i64 -1, and SQL's *signed*
+        // `MAX()` would wrongly treat it as the smallest — Rust's u64 `.max()`
+        // compares the true magnitudes. The whole read-modify-write runs while THIS
+        // adapter's single connection Mutex is held (every RecorderAdapter call
+        // takes it), so two session loops' saves serialize and cannot interleave —
+        // the merge is atomic without a separate SQL transaction. INTEGER `MAX()`
+        // also cannot overflow (unlike a `+` additive merge, which SQLite silently
+        // promotes to REAL on i64 overflow — breaking the integer-only, NaN/Inf-free
+        // budget invariant).
+        let current: Option<i64> = conn
+            .query_row(
+                "SELECT total_nanodollars FROM cost_snapshots WHERE month_yyyymm = ?1",
+                params![month_yyyymm],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|_| RecorderError::Db)?;
+        let merged = current.map(|n| n as u64).unwrap_or(0).max(total_nanodollars);
         conn.execute(
             "INSERT INTO cost_snapshots (month_yyyymm, total_nanodollars) VALUES (?1, ?2)
              ON CONFLICT(month_yyyymm) DO UPDATE SET total_nanodollars = excluded.total_nanodollars",
-            params![month_yyyymm, total_nanodollars as i64],
+            params![month_yyyymm, merged as i64],
         )
         .map_err(|_| RecorderError::Db)?;
-        Ok(())
+        Ok(merged)
     }
 
     fn load_cost_snapshot(&self, month_yyyymm: u32) -> Result<Option<u64>, RecorderError> {
@@ -353,11 +382,56 @@ mod tests {
     }
 
     #[test]
-    fn cost_snapshot_upsert_overwrites() {
+    fn cost_snapshot_higher_write_advances_and_returns_total() {
+        // A higher (forward) write advances the persisted total and save returns
+        // the merged (== written, since it is the new max) total.
         let a = mem();
-        a.save_cost_snapshot(202605, 1_000).unwrap();
-        a.save_cost_snapshot(202605, 2_500).unwrap();
+        assert_eq!(a.save_cost_snapshot(202605, 1_000).unwrap(), 1_000);
+        assert_eq!(a.save_cost_snapshot(202605, 2_500).unwrap(), 2_500);
         assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(2_500));
+    }
+
+    #[test]
+    fn cost_snapshot_save_is_monotonic_and_returns_merged() {
+        // koe-ixt mechanism 5 (undercount / rollback). A stop->start handover can
+        // make an older session's late save (a LOWER, stale total) land AFTER a
+        // newer session already wrote a HIGHER total. The persisted monthly total
+        // must never roll backwards, and save must return the merged (post-max)
+        // persisted total so the caller can fail-closed on the authoritative
+        // cross-session value.
+        let a = mem();
+        assert_eq!(a.save_cost_snapshot(202605, 2_500).unwrap(), 2_500);
+        // A lower (stale / out-of-order) write must NOT overwrite the higher total
+        // and must return the kept (higher) total.
+        assert_eq!(
+            a.save_cost_snapshot(202605, 1_000).unwrap(),
+            2_500,
+            "a lower late write must return the kept higher total, not roll back"
+        );
+        assert_eq!(
+            a.load_cost_snapshot(202605).unwrap(),
+            Some(2_500),
+            "persisted monthly total must never decrease (undercount/rollback guard)"
+        );
+        // An equal-or-higher write still advances normally.
+        assert_eq!(a.save_cost_snapshot(202605, 4_000).unwrap(), 4_000);
+        assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(4_000));
+    }
+
+    #[test]
+    fn cost_snapshot_saturated_max_is_not_rolled_back_by_lower_write() {
+        // u64::MAX persists as i64 -1 (bit reinterpretation). The monotonic merge
+        // must compare TRUE u64 magnitudes (Rust `.max()`), NOT signed SQL `MAX()`,
+        // which would treat -1 as the smallest and wrongly let a lower write win —
+        // silently un-saturating a maxed-out budget total (fail-open on the cap).
+        let a = mem();
+        assert_eq!(a.save_cost_snapshot(202605, u64::MAX).unwrap(), u64::MAX);
+        assert_eq!(
+            a.save_cost_snapshot(202605, 1_000).unwrap(),
+            u64::MAX,
+            "a lower write must not roll a saturated u64::MAX total back"
+        );
+        assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(u64::MAX));
     }
 
     #[test]
