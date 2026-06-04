@@ -315,6 +315,13 @@ async fn run_read_loop<S, F, A, SA>(
     // (rather than letting them complete and spend more).
     let mut dispatch_tasks = tokio::task::JoinSet::new();
     let mut save_failures: u32 = 0;
+    // Cost (nanodollars) that has been counted into the budget gate but not yet
+    // durably written to the shared ledger because an `add_month_cost` failed
+    // transiently. Carried across frames so the next add retries the WHOLE
+    // unpersisted amount (and the gate keeps counting it) — a failed add must never
+    // silently drop spend from the additive ledger (that would undercount /
+    // fail-open). Cleared to 0 once an add succeeds (koe-ixt R-C).
+    let mut pending_cost_delta: u64 = 0;
     // Latch so the in-flight dispatch cap logs once per saturation episode, not
     // once per dropped frame — a sustained flood must not turn the fail-soft drop
     // into a stderr-backpressure DoS (koe-wj2 R-C / Codex).
@@ -410,7 +417,7 @@ async fn run_read_loop<S, F, A, SA>(
                         match handle_text(
                             &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
                             &dispatcher, &mut dispatch_tasks, &mut save_failures,
-                            &mut cap_warned, &mut journal_drop_warned,
+                            &mut pending_cost_delta, &mut cap_warned, &mut journal_drop_warned,
                         ).await {
                             LoopAction::Continue => {}
                             // Carry the terminal error reason out to finalize so it
@@ -594,6 +601,7 @@ async fn handle_text(
     dispatcher: &Arc<dyn DispatcherSeam>,
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
     save_failures: &mut u32,
+    pending_cost_delta: &mut u64,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
 ) -> LoopAction {
@@ -692,25 +700,36 @@ async fn handle_text(
                 c.add_usage(&usage, observed_month);
                 (c.current_month, c.config)
             };
-            // Add this frame's delta to the SHARED monthly ledger and read back the
-            // new authoritative cross-session total (koe-ixt). Additive accounting is
-            // the single source of truth: it SUMS every session's spend, so a
-            // stop->start handover where an older read loop is still draining late
-            // usage cannot run a newer session fail-open on a stale local baseline
-            // (mechanism 4), and two overlapping sessions' spend is summed rather than
-            // one side lost to a max(); it is order-independent so a late / out-of-
-            // order add never rolls the total back (mechanism 5); and it saturates so
-            // it never overflows (fail-closed at u64::MAX).
+            // The amount to add includes any earlier deltas that FAILED to persist
+            // (carried in pending_cost_delta), so a transient ledger failure never
+            // silently drops spend: we retry the whole unpersisted amount and the
+            // gate keeps counting it until an add succeeds.
+            let to_add = pending_cost_delta.saturating_add(delta);
+            // Add to the SHARED monthly ledger and read back the new authoritative
+            // cross-session total (koe-ixt). Additive accounting is the single source
+            // of truth: it SUMS every session's spend, so a stop->start handover
+            // where an older read loop is still draining late usage cannot run a
+            // newer session fail-open on a stale local baseline (mechanism 4), and two
+            // overlapping sessions' spend is summed rather than one side lost to a
+            // max(); it is order-independent so a late / out-of-order add never rolls
+            // the total back (mechanism 5); and it saturates so it never overflows
+            // (fail-closed at u64::MAX).
             let rec = Arc::clone(recorder);
             let added =
-                tokio::task::spawn_blocking(move || rec.add_month_cost(effective_month, delta)).await;
+                tokio::task::spawn_blocking(move || rec.add_month_cost(effective_month, to_add)).await;
             let authoritative_total = match added {
                 Ok(Ok(new_total)) => {
+                    // The whole unpersisted amount is now durably in the ledger.
                     *save_failures = 0;
+                    *pending_cost_delta = 0;
                     new_total
                 }
                 _ => {
                     *save_failures += 1;
+                    // Carry the unpersisted amount forward so the NEXT add retries it
+                    // (and the gate below keeps counting it) — a failed add must never
+                    // drop spend from the ledger (undercount / fail-open).
+                    *pending_cost_delta = to_add;
                     if *save_failures >= MAX_SNAPSHOT_SAVE_FAILURES {
                         // Can't durably track spend → stop rather than risk a restart
                         // resetting the monthly total (fail-closed). Terminal error
@@ -718,8 +737,8 @@ async fn handle_text(
                         // (koe-ego), not here.
                         return LoopAction::Stop("cost tracking unavailable");
                     }
-                    // The ledger ADD failed → this frame's delta was NOT persisted.
-                    // Recover the last persisted total and add this frame's delta for
+                    // The ledger ADD failed but the persisted total is usually still
+                    // READABLE. Gate on persisted + the (carried) unpersisted amount —
                     // a fail-closed lower bound on true spend, so a handover sibling's
                     // over-cap total still stops THIS session across a transient write
                     // failure. If the READ also fails the balance is UNKNOWN → an
@@ -731,7 +750,7 @@ async fn handle_text(
                     })
                     .await;
                     match readback {
-                        Ok(Ok(persisted)) => persisted.unwrap_or(0).saturating_add(delta),
+                        Ok(Ok(persisted)) => persisted.unwrap_or(0).saturating_add(to_add),
                         _ => return LoopAction::Stop("cost tracking unavailable"),
                     }
                 }
@@ -1840,7 +1859,8 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let (mut save_failures, mut cap_warned, mut journal_drop_warned) = (0u32, false, false);
+        let (mut save_failures, mut pending_cost_delta) = (0u32, 0u64);
+        let (mut cap_warned, mut journal_drop_warned) = (false, false);
         handle_text(
             usage,
             provider,
@@ -1851,6 +1871,7 @@ mod tests {
             &dispatcher,
             &mut dispatch_tasks,
             &mut save_failures,
+            &mut pending_cost_delta,
             &mut cap_warned,
             &mut journal_drop_warned,
         )
@@ -2073,6 +2094,92 @@ mod tests {
         assert!(
             matches!(result, LoopAction::Stop("cost tracking unavailable")),
             "an unknown authoritative balance (save AND read both failed) must stop fail-closed on the first frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_ledger_adds_carry_forward_and_still_trip_the_cap() {
+        // koe-ixt (Codex R-C): a failed `add_month_cost` must NOT silently drop this
+        // frame's spend from the ledger. The unpersisted delta is carried forward
+        // (pending_cost_delta) so the gate keeps counting it across frames. Codex's
+        // scenario: a $15 cap and TWO consecutive add-failures of +$10 each. True
+        // spend is $20, so the second frame must fail-closed on the CARRIED $10 + the
+        // new $10 = $20 (>= $15) — even though each frame alone is only $10 and
+        // neither was persisted. Without the carry the gate would see only $10 each
+        // time and charge on (fail-open / undercount).
+        let month = current_yyyymm();
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig {
+                enabled: true,
+                monthly_limit_nanodollars: 15 * NANODOLLARS_PER_USD,
+            },
+            month,
+        )));
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        // FailingRecorder: add_month_cost -> Err, load_cost_snapshot -> Ok(None), so
+        // the fallback gate sees 0 + the carried unpersisted amount.
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(FailingRecorder);
+        // $10 per frame = 312_500 audio-input tokens * 32_000 nanodollars.
+        let ten_dollars = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 312_500u64 } } }
+        });
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
+        let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
+        let mut dispatch_tasks = tokio::task::JoinSet::new();
+        // Persistent state across both frames (run_read_loop owns these for the
+        // whole session, so the carry survives between frames).
+        let (mut save_failures, mut pending_cost_delta) = (0u32, 0u64);
+        let (mut cap_warned, mut journal_drop_warned) = (false, false);
+
+        // Frame 1: add fails; the $10 is carried, gate sees only $10 (< $15 cap).
+        let r1 = handle_text(
+            &ten_dollars,
+            &provider,
+            &write_tx,
+            &cost,
+            &recorder,
+            &rec_tx,
+            &dispatcher,
+            &mut dispatch_tasks,
+            &mut save_failures,
+            &mut pending_cost_delta,
+            &mut cap_warned,
+            &mut journal_drop_warned,
+        )
+        .await;
+        assert!(
+            matches!(r1, LoopAction::Continue),
+            "the first $10 (< $15 cap) must continue"
+        );
+        assert_eq!(
+            pending_cost_delta,
+            10 * NANODOLLARS_PER_USD,
+            "the failed $10 add must be carried forward, not dropped from the ledger"
+        );
+
+        // Frame 2: add fails again; gate sees carried $10 + new $10 = $20 (>= $15) →
+        // fail-closed. This is the budget gate, NOT the 'cost tracking unavailable'
+        // counter path (only 2 failures so far, below MAX_SNAPSHOT_SAVE_FAILURES).
+        let r2 = handle_text(
+            &ten_dollars,
+            &provider,
+            &write_tx,
+            &cost,
+            &recorder,
+            &rec_tx,
+            &dispatcher,
+            &mut dispatch_tasks,
+            &mut save_failures,
+            &mut pending_cost_delta,
+            &mut cap_warned,
+            &mut journal_drop_warned,
+        )
+        .await;
+        assert!(
+            matches!(r2, LoopAction::Stop("monthly budget exceeded")),
+            "the carried + new delta ($20 >= $15) must trip the cap fail-closed, not be lost"
         );
     }
 
