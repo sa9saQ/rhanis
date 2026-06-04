@@ -232,13 +232,16 @@ async fn finalize_session_slot<F>(
         // pass). We own the terminal transition only if NO newer start has begun
         // since ours. `start_session` mints our generation then leaves the counter
         // exactly one higher, so `latest == generation + 1` means we are still the
-        // latest start. Any newer start — including one that FAILED before storing
-        // an ActiveSession (connect/setup/audio error) — advanced the counter past
-        // us, so it owns the terminal transition and we stay silent; emitting here
-        // would land our `idle`/`error` over its `connecting`/`error` (koe-ego: a
-        // failed reconnect during a restart would otherwise be wrongly cleared to
-        // idle). The counter read is under this slot lock (same mutex the mint runs
-        // under), so it observes every prior mint.
+        // latest start. A newer start advances the counter the moment it passes the
+        // is_some() check (the mint is before every fallible step), so we stay
+        // silent for ANY newer start attempt: whether it (a) rejects at an input
+        // gate (settings / onboarding / provider / budget / key) and surfaces via
+        // the frontend's invoke-rejection, (b) fails connect/setup/audio and emits
+        // its own backend `error`, or (c) succeeds. In every case that newer
+        // attempt's outcome — not our stale `idle`/`error` — must own the UI (a
+        // failed reconnect during a restart must not be cleared to idle). The
+        // counter read is under this slot lock (the same mutex the mint runs under),
+        // so it observes every prior mint.
         None => latest_generation.load(Ordering::Relaxed) == generation + 1,
         Some(_) => false,
     };
