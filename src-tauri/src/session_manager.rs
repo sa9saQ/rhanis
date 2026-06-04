@@ -77,6 +77,20 @@ const MAX_INFLIGHT_DISPATCHES: usize = 64;
 /// (a persistent failure means a restart could lose the running total).
 const MAX_SNAPSHOT_SAVE_FAILURES: u32 = 3;
 
+/// Spend (nanodollars) counted into the budget gate but not yet durably written to
+/// the additive ledger because an `add_month_cost` failed transiently, tagged with
+/// the month it belongs to. Carried across frames so the next add retries the WHOLE
+/// unpersisted amount (and the gate keeps counting it); a failed add must never
+/// silently drop spend (that would undercount / fail-open). Reset to 0 once an add
+/// succeeds. The `month` SCOPES the carry: if the month rolls over while spend is
+/// still unpersisted, the loop fails closed rather than fold a past month's spend
+/// into the new month's row (koe-ixt). (koe-ixt R-C / Codex P2)
+#[derive(Default)]
+struct PendingCost {
+    month: u32,
+    nanodollars: u64,
+}
+
 /// WebSocket frame/message size limits (DoS guard).
 /// Max message: 512 KiB — comfortably above the largest legitimate Realtime
 /// frame (audio deltas are ~256 KiB max; control frames are much smaller).
@@ -315,13 +329,10 @@ async fn run_read_loop<S, F, A, SA>(
     // (rather than letting them complete and spend more).
     let mut dispatch_tasks = tokio::task::JoinSet::new();
     let mut save_failures: u32 = 0;
-    // Cost (nanodollars) that has been counted into the budget gate but not yet
-    // durably written to the shared ledger because an `add_month_cost` failed
-    // transiently. Carried across frames so the next add retries the WHOLE
-    // unpersisted amount (and the gate keeps counting it) — a failed add must never
-    // silently drop spend from the additive ledger (that would undercount /
-    // fail-open). Cleared to 0 once an add succeeds (koe-ixt R-C).
-    let mut pending_cost_delta: u64 = 0;
+    // Unpersisted spend carried across frames after a transient ledger-add failure
+    // (see [`PendingCost`]). Month-scoped so a rollover with unpersisted spend fails
+    // closed instead of mis-attributing it (koe-ixt R-C).
+    let mut pending = PendingCost::default();
     // Latch so the in-flight dispatch cap logs once per saturation episode, not
     // once per dropped frame — a sustained flood must not turn the fail-soft drop
     // into a stderr-backpressure DoS (koe-wj2 R-C / Codex).
@@ -417,7 +428,7 @@ async fn run_read_loop<S, F, A, SA>(
                         match handle_text(
                             &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
                             &dispatcher, &mut dispatch_tasks, &mut save_failures,
-                            &mut pending_cost_delta, &mut cap_warned, &mut journal_drop_warned,
+                            &mut pending, &mut cap_warned, &mut journal_drop_warned,
                         ).await {
                             LoopAction::Continue => {}
                             // Carry the terminal error reason out to finalize so it
@@ -601,7 +612,7 @@ async fn handle_text(
     dispatcher: &Arc<dyn DispatcherSeam>,
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
     save_failures: &mut u32,
-    pending_cost_delta: &mut u64,
+    pending: &mut PendingCost,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
 ) -> LoopAction {
@@ -700,11 +711,20 @@ async fn handle_text(
                 c.add_usage(&usage, observed_month);
                 (c.current_month, c.config)
             };
-            // The amount to add includes any earlier deltas that FAILED to persist
-            // (carried in pending_cost_delta), so a transient ledger failure never
-            // silently drops spend: we retry the whole unpersisted amount and the
-            // gate keeps counting it until an add succeeds.
-            let to_add = pending_cost_delta.saturating_add(delta);
+            // The amount to add includes any earlier spend that FAILED to persist
+            // (carried in `pending`), so a transient ledger failure never silently
+            // drops spend: we retry the whole unpersisted amount and the gate keeps
+            // counting it until an add succeeds. The carry is MONTH-SCOPED: if it
+            // belongs to a PAST month (a rollover happened while spend was still
+            // unpersisted), fail closed rather than fold it into the new month's row
+            // (which would undercount the old month and over-count the new one). A
+            // non-empty carry already means the ledger was failing, so stopping here
+            // is the fail-closed choice (koe-ixt R-C / Codex P2); a fresh session
+            // reloads cleanly from the ledger.
+            if pending.nanodollars > 0 && pending.month != effective_month {
+                return LoopAction::Stop("cost tracking unavailable");
+            }
+            let to_add = pending.nanodollars.saturating_add(delta);
             // Add to the SHARED monthly ledger and read back the new authoritative
             // cross-session total (koe-ixt). Additive accounting is the single source
             // of truth: it SUMS every session's spend, so a stop->start handover
@@ -721,15 +741,17 @@ async fn handle_text(
                 Ok(Ok(new_total)) => {
                     // The whole unpersisted amount is now durably in the ledger.
                     *save_failures = 0;
-                    *pending_cost_delta = 0;
+                    pending.nanodollars = 0;
                     new_total
                 }
                 _ => {
                     *save_failures += 1;
-                    // Carry the unpersisted amount forward so the NEXT add retries it
-                    // (and the gate below keeps counting it) — a failed add must never
-                    // drop spend from the ledger (undercount / fail-open).
-                    *pending_cost_delta = to_add;
+                    // Carry the unpersisted amount forward (tagged with its month) so
+                    // the NEXT add retries it (and the gate below keeps counting it) —
+                    // a failed add must never drop spend from the ledger (undercount
+                    // / fail-open).
+                    pending.nanodollars = to_add;
+                    pending.month = effective_month;
                     if *save_failures >= MAX_SNAPSHOT_SAVE_FAILURES {
                         // Can't durably track spend → stop rather than risk a restart
                         // resetting the monthly total (fail-closed). Terminal error
@@ -1859,7 +1881,8 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let (mut save_failures, mut pending_cost_delta) = (0u32, 0u64);
+        let mut save_failures = 0u32;
+        let mut pending = PendingCost::default();
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
         handle_text(
             usage,
@@ -1871,7 +1894,7 @@ mod tests {
             &dispatcher,
             &mut dispatch_tasks,
             &mut save_failures,
-            &mut pending_cost_delta,
+            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         )
@@ -2101,7 +2124,7 @@ mod tests {
     async fn failed_ledger_adds_carry_forward_and_still_trip_the_cap() {
         // koe-ixt (Codex R-C): a failed `add_month_cost` must NOT silently drop this
         // frame's spend from the ledger. The unpersisted delta is carried forward
-        // (pending_cost_delta) so the gate keeps counting it across frames. Codex's
+        // (`pending`) so the gate keeps counting it across frames. Codex's
         // scenario: a $15 cap and TWO consecutive add-failures of +$10 each. True
         // spend is $20, so the second frame must fail-closed on the CARRIED $10 + the
         // new $10 = $20 (>= $15) — even though each frame alone is only $10 and
@@ -2130,7 +2153,8 @@ mod tests {
         let mut dispatch_tasks = tokio::task::JoinSet::new();
         // Persistent state across both frames (run_read_loop owns these for the
         // whole session, so the carry survives between frames).
-        let (mut save_failures, mut pending_cost_delta) = (0u32, 0u64);
+        let mut save_failures = 0u32;
+        let mut pending = PendingCost::default();
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
 
         // Frame 1: add fails; the $10 is carried, gate sees only $10 (< $15 cap).
@@ -2144,7 +2168,7 @@ mod tests {
             &dispatcher,
             &mut dispatch_tasks,
             &mut save_failures,
-            &mut pending_cost_delta,
+            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         )
@@ -2154,7 +2178,7 @@ mod tests {
             "the first $10 (< $15 cap) must continue"
         );
         assert_eq!(
-            pending_cost_delta,
+            pending.nanodollars,
             10 * NANODOLLARS_PER_USD,
             "the failed $10 add must be carried forward, not dropped from the ledger"
         );
@@ -2172,7 +2196,7 @@ mod tests {
             &dispatcher,
             &mut dispatch_tasks,
             &mut save_failures,
-            &mut pending_cost_delta,
+            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         )
@@ -2180,6 +2204,65 @@ mod tests {
         assert!(
             matches!(r2, LoopAction::Stop("monthly budget exceeded")),
             "the carried + new delta ($20 >= $15) must trip the cap fail-closed, not be lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_cost_from_a_past_month_fails_closed_on_rollover() {
+        // koe-ixt (Codex P2): the carried unpersisted spend is MONTH-SCOPED. If a
+        // month rollover happens while spend is still unpersisted (a prior add
+        // failed), the loop must FAIL CLOSED rather than fold the past month's spend
+        // into the new month's row (which would undercount the old month and
+        // over-count the new). Modeled by pre-seeding `pending` for an EARLIER month
+        // than the tracker's effective month and driving one frame.
+        let tracker_month = 209912; // strictly ahead of any real current_yyyymm()
+        assert!(
+            tracker_month > current_yyyymm(),
+            "test premise: the tracker's month must be ahead of the wall clock"
+        );
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig {
+                enabled: true,
+                monthly_limit_nanodollars: 1000 * NANODOLLARS_PER_USD,
+            },
+            tracker_month,
+        )));
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(OkRecorder);
+        let usage = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 100u64 } } }
+        });
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
+        let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
+        let mut dispatch_tasks = tokio::task::JoinSet::new();
+        let mut save_failures = 0u32;
+        // Unpersisted spend left over from an EARLIER month (tracker_month - 1).
+        let mut pending = PendingCost {
+            month: tracker_month - 1,
+            nanodollars: 5 * NANODOLLARS_PER_USD,
+        };
+        let (mut cap_warned, mut journal_drop_warned) = (false, false);
+
+        let result = handle_text(
+            &usage,
+            &provider,
+            &write_tx,
+            &cost,
+            &recorder,
+            &rec_tx,
+            &dispatcher,
+            &mut dispatch_tasks,
+            &mut save_failures,
+            &mut pending,
+            &mut cap_warned,
+            &mut journal_drop_warned,
+        )
+        .await;
+        assert!(
+            matches!(result, LoopAction::Stop("cost tracking unavailable")),
+            "unpersisted spend from a past month must fail closed on rollover, not be folded into the new month"
         );
     }
 
