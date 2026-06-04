@@ -572,7 +572,7 @@ mod tests {
         fn list_recent_notes(&self, _: u32) -> Result<Vec<crate::storage::adapter::Note>, crate::storage::adapter::RecorderError> { Ok(vec![]) }
         fn log_conversation_event(&self, _: &str, _: &str, _: &str) -> Result<i64, crate::storage::adapter::RecorderError> { Ok(0) }
         fn list_recent_events(&self, _: u32) -> Result<Vec<crate::storage::adapter::ConversationEvent>, crate::storage::adapter::RecorderError> { Ok(vec![]) }
-        fn save_cost_snapshot(&self, _: u32, n: u64) -> Result<u64, crate::storage::adapter::RecorderError> { Ok(n) }
+        fn add_month_cost(&self, _: u32, n: u64) -> Result<u64, crate::storage::adapter::RecorderError> { Ok(n) }
         fn load_cost_snapshot(&self, _: u32) -> Result<Option<u64>, crate::storage::adapter::RecorderError> { Ok(None) }
         fn health_check(&self) -> Result<(), crate::storage::adapter::RecorderError> { Ok(()) }
     }

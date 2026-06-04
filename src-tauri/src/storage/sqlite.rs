@@ -165,36 +165,32 @@ impl RecorderAdapter for SqliteAdapter {
         Ok(out)
     }
 
-    fn save_cost_snapshot(
+    fn add_month_cost(
         &self,
         month_yyyymm: u32,
-        total_nanodollars: u64,
+        delta_nanodollars: u64,
     ) -> Result<u64, RecorderError> {
         let conn = self.lock()?;
-        // Monotonic merge (koe-ixt mechanism 5): the persisted monthly total must
-        // never DECREASE for a given month. The in-memory CostTracker only ever
-        // grows the total within a month (saturating_add; a rollover uses a
-        // different month_yyyymm key), so a write with a LOWER total can only be a
-        // stale / out-of-order writer — e.g. a stop->start handover where an older
-        // session's late `response.done` save lands after a newer session already
-        // wrote a higher total. Letting it win would roll the budget total
-        // backwards (undercount -> fail-open on the cap). We keep the MAX and
-        // return the merged total so the caller gates on the authoritative
-        // cross-session value.
+        // Additive ledger (koe-ixt): the monthly cost is the SUM of every session's
+        // per-`response.done` charge, so we ADD this delta to the stored total
+        // rather than overwriting it. This sums two sessions' spend that overlap
+        // during a stop->start handover (an older read loop draining late usage)
+        // instead of losing one side to a max(); it is order-independent so a late /
+        // out-of-order write never rolls the total back (mechanism 5); and the
+        // returned total lets the caller gate on the authoritative cross-session sum
+        // (mechanism 4).
         //
-        // The max is computed in Rust, NOT via SQL `MAX()`: SQLite INTEGER is i64,
-        // and the u64 total is stored by *bit* reinterpretation (`as i64`) and read
-        // back with `as u64`, which round-trips all 64 bits exactly (so a saturated
-        // u64::MAX total survives a restart instead of clamping at i64::MAX). A
-        // saturated u64::MAX therefore persists as i64 -1, and SQL's *signed*
-        // `MAX()` would wrongly treat it as the smallest — Rust's u64 `.max()`
-        // compares the true magnitudes. The whole read-modify-write runs while THIS
-        // adapter's single connection Mutex is held (every RecorderAdapter call
-        // takes it), so two session loops' saves serialize and cannot interleave —
-        // the merge is atomic without a separate SQL transaction. INTEGER `MAX()`
-        // also cannot overflow (unlike a `+` additive merge, which SQLite silently
-        // promotes to REAL on i64 overflow — breaking the integer-only, NaN/Inf-free
-        // budget invariant).
+        // The add is done in RUST with `saturating_add`, NOT SQLite's `+`: SQLite
+        // promotes an i64 overflow to a REAL float, which would break the
+        // integer-only, NaN/Inf-free budget invariant; saturating_add clamps at
+        // u64::MAX (fail-closed = over budget). SQLite INTEGER is i64, so the u64 is
+        // stored by *bit* reinterpretation (`as i64`) and read back with `as u64`,
+        // round-tripping all 64 bits exactly (a saturated u64::MAX total survives a
+        // restart as i64 -1 instead of clamping at i64::MAX). The whole
+        // read-modify-write runs while THIS adapter's single connection Mutex is
+        // held (every RecorderAdapter call takes it), so two session loops' adds
+        // serialize and cannot interleave — atomic without a separate SQL
+        // transaction, and no add is lost to a lost-update race.
         let current: Option<i64> = conn
             .query_row(
                 "SELECT total_nanodollars FROM cost_snapshots WHERE month_yyyymm = ?1",
@@ -203,14 +199,17 @@ impl RecorderAdapter for SqliteAdapter {
             )
             .optional()
             .map_err(|_| RecorderError::Db)?;
-        let merged = current.map(|n| n as u64).unwrap_or(0).max(total_nanodollars);
+        let new_total = current
+            .map(|n| n as u64)
+            .unwrap_or(0)
+            .saturating_add(delta_nanodollars);
         conn.execute(
             "INSERT INTO cost_snapshots (month_yyyymm, total_nanodollars) VALUES (?1, ?2)
              ON CONFLICT(month_yyyymm) DO UPDATE SET total_nanodollars = excluded.total_nanodollars",
-            params![month_yyyymm, merged as i64],
+            params![month_yyyymm, new_total as i64],
         )
         .map_err(|_| RecorderError::Db)?;
-        Ok(merged)
+        Ok(new_total)
     }
 
     fn load_cost_snapshot(&self, month_yyyymm: u32) -> Result<Option<u64>, RecorderError> {
@@ -382,85 +381,81 @@ mod tests {
     }
 
     #[test]
-    fn cost_snapshot_higher_write_advances_and_returns_total() {
-        // A higher (forward) write advances the persisted total and save returns
-        // the merged (== written, since it is the new max) total.
+    fn add_month_cost_accumulates_and_returns_running_total() {
+        // Additive ledger: each add sums onto the month's running total and returns
+        // the new total. The first add of a fresh month starts from 0.
         let a = mem();
-        assert_eq!(a.save_cost_snapshot(202605, 1_000).unwrap(), 1_000);
-        assert_eq!(a.save_cost_snapshot(202605, 2_500).unwrap(), 2_500);
+        assert_eq!(a.add_month_cost(202605, 1_000).unwrap(), 1_000);
+        assert_eq!(a.add_month_cost(202605, 1_500).unwrap(), 2_500);
         assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(2_500));
     }
 
     #[test]
-    fn cost_snapshot_save_is_monotonic_and_returns_merged() {
-        // koe-ixt mechanism 5 (undercount / rollback). A stop->start handover can
-        // make an older session's late save (a LOWER, stale total) land AFTER a
-        // newer session already wrote a HIGHER total. The persisted monthly total
-        // must never roll backwards, and save must return the merged (post-max)
-        // persisted total so the caller can fail-closed on the authoritative
-        // cross-session value.
+    fn add_month_cost_never_decreases_and_is_order_independent() {
+        // koe-ixt mechanism 5 (undercount / rollback). An additive ledger only ever
+        // grows within a month, so a LATE / out-of-order write (e.g. a stop->start
+        // handover where an older session's late `response.done` add lands after a
+        // newer session already added) can never roll the total backwards: it just
+        // sums in. The returned total is the authoritative cross-session sum the
+        // caller gates on.
         let a = mem();
-        assert_eq!(a.save_cost_snapshot(202605, 2_500).unwrap(), 2_500);
-        // A lower (stale / out-of-order) write must NOT overwrite the higher total
-        // and must return the kept (higher) total.
+        assert_eq!(a.add_month_cost(202605, 2_500).unwrap(), 2_500);
+        // A smaller, "late" add increases the total (it does NOT overwrite/roll back).
         assert_eq!(
-            a.save_cost_snapshot(202605, 1_000).unwrap(),
-            2_500,
-            "a lower late write must return the kept higher total, not roll back"
+            a.add_month_cost(202605, 1_000).unwrap(),
+            3_500,
+            "a late add must sum in, never roll the total back"
         );
-        assert_eq!(
-            a.load_cost_snapshot(202605).unwrap(),
-            Some(2_500),
-            "persisted monthly total must never decrease (undercount/rollback guard)"
-        );
-        // An equal-or-higher write still advances normally.
-        assert_eq!(a.save_cost_snapshot(202605, 4_000).unwrap(), 4_000);
-        assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(4_000));
+        assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(3_500));
     }
 
     #[test]
-    fn cost_snapshot_saturated_max_is_not_rolled_back_by_lower_write() {
-        // u64::MAX persists as i64 -1 (bit reinterpretation). The monotonic merge
-        // must compare TRUE u64 magnitudes (Rust `.max()`), NOT signed SQL `MAX()`,
-        // which would treat -1 as the smallest and wrongly let a lower write win —
-        // silently un-saturating a maxed-out budget total (fail-open on the cap).
+    fn add_month_cost_saturates_at_u64_max_without_real_promotion() {
+        // The add is done in Rust with saturating_add (NOT SQLite's `+`, which
+        // promotes an i64 overflow to a REAL float and breaks the integer-only,
+        // NaN/Inf-free budget invariant). Adding onto a near-u64::MAX total clamps
+        // at u64::MAX (fail-closed = over budget), and u64::MAX round-trips exactly
+        // through the i64 bit-cast (it would be i64 -1, never i64::MAX).
         let a = mem();
-        assert_eq!(a.save_cost_snapshot(202605, u64::MAX).unwrap(), u64::MAX);
+        assert_eq!(a.add_month_cost(202605, u64::MAX - 10).unwrap(), u64::MAX - 10);
         assert_eq!(
-            a.save_cost_snapshot(202605, 1_000).unwrap(),
+            a.add_month_cost(202605, 1_000).unwrap(),
             u64::MAX,
-            "a lower write must not roll a saturated u64::MAX total back"
+            "an add that would overflow must saturate at u64::MAX, not wrap or go REAL"
         );
         assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(u64::MAX));
+        // A further add stays clamped.
+        assert_eq!(a.add_month_cost(202605, 5).unwrap(), u64::MAX);
     }
 
     #[test]
-    fn cost_snapshot_months_are_independent() {
+    fn add_month_cost_months_are_independent() {
         let a = mem();
-        a.save_cost_snapshot(202605, 100).unwrap();
-        a.save_cost_snapshot(202606, 200).unwrap();
-        assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(100));
+        a.add_month_cost(202605, 100).unwrap();
+        a.add_month_cost(202606, 200).unwrap();
+        a.add_month_cost(202605, 50).unwrap();
+        assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(150));
         assert_eq!(a.load_cost_snapshot(202606).unwrap(), Some(200));
     }
 
     #[test]
-    fn cost_snapshot_u64_max_round_trips() {
+    fn add_month_cost_u64_max_round_trips() {
         // u64::MAX exceeds i64::MAX; the bit-cast store/load must preserve it
         // exactly (a saturated budget total must not corrupt on restart).
         let a = mem();
-        a.save_cost_snapshot(202605, u64::MAX).unwrap();
+        a.add_month_cost(202605, u64::MAX).unwrap();
         assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(u64::MAX));
     }
 
     #[test]
-    fn cost_snapshot_persists_across_reopen() {
-        // File-backed: a saturated u64::MAX total must survive a restart exactly
-        // (combines persistence + the u64<->i64 bit round-trip).
+    fn cost_ledger_persists_across_reopen() {
+        // File-backed: the accumulated total (here a saturated u64::MAX) must
+        // survive a restart exactly (persistence + the u64<->i64 bit round-trip).
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("koe.db");
         {
             let a = SqliteAdapter::open(&path).expect("open 1");
-            a.save_cost_snapshot(202605, u64::MAX).unwrap();
+            a.add_month_cost(202605, u64::MAX).unwrap();
         }
         let a = SqliteAdapter::open(&path).expect("open 2");
         assert_eq!(a.load_cost_snapshot(202605).unwrap(), Some(u64::MAX));
