@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::adapter::{ConversationEvent, Note, RecorderAdapter, RecorderError};
 
@@ -58,6 +58,13 @@ impl SqliteAdapter {
         // SQLITE_BUSY against the writer. Best-effort: an in-memory DB reports
         // "memory" and ignores WAL, which must not fail open().
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        // Busy timeout so a concurrent writer — e.g. a SECOND koe process on the
+        // same DB file — waits briefly for the write lock the `add_month_cost`
+        // `BEGIN IMMEDIATE` transaction takes, instead of failing instantly. The
+        // cost writes run on a blocking thread, so a short wait never stalls the
+        // async read loop; if the wait is exceeded the op still fails closed (the
+        // caller carries the unpersisted delta and retries).
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS notes (
                  id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,7 +177,7 @@ impl RecorderAdapter for SqliteAdapter {
         month_yyyymm: u32,
         delta_nanodollars: u64,
     ) -> Result<u64, RecorderError> {
-        let conn = self.lock()?;
+        let mut conn = self.lock()?;
         // Additive ledger (koe-ixt): the monthly cost is the SUM of every session's
         // per-`response.done` charge, so we ADD this delta to the stored total
         // rather than overwriting it. This sums two sessions' spend that overlap
@@ -180,18 +187,29 @@ impl RecorderAdapter for SqliteAdapter {
         // returned total lets the caller gate on the authoritative cross-session sum
         // (mechanism 4).
         //
+        // The read-modify-write runs inside a `BEGIN IMMEDIATE` transaction so it is
+        // atomic ACROSS PROCESSES, not just within this adapter's connection Mutex:
+        // a second koe instance on the same DB file has its OWN connection (and
+        // Mutex), so without a DB-level write lock the two `SELECT current` →
+        // `UPDATE new_total` pairs could lost-update (one process's delta dropped →
+        // undercount → fail-open on the cap). `IMMEDIATE` acquires the write lock up
+        // front, so concurrent writers serialize; on contention SQLite returns BUSY
+        // (after the `busy_timeout`) → `RecorderError::Db` → the caller carries the
+        // unpersisted delta and retries (fail-closed). The single-statement upsert
+        // this replaced was atomic on its own, but the additive read-then-write is
+        // two statements, so the transaction restores that atomicity.
+        //
         // The add is done in RUST with `saturating_add`, NOT SQLite's `+`: SQLite
         // promotes an i64 overflow to a REAL float, which would break the
         // integer-only, NaN/Inf-free budget invariant; saturating_add clamps at
         // u64::MAX (fail-closed = over budget). SQLite INTEGER is i64, so the u64 is
         // stored by *bit* reinterpretation (`as i64`) and read back with `as u64`,
         // round-tripping all 64 bits exactly (a saturated u64::MAX total survives a
-        // restart as i64 -1 instead of clamping at i64::MAX). The whole
-        // read-modify-write runs while THIS adapter's single connection Mutex is
-        // held (every RecorderAdapter call takes it), so two session loops' adds
-        // serialize and cannot interleave — atomic without a separate SQL
-        // transaction, and no add is lost to a lost-update race.
-        let current: Option<i64> = conn
+        // restart as i64 -1 instead of clamping at i64::MAX).
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RecorderError::Db)?;
+        let current: Option<i64> = tx
             .query_row(
                 "SELECT total_nanodollars FROM cost_snapshots WHERE month_yyyymm = ?1",
                 params![month_yyyymm],
@@ -203,12 +221,13 @@ impl RecorderAdapter for SqliteAdapter {
             .map(|n| n as u64)
             .unwrap_or(0)
             .saturating_add(delta_nanodollars);
-        conn.execute(
+        tx.execute(
             "INSERT INTO cost_snapshots (month_yyyymm, total_nanodollars) VALUES (?1, ?2)
              ON CONFLICT(month_yyyymm) DO UPDATE SET total_nanodollars = excluded.total_nanodollars",
             params![month_yyyymm, new_total as i64],
         )
         .map_err(|_| RecorderError::Db)?;
+        tx.commit().map_err(|_| RecorderError::Db)?;
         Ok(new_total)
     }
 
@@ -499,6 +518,47 @@ mod tests {
             h.join().expect("thread join");
         }
         assert_eq!(a.list_recent_notes(1000).unwrap().len(), 80);
+    }
+
+    #[test]
+    fn add_month_cost_no_lost_update_across_adapters() {
+        // koe-ixt (Codex R-C): the additive read-modify-write must be atomic ACROSS
+        // PROCESSES, not just within one adapter's connection Mutex. Two koe
+        // instances on the same DB file have SEPARATE connections, so without a
+        // DB-level write lock their `SELECT current` -> `UPDATE new_total` pairs
+        // could lost-update (one process's delta dropped -> undercount -> fail-open
+        // on the cap). Modeled by TWO `SqliteAdapter`s on the SAME file adding
+        // concurrently: the `BEGIN IMMEDIATE` transaction + busy_timeout serialize
+        // the writers, so the persisted total equals the SUM of every successful add.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("koe.db");
+        let a = Arc::new(SqliteAdapter::open(&path).expect("open A"));
+        let b = Arc::new(SqliteAdapter::open(&path).expect("open B"));
+
+        let successes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for adapter in [Arc::clone(&a), Arc::clone(&b)] {
+            let successes = Arc::clone(&successes);
+            handles.push(thread::spawn(move || {
+                for _ in 0..50 {
+                    if adapter.add_month_cost(202605, 1_000).is_ok() {
+                        successes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+        // The persisted total must equal EVERY successful add summed — no add is
+        // silently dropped by a cross-adapter lost-update. (With the busy_timeout
+        // the light contention resolves by waiting, so in practice all 100 succeed.)
+        let total = a.load_cost_snapshot(202605).unwrap().expect("snapshot exists");
+        let expected = successes.load(std::sync::atomic::Ordering::Relaxed) * 1_000;
+        assert_eq!(
+            total, expected,
+            "persisted total ({total}) must equal sum of successful adds ({expected}) — no lost update"
+        );
     }
 
     #[test]
