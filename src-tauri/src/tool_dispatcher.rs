@@ -56,8 +56,10 @@ const MAX_ARGS_LEN: usize = 64 * 1024;
 const MAX_TOOL_OUTPUT_LEN: usize = 16 * 1024;
 
 /// Hard cap on the tool name length. The name is model-controlled and flows into
-/// `ToolEvent.tool`; bound it like the args/output caps.
-const MAX_TOOL_NAME_LEN: usize = 256;
+/// `ToolEvent.tool`; bound it like the args/output caps. `pub(crate)` so the
+/// session_manager conversation journal (koe-emd) bounds the same model-controlled
+/// field with the same limit instead of re-introducing a magic number.
+pub(crate) const MAX_TOOL_NAME_LEN: usize = 256;
 
 /// Shell tokens that are never allowed in a `run_command` invocation (blocked
 /// outright, before the human gate). Matched at the **token** level (not
