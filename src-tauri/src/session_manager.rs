@@ -716,13 +716,17 @@ async fn handle_text(
             // drops spend: we retry the whole unpersisted amount and the gate keeps
             // counting it until an add succeeds. The carry is MONTH-SCOPED: if it
             // belongs to a PAST month (a rollover happened while spend was still
-            // unpersisted), fail closed rather than fold it into the new month's row
-            // (which would undercount the old month and over-count the new one). A
-            // non-empty carry already means the ledger was failing, so stopping here
-            // is the fail-closed choice (koe-ixt R-C / Codex P2); a fresh session
-            // reloads cleanly from the ledger.
-            if pending.nanodollars > 0 && pending.month != effective_month {
-                return LoopAction::Stop("cost tracking unavailable");
+            // unpersisted), the stale carry is DROPPED rather than folded into the
+            // new month's row (which would over-count the new month). Dropping it is
+            // sound because the old month's cap was already enforced live, frame by
+            // frame, and its persisted total is never read again once it is no longer
+            // the current month (`load_cost_snapshot` is only called for the current
+            // month at session start). We then proceed normally so THIS frame's spend
+            // IS still recorded in — and gated against — the NEW month, instead of
+            // being lost to an early stop (koe-ixt R-C / Codex P2).
+            if pending.month != effective_month {
+                pending.nanodollars = 0;
+                pending.month = effective_month;
             }
             let to_add = pending.nanodollars.saturating_add(delta);
             // Add to the SHARED monthly ledger and read back the new authoritative
@@ -2208,18 +2212,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_cost_from_a_past_month_fails_closed_on_rollover() {
+    async fn pending_cost_from_a_past_month_is_dropped_not_folded_into_new_month() {
         // koe-ixt (Codex P2): the carried unpersisted spend is MONTH-SCOPED. If a
         // month rollover happens while spend is still unpersisted (a prior add
-        // failed), the loop must FAIL CLOSED rather than fold the past month's spend
-        // into the new month's row (which would undercount the old month and
-        // over-count the new). Modeled by pre-seeding `pending` for an EARLIER month
-        // than the tracker's effective month and driving one frame.
+        // failed), the stale carry must NOT be folded into the new month's row (that
+        // would over-count the new month). It is DROPPED — the old month's cap was
+        // already enforced live and its persisted total is never read again once it
+        // is no longer the current month — and the loop PROCEEDS so this frame's
+        // spend is still recorded in (and gated against) the NEW month, not lost to
+        // an early stop. Modeled by pre-seeding `pending` for an EARLIER month than
+        // the tracker's effective month and driving one frame.
         let tracker_month = 209912; // strictly ahead of any real current_yyyymm()
         assert!(
             tracker_month > current_yyyymm(),
             "test premise: the tracker's month must be ahead of the wall clock"
         );
+        let (rec, persisted) = SharedSnapshotRecorder::new();
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(rec);
         let cost = Arc::new(TokioMutex::new(CostTracker::new(
             BudgetConfig {
                 enabled: true,
@@ -2228,17 +2237,17 @@ mod tests {
             tracker_month,
         )));
         let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
-        let recorder: Arc<dyn RecorderAdapter> = Arc::new(OkRecorder);
-        let usage = serde_json::json!({
+        // This frame's spend: $10 = 312_500 audio-input tokens * 32_000 nanodollars.
+        let ten_dollars = serde_json::json!({
             "type": "response.done",
-            "response": { "usage": { "input_token_details": { "audio_tokens": 100u64 } } }
+            "response": { "usage": { "input_token_details": { "audio_tokens": 312_500u64 } } }
         });
         let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
         let mut save_failures = 0u32;
-        // Unpersisted spend left over from an EARLIER month (tracker_month - 1).
+        // Unpersisted $5 left over from an EARLIER month (tracker_month - 1).
         let mut pending = PendingCost {
             month: tracker_month - 1,
             nanodollars: 5 * NANODOLLARS_PER_USD,
@@ -2246,7 +2255,7 @@ mod tests {
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
 
         let result = handle_text(
-            &usage,
+            &ten_dollars,
             &provider,
             &write_tx,
             &cost,
@@ -2261,9 +2270,24 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, LoopAction::Stop("cost tracking unavailable")),
-            "unpersisted spend from a past month must fail closed on rollover, not be folded into the new month"
+            matches!(result, LoopAction::Continue),
+            "the session must proceed (recording this frame), not stop, on a rollover with stale pending"
         );
+        // The NEW month's ledger got ONLY this frame's $10 — the stale $5 from the
+        // old month was DROPPED, not folded into the new month's total.
+        assert_eq!(
+            *persisted.lock().unwrap().get(&tracker_month).unwrap(),
+            10 * NANODOLLARS_PER_USD,
+            "stale old-month pending ($5) must be dropped, not added to the new month ($10, not $15)"
+        );
+        // The dropped old-month pending was not written to the old month's row either.
+        assert!(
+            !persisted.lock().unwrap().contains_key(&(tracker_month - 1)),
+            "the dropped old-month pending must not be written anywhere"
+        );
+        // After a successful add the carry is reset and re-scoped to the new month.
+        assert_eq!(pending.nanodollars, 0, "carry is cleared after a successful add");
+        assert_eq!(pending.month, tracker_month, "carry is re-scoped to the current month");
     }
 
     #[tokio::test]
