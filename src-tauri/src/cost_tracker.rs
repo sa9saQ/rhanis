@@ -118,6 +118,22 @@ impl Default for BudgetConfig {
     }
 }
 
+impl BudgetConfig {
+    /// `total_nanodollars` がこの予算を超過しているか。`enabled = false`
+    /// （ユーザーが明示的に無制限を選択）は常に false。上限ちょうども超過扱い
+    /// （fail-closed 寄り）。
+    ///
+    /// `total` には **世代横断の永続合計**（= 単一セッションの local 合計以上）を
+    /// 渡せる。session_manager は usage 受信ごとに共有コストスナップショットを
+    /// 読み戻してこの判定を行うため、stop→start handover で古いセッションが
+    /// 遅延 usage を処理し続けても、新しいセッションが古い local baseline で
+    /// fail-open することを防ぐ（koe-ixt 機序4）。超過判定の単一の真実源であり、
+    /// [`CostTracker::is_over_budget`] はこれに委譲する。
+    pub fn is_over(&self, total_nanodollars: u64) -> bool {
+        self.enabled && total_nanodollars >= self.monthly_limit_nanodollars
+    }
+}
+
 /// 月次のコスト累計 + 予算判定。
 ///
 /// `current_month` は `YYYYMM`（例: 2026 年 5 月 = `202605`）。
@@ -162,8 +178,10 @@ impl CostTracker {
 
     /// 予算超過か。`enabled = false` なら常に false（無制限）。
     /// 上限ちょうどに達した時点で「超過」とみなす（fail-closed 寄り）。
+    /// 判定本体は [`BudgetConfig::is_over`] に委譲する（session_manager が
+    /// 世代横断の永続合計で判定する経路と同一の述語を使うため、koe-ixt）。
     pub fn is_over_budget(&self) -> bool {
-        self.config.enabled && self.month_total_nanodollars >= self.config.monthly_limit_nanodollars
+        self.config.is_over(self.month_total_nanodollars)
     }
 
     /// 新しいセッションを開始してよいか。予算超過なら false（fail-closed）。
@@ -378,5 +396,32 @@ mod tests {
         t.add_usage(&over, 202605);
         assert_eq!(t.remaining_nanodollars(), Some(0)); // 負にならず 0
         assert!(t.is_over_budget());
+    }
+
+    #[test]
+    fn budget_config_is_over_gates_on_arbitrary_total_fail_closed() {
+        // koe-ixt: the session loop gates the budget on the GLOBAL persisted total
+        // (>= a single session's local total) read back from the shared cost
+        // snapshot, so the predicate must accept an arbitrary total with the same
+        // fail-closed semantics as is_over_budget.
+        let on = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 32 * USD,
+        };
+        assert!(!on.is_over(31 * USD));
+        assert!(on.is_over(32 * USD), "at-limit is over (fail-closed)");
+        assert!(on.is_over(100 * USD));
+        // Disabled = unlimited: never over, even for a saturated total.
+        let off = BudgetConfig {
+            enabled: false,
+            monthly_limit_nanodollars: 32 * USD,
+        };
+        assert!(!off.is_over(u64::MAX));
+        // is_over_budget delegates to is_over on the tracker's own running total,
+        // so the two predicates can never disagree for the local total.
+        let mut t = CostTracker::new(on, 202605);
+        t.month_total_nanodollars = 32 * USD;
+        assert!(t.is_over_budget());
+        assert_eq!(t.is_over_budget(), on.is_over(t.month_total_nanodollars));
     }
 }
