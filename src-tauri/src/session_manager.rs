@@ -27,7 +27,7 @@
 //! transaction N/A · idempotency_key N/A (real-time session control; the budget
 //! guard stops the session, it does not write a charge).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -88,19 +88,35 @@ const WS_MAX_FRAME_SIZE: usize = 512 * 1024;
 
 /// In-flight session handles. `None` when idle.
 pub(crate) struct ActiveSession {
+    /// Monotonic generation minted by [`ManagedSession`] for this session
+    /// (koe-ego). The read loop clears the slot / emits the terminal idle only
+    /// while the slot still holds *this* generation, so a stop->start handover
+    /// (slot taken, then a new session stored) cannot have the old loop's
+    /// teardown clear the newer session's handle.
+    generation: u64,
     shutdown_tx: oneshot::Sender<()>,
     write_handle: tokio::task::JoinHandle<()>,
 }
 
-/// Tauri managed state: the single optional active session. The `tokio::Mutex`
-/// is held across the whole `start_session` setup so two concurrent starts
-/// cannot both pass the `is_some()` check (double-start race). The field is
-/// `pub(crate)` (not `pub`) because `ActiveSession` is crate-private.
-pub struct ManagedSession(pub(crate) Arc<TokioMutex<Option<ActiveSession>>>);
+/// Tauri managed state: the single optional active session plus the monotonic
+/// generation source. The `tokio::Mutex` is held across the whole `start_session`
+/// setup so two concurrent starts cannot both pass the `is_some()` check
+/// (double-start race). Field `.0` is `pub(crate)` (not `pub`) because
+/// `ActiveSession` is crate-private; field `.1` is the generation counter
+/// (koe-ego) — `start_session` mints from it and the read loop reads it to ask
+/// "has a newer start begun since mine?" at its terminal slot-clear. Read only
+/// inside this module.
+pub struct ManagedSession(
+    pub(crate) Arc<TokioMutex<Option<ActiveSession>>>,
+    Arc<AtomicU64>,
+);
 
 impl ManagedSession {
     pub fn new() -> Self {
-        Self(Arc::new(TokioMutex::new(None)))
+        // Generations start at 1 so 0 never collides with a live session (0 reads
+        // as "no session has started yet"). `Arc` so the read loop can hold the
+        // counter to check whether a newer start has begun since its own.
+        Self(Arc::new(TokioMutex::new(None)), Arc::new(AtomicU64::new(1)))
     }
 }
 
@@ -147,13 +163,95 @@ fn current_yyyymm() -> u32 {
 /// What the loop should do after handling one frame.
 enum LoopAction {
     Continue,
-    Stop,
+    /// Stop the loop fail-closed. The `&'static str` is the terminal error reason;
+    /// it is NOT emitted here but carried out to `finalize_session_slot`, which
+    /// emits it under the slot lock (generation-guarded) so a stop->start handover
+    /// cannot flash a dying loop's `error` over a newer, connected session
+    /// (koe-ego).
+    Stop(&'static str),
 }
 
 /// Poll interval for detecting a mic device failure via `mic_running` flag.
 /// 100ms is fast enough for UX feedback and cheap enough to not measurably
 /// impact the audio pipeline.
 const MIC_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Terminal slot handling for a read loop: clears the slot AND emits the single
+/// terminal status (`error` or `idle`) atomically under the slot lock — the
+/// generation guard that closes the `stop_session`→`start_session` handover race
+/// (koe-ego). This is the ONLY place run_read_loop emits a terminal status, so
+/// **every** terminal `error`/`idle` is generation-guarded, not just `idle`.
+///
+/// `terminal_error`: `Some(reason)` for an abnormal exit (budget / timeout / mic
+/// lost / connection error / cost-tracking unavailable) → emit `error(reason)`;
+/// `None` for a clean stop/close → emit `idle`. Three cases, decided under the
+/// lock:
+///
+/// - slot holds **our** `generation` → take it (clear) and emit the terminal
+///   status (error-or-idle);
+/// - slot is **empty** → `stop_session` took our handle (or we cleared it on a
+///   prior pass). We own the terminal transition only if no newer start has begun
+///   since ours — checked via `latest_generation` (the counter has not advanced
+///   past us). A newer start — even one that FAILED before storing an
+///   `ActiveSession` — advanced the counter and owns its own transition, so we
+///   stay silent (else our `idle`/`error` could land over its `connecting`/`error`,
+///   e.g. wrongly clearing a failed reconnect to idle during a restart);
+/// - slot holds a **different** generation → a newer session replaced us during a
+///   handover; leave its handle intact and emit **nothing** (that session owns its
+///   own terminal transition). Clearing it would orphan a live WS (unstoppable →
+///   BYOK double-charge); emitting our status would flash the UI to `error`/`idle`
+///   over a connected session (and a stale `error` is sticky + disables the stop
+///   control for the live session — see sessionStore).
+///
+/// The clear and the emit happen under the same lock so the slot state and the
+/// emitted status can never disagree. `start_session` emits `connecting` while
+/// holding this same slot mutex (it is held across the whole start setup), so the
+/// two are serialized: either this finalize runs first (emits our status, clears,
+/// releases → a racing `connecting` follows it) or `start_session` runs first
+/// (stores the newer generation → this finalize hits the different-generation arm
+/// and emits nothing). Either way a stale status can never land after the newer
+/// session's `connecting`. (The frontend also dedups by `sequence` as a backstop.)
+/// `emit` is synchronous, so the async lock is never held across an `.await`
+/// (no deadlock; minimal hold).
+async fn finalize_session_slot<F>(
+    session: &Arc<TokioMutex<Option<ActiveSession>>>,
+    generation: u64,
+    latest_generation: &AtomicU64,
+    terminal_error: Option<&str>,
+    emit: &F,
+) where
+    F: Fn(&str, Option<&str>),
+{
+    let mut guard = session.lock().await;
+    let owns_terminal = match guard.as_ref().map(|s| s.generation) {
+        Some(g) if g == generation => {
+            *guard = None;
+            true
+        }
+        // Slot empty: stop_session took our handle (or we cleared it on a prior
+        // pass). We own the terminal transition only if NO newer start has begun
+        // since ours. `start_session` mints our generation then leaves the counter
+        // exactly one higher, so `latest == generation + 1` means we are still the
+        // latest start. A newer start advances the counter the moment it passes the
+        // is_some() check (the mint is before every fallible step), so we stay
+        // silent for ANY newer start attempt: whether it (a) rejects at an input
+        // gate (settings / onboarding / provider / budget / key) and surfaces via
+        // the frontend's invoke-rejection, (b) fails connect/setup/audio and emits
+        // its own backend `error`, or (c) succeeds. In every case that newer
+        // attempt's outcome — not our stale `idle`/`error` — must own the UI (a
+        // failed reconnect during a restart must not be cleared to idle). The
+        // counter read is under this slot lock (the same mutex the mint runs under),
+        // so it observes every prior mint.
+        None => latest_generation.load(Ordering::Relaxed) == generation + 1,
+        Some(_) => false,
+    };
+    if owns_terminal {
+        match terminal_error {
+            Some(reason) => emit("error", Some(reason)),
+            None => emit("idle", None),
+        }
+    }
+}
 
 /// The session read loop. Generic over the frame source `S` and an `emit`
 /// closure `F` so it runs with no live socket and no `AppHandle` in tests.
@@ -201,6 +299,8 @@ async fn run_read_loop<S, F, A, SA>(
     mut shutdown: oneshot::Receiver<()>,
     emit: F,
     session: Arc<TokioMutex<Option<ActiveSession>>>,
+    generation: u64,
+    latest_generation: Arc<AtomicU64>,
     audio_handler: A,
     mic_running: Arc<AtomicBool>,
     stop_audio: SA,
@@ -234,23 +334,28 @@ async fn run_read_loop<S, F, A, SA>(
     // drains them instead, so their side effects (e.g. a note write) and final
     // response frames complete rather than being killed mid-flight.
     let abort_inflight: bool;
-    // An error exit must leave the terminal `error` status visible: emitting a
-    // trailing `idle` would make the frontend clear `lastError`, hiding the
-    // budget/connection/timeout reason (a near-silent failure).
-    let mut ended_with_error = false;
+    // Terminal status carried out to `finalize_session_slot`, which emits it under
+    // the slot lock (generation-guarded — koe-ego): `Some(reason)` for an abnormal
+    // exit (budget / timeout / mic lost / connection error / cost-tracking
+    // unavailable) → `error(reason)`; `None` for a clean stop/close → `idle`. Set
+    // by the loop's error arms below. Emitting here would leak the dying loop's
+    // status over a newer session during a stop->start handover.
+    let mut terminal_error: Option<&'static str> = None;
 
     // Pre-loop check: if the mic is already not running when we enter (e.g., the
     // error_callback fired before or during start_session), fail immediately rather
     // than waiting for the first 100ms interval tick.
     if !mic_running.load(Ordering::Acquire) {
-        emit("error", Some("mic device lost"));
         // P1: abort the writer FIRST so no already-queued PCM is flushed, then
         // stop_immediate (StopNow — discard tail) because this is an abnormal exit.
         if let Some(h) = &writer_abort {
             h.abort();
         }
         stop_audio(false); // false = immediate (no tail flush)
-        session.lock().await.take();
+        // Emit the terminal `error` under the slot lock (generation-guarded —
+        // koe-ego), and only for our own slot: a stop->start handover must not
+        // flash this dying loop's error over a newer, connected session.
+        finalize_session_slot(&session, generation, &latest_generation, Some("mic device lost"), &emit).await;
         return;
     }
 
@@ -269,8 +374,7 @@ async fn run_read_loop<S, F, A, SA>(
                 break;
             }
             _ = &mut deadline => {
-                emit("error", Some("session timeout"));
-                ended_with_error = true;
+                terminal_error = Some("session timeout");
                 abort_inflight = true;
                 break;
             }
@@ -279,8 +383,7 @@ async fn run_read_loop<S, F, A, SA>(
             // silently continuing as a deaf text-only session.
             _ = mic_poll.tick() => {
                 if !mic_running.load(Ordering::Acquire) {
-                    emit("error", Some("mic device lost"));
-                    ended_with_error = true;
+                    terminal_error = Some("mic device lost");
                     abort_inflight = true;
                     break;
                 }
@@ -306,14 +409,16 @@ async fn run_read_loop<S, F, A, SA>(
                         audio_handler(&event);
                         match handle_text(
                             &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
-                            &dispatcher, &emit, &mut dispatch_tasks, &mut save_failures,
+                            &dispatcher, &mut dispatch_tasks, &mut save_failures,
                             &mut cap_warned, &mut journal_drop_warned,
                         ).await {
                             LoopAction::Continue => {}
-                            // handle_text already emitted the terminal error
-                            // (budget exceeded / cost tracking unavailable).
-                            LoopAction::Stop => {
-                                ended_with_error = true;
+                            // Carry the terminal error reason out to finalize so it
+                            // is emitted under the slot lock (generation-guarded),
+                            // not here — a handover must not flash it over a newer
+                            // session (koe-ego).
+                            LoopAction::Stop(reason) => {
+                                terminal_error = Some(reason);
                                 abort_inflight = true;
                                 break;
                             }
@@ -328,8 +433,7 @@ async fn run_read_loop<S, F, A, SA>(
                     // `response.audio.delta` events on the OpenAI Realtime API.
                     Some(Ok(_)) => {}
                     Some(Err(_)) => {
-                        emit("error", Some("connection error"));
-                        ended_with_error = true;
+                        terminal_error = Some("connection error");
                         abort_inflight = true;
                         break;
                     }
@@ -357,25 +461,23 @@ async fn run_read_loop<S, F, A, SA>(
         // Drain in-flight dispatches so their side effects + final frames finish.
         while dispatch_tasks.join_next().await.is_some() {}
     }
-    // Clear the session slot on EVERY exit (server close / budget / timeout /
-    // shutdown) so a stale `Some` cannot permanently block the next
-    // start_session. The read loop is the SINGLE place that emits a terminal
-    // status (stop_session relies on this), so there is never a double idle.
+    // Terminal slot handling (koe-ego): clear the slot and emit the single
+    // terminal status (`error(reason)` for an abnormal exit, else `idle`) ONLY
+    // while the slot still holds *this* session's generation (or is already empty —
+    // stop_session took our handle). If a stop_session->start_session handover has
+    // already replaced us with a newer generation, leave that newer handle
+    // untouched and emit nothing — otherwise this exiting loop would orphan the
+    // live session (its WS could no longer be stopped → BYOK double-charge) and
+    // flash the UI to `error`/`idle` over a connected session. finalize is the
+    // SINGLE place the read loop emits a terminal status, so every terminal
+    // `error`/`idle` is generation-guarded (not just `idle`) and never doubled.
     //
-    // This is done BEFORE the journal flush below: clearing the slot must not be
-    // delayed by the conversation-writer drain, otherwise koe-emd would widen the
-    // pre-existing stop_session->start_session slot-handover window (stop_session
-    // takes the slot, then a racing start_session could store a new ActiveSession
-    // that this exiting loop would then clear). Keeping the slot-clear at the same
-    // point as before koe-emd holds that window at its prior size. The residual
-    // pre-existing race (this loop can still clear a *newer* session's slot) is a
-    // separate session-lifecycle fix tracked as a follow-up (generation-id guard).
-    session.lock().await.take();
-    // Only a clean stop/close transitions to idle; an error exit leaves the
-    // already-emitted `error` as the terminal status so the UI keeps the reason.
-    if !ended_with_error {
-        emit("idle", None);
-    }
+    // Done under the slot lock and BEFORE the journal flush below: holding the lock
+    // across the clear + emit keeps the slot state and terminal status consistent
+    // (a racing start_session's `connecting` can only follow this status), and
+    // clearing here (not after the conversation-writer drain) means the slot
+    // handover is never delayed by journalling.
+    finalize_session_slot(&session, generation, &latest_generation, terminal_error, &emit).await;
     // Close the journal channel and flush its tail before run_read_loop returns so
     // a record still in flight is persisted (the seam tests rely on this drain).
     // Unconditional: turns that already happened belong in the history even on an
@@ -482,7 +584,7 @@ fn enqueue_record(
 /// Handles one decoded server frame via the provider's normalizer. Returns
 /// whether to keep looping.
 #[allow(clippy::too_many_arguments)]
-async fn handle_text<F>(
+async fn handle_text(
     event: &Value,
     provider: &Arc<dyn RealtimeProvider>,
     write_tx: &mpsc::Sender<Message>,
@@ -490,15 +592,11 @@ async fn handle_text<F>(
     recorder: &Arc<dyn RecorderAdapter>,
     rec_tx: &mpsc::Sender<ConversationRecord>,
     dispatcher: &Arc<dyn DispatcherSeam>,
-    emit: &F,
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
     save_failures: &mut u32,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
-) -> LoopAction
-where
-    F: Fn(&str, Option<&str>),
-{
+) -> LoopAction {
     match provider.parse_frame(event) {
         ProviderEvent::FunctionCall(pending) => {
             // Reap finished dispatches so the in-flight count reflects reality,
@@ -592,15 +690,18 @@ where
                     *save_failures += 1;
                     if *save_failures >= MAX_SNAPSHOT_SAVE_FAILURES {
                         // Can't durably track spend → stop rather than risk a
-                        // restart resetting the monthly total (fail-closed).
-                        emit("error", Some("cost tracking unavailable"));
-                        return LoopAction::Stop;
+                        // restart resetting the monthly total (fail-closed). The
+                        // terminal error is emitted by finalize_session_slot under
+                        // the slot lock (koe-ego), not here.
+                        return LoopAction::Stop("cost tracking unavailable");
                     }
                 }
             }
             if over {
-                emit("error", Some("monthly budget exceeded"));
-                return LoopAction::Stop; // fail-closed
+                // Terminal error emitted by finalize_session_slot under the slot
+                // lock (koe-ego), not here, so a handover can't flash it over a
+                // newer session.
+                return LoopAction::Stop("monthly budget exceeded"); // fail-closed
             }
             LoopAction::Continue
         }
@@ -650,6 +751,22 @@ pub async fn start_session(
     if guard.is_some() {
         return Err("session already active".to_string());
     }
+    // Mint this start attempt's generation (koe-ego) BEFORE the fallible setup
+    // (connect / session.update / audio), so even a start that FAILS before
+    // storing an ActiveSession still advances the counter. An exiting old loop
+    // reads this counter to detect that a newer start has begun and then stays
+    // silent at its terminal slot-clear (the `None` arm of finalize_session_slot);
+    // otherwise its `idle` could land over the newer start's `connecting`/`error`
+    // — e.g. a failed reconnect during a restart would be wrongly cleared to idle.
+    //
+    // `Relaxed` is sufficient: the mint runs while the slot mutex `guard` is held
+    // (from the is_some() check above) and the read loop reads BOTH the stored
+    // generation and this counter back through the same mutex, so the mutex
+    // supplies the happens-before. The atomic only hands out unique, monotonically
+    // increasing ids, which a single atomic's modification order guarantees even
+    // under Relaxed.
+    let generation = session.1.fetch_add(1, Ordering::Relaxed);
+    let latest_generation = Arc::clone(&session.1);
 
     let app_settings = settings.0.load().map_err(|_| "settings unavailable".to_string())?;
     if !app_settings.onboarding_completed {
@@ -817,6 +934,8 @@ pub async fn start_session(
 
     // Detached: the loop clears the session slot + emits idle on its own exit;
     // stop_session signals it via shutdown_tx rather than holding its handle.
+    // `generation` was minted above (right after the is_some check) and
+    // `latest_generation` is the shared counter the loop checks at finalize.
     tokio::spawn(run_read_loop(
         stream,
         provider,
@@ -827,6 +946,8 @@ pub async fn start_session(
         shutdown_rx,
         emit,
         session_for_loop,
+        generation,
+        latest_generation,
         audio_handler,
         mic_running,
         stop_audio,
@@ -834,6 +955,7 @@ pub async fn start_session(
     ));
 
     *guard = Some(ActiveSession {
+        generation,
         shutdown_tx,
         write_handle,
     });
@@ -876,6 +998,31 @@ mod tests {
     use crate::realtime_provider::OpenAiRealtime;
     use crate::realtime_types::{DispatchResult, NoopDispatcher, ToolSchema};
     use crate::storage::adapter::{ConversationEvent, Note, RecorderError};
+
+    /// Generation passed to `run_read_loop` in tests whose `session` slot starts
+    /// empty (`None`): paired with [`test_counter`] so the `None` arm sees "I am
+    /// still the latest start" and emits as before. Tests that exercise the
+    /// generation guard pass explicit `GEN_*` values instead (see the koe-ego
+    /// handover tests).
+    const TEST_GENERATION: u64 = 1;
+
+    /// The `latest_generation` counter for a loop running [`TEST_GENERATION`] with
+    /// no newer start: `TEST_GENERATION + 1` is exactly the value `start_session`
+    /// leaves after minting `TEST_GENERATION`, so the `None` arm treats this loop
+    /// as the latest start and still emits its terminal status.
+    fn test_counter() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(TEST_GENERATION + 1))
+    }
+
+    /// Builds an `ActiveSession` standing in for a session that occupies the slot,
+    /// with `generation` set. The `shutdown_tx` / `write_handle` are inert (a
+    /// dropped receiver, an immediately-finished task) — the koe-ego tests only
+    /// inspect `generation` to prove the slot was (not) cleared.
+    fn fake_active_session(generation: u64) -> ActiveSession {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let write_handle = tokio::spawn(async {});
+        ActiveSession { generation, shutdown_tx, write_handle }
+    }
 
     // ---- current_yyyymm ------------------------------------------------------
 
@@ -1002,6 +1149,336 @@ mod tests {
         (log, emit)
     }
 
+    // ---- koe-ego: stop_session -> start_session slot-handover generation guard --
+
+    #[tokio::test]
+    async fn handover_race_exiting_loop_keeps_newer_session_slot() {
+        // The real stop_session->start_session handover, modeled with a strict
+        // happens-before so it is deterministic (no flaky timing):
+        //   1. session A (GEN_A) is live and its read loop is parked;
+        //   2. stop_session takes A out of the slot (slot now empty);
+        //   3. start_session(B) stores a NEWER session (GEN_B) in the slot;
+        //   4. ONLY THEN is A's loop signaled, so its teardown runs *after* B is in
+        //      the slot — exactly the dangerous interleaving.
+        // A's exiting loop must leave B's handle intact and emit no terminal idle
+        // (else B's live WS would be orphaned/unstoppable → BYOK double-charge, and
+        // the UI would flash to idle while B is connected).
+        const GEN_A: u64 = 1;
+        const GEN_B: u64 = 2;
+
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> = Arc::new(TokioMutex::new(None));
+        let (log, emit) = collect_emit();
+
+        // (1) A is live: store its handle and start its read loop, parked on a
+        // stream that never yields (only the shutdown signal will end it).
+        let (a_shutdown_tx, a_shutdown_rx) = oneshot::channel();
+        let a_write = tokio::spawn(async {});
+        *slot.lock().await = Some(ActiveSession {
+            generation: GEN_A,
+            shutdown_tx: a_shutdown_tx,
+            write_handle: a_write,
+        });
+
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (a_write_tx, _a_write_rx) = mpsc::channel::<Message>(8);
+        let a_loop = tokio::spawn(run_read_loop(
+            futures_util::stream::pending::<Result<Message, WsError>>(),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            a_write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            a_shutdown_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN_A,
+            Arc::new(AtomicU64::new(GEN_B + 1)), // a newer start (B) exists
+            |_event: &serde_json::Value| {},
+            Arc::new(AtomicBool::new(true)),
+            |_graceful: bool| {},
+            None,
+        ));
+
+        // Let A's loop reach its select and park on the pending stream.
+        tokio::task::yield_now().await;
+
+        // (2) stop_session(A): take A's handle out of the slot (slot now empty).
+        let a_active = slot.lock().await.take().expect("A occupies the slot");
+        assert_eq!(a_active.generation, GEN_A);
+
+        // (3) start_session(B): a NEWER session takes the now-empty slot, BEFORE
+        // A's exiting loop reaches its terminal slot-clear.
+        *slot.lock().await = Some(fake_active_session(GEN_B));
+
+        // (4) Now signal A's loop to exit; its teardown runs with B in the slot.
+        let _ = a_active.shutdown_tx.send(());
+        a_loop.await.expect("A read loop joins");
+
+        assert_eq!(
+            slot.lock().await.as_ref().map(|s| s.generation),
+            Some(GEN_B),
+            "exiting A loop must not clear B's (newer) slot during a stop->start handover (koe-ego)"
+        );
+        let emitted: Vec<_> = log.lock().unwrap().clone();
+        assert!(
+            !emitted.iter().any(|(s, _)| s == "idle"),
+            "exiting A loop must not emit idle while a newer session owns the slot: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exiting_loop_on_close_does_not_clear_newer_generation() {
+        // Terminal slot-clear site (normal server-close exit): if the slot already
+        // holds a newer generation (a handover completed before this loop's
+        // teardown), the exiting loop must leave it and emit no idle.
+        const GEN_A: u64 = 1;
+        const GEN_B: u64 = 2;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> = Arc::new(TokioMutex::new(None));
+        *slot.lock().await = Some(fake_active_session(GEN_B));
+
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (log, emit) = collect_emit();
+
+        run_read_loop(
+            frame_stream(vec![]), // empty stream → immediate normal (server-close) exit
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN_A,
+            Arc::new(AtomicU64::new(GEN_B + 1)), // a newer start (B) exists
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            slot.lock().await.as_ref().map(|s| s.generation),
+            Some(GEN_B),
+            "old loop must not clear a newer session's slot on close (koe-ego)"
+        );
+        let emitted: Vec<_> = log.lock().unwrap().clone();
+        assert!(
+            !emitted.iter().any(|(s, _)| s == "idle"),
+            "old loop must not emit idle while a newer session owns the slot: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mic_lost_preloop_does_not_clear_newer_generation() {
+        // The pre-loop mic-lost early-return clear site honors the generation
+        // guard: with a newer generation in the slot it neither takes that handle
+        // NOR emits a terminal status — its `error` is generation-guarded inside
+        // finalize_session_slot (koe-ego), so a dying loop can't flash its error
+        // over the connected newer session.
+        const GEN_A: u64 = 1;
+        const GEN_B: u64 = 2;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> = Arc::new(TokioMutex::new(None));
+        *slot.lock().await = Some(fake_active_session(GEN_B));
+
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (log, emit) = collect_emit();
+
+        run_read_loop(
+            frame_stream(vec![]),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN_A,
+            Arc::new(AtomicU64::new(GEN_B + 1)), // a newer start (B) exists
+            |_| {},
+            Arc::new(AtomicBool::new(false)), // mic NOT running → pre-loop early return
+            |_| {},
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            slot.lock().await.as_ref().map(|s| s.generation),
+            Some(GEN_B),
+            "mic-lost early return must not clear a newer session's slot (koe-ego)"
+        );
+        // With GEN_B owning the slot, the dying loop emits NO terminal status —
+        // neither its `error` nor an `idle` — over the newer session.
+        let emitted: Vec<_> = log.lock().unwrap().clone();
+        assert!(
+            emitted.is_empty(),
+            "mic-lost early return must emit no terminal status over a newer session: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handover_error_exit_does_not_emit_over_newer_session() {
+        // The in-loop error arms (here: a transport error → the connection-error
+        // arm) also route their terminal `error` through finalize_session_slot, so
+        // a stop->start handover that put a newer generation in the slot must NOT
+        // flash the dying loop's `error` over the connected newer session (koe-ego).
+        // Otherwise the stale error sticks in the UI and disables the stop control
+        // for a live, BYOK-billing session.
+        const GEN_A: u64 = 1;
+        const GEN_B: u64 = 2;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> = Arc::new(TokioMutex::new(None));
+        *slot.lock().await = Some(fake_active_session(GEN_B));
+
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (log, emit) = collect_emit();
+
+        run_read_loop(
+            futures_util::stream::iter(vec![Err(WsError::ConnectionClosed)]),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN_A,
+            Arc::new(AtomicU64::new(GEN_B + 1)), // a newer start (B) exists
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            slot.lock().await.as_ref().map(|s| s.generation),
+            Some(GEN_B),
+            "in-loop error exit must not clear a newer session's slot (koe-ego)"
+        );
+        let emitted: Vec<_> = log.lock().unwrap().clone();
+        assert!(
+            emitted.is_empty(),
+            "in-loop error exit must emit no terminal status over a newer session: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exiting_loop_clears_its_own_generation_and_emits_idle() {
+        // The fix must not regress the normal path: a loop whose generation still
+        // owns the slot clears it and emits the single terminal idle on a clean
+        // exit.
+        const GEN: u64 = 7;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> = Arc::new(TokioMutex::new(None));
+        *slot.lock().await = Some(fake_active_session(GEN));
+
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (log, emit) = collect_emit();
+
+        run_read_loop(
+            frame_stream(vec![]),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN,
+            Arc::new(AtomicU64::new(GEN + 1)), // this loop is the latest start
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+        )
+        .await;
+
+        assert!(
+            slot.lock().await.is_none(),
+            "own-generation slot must be cleared on clean exit (koe-ego)"
+        );
+        let emitted: Vec<_> = log.lock().unwrap().clone();
+        assert!(
+            emitted.iter().any(|(s, _)| s == "idle"),
+            "clean exit must emit the terminal idle: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn none_arm_stays_silent_when_a_newer_start_has_begun() {
+        // koe-ego None-arm case (Codex MCP + Codex Cloud R-C): after stop_session
+        // takes our handle (slot None), a NEWER start_session can begin and even
+        // FAIL before storing an ActiveSession (connect/setup/audio error) — the
+        // slot stays None but the generation counter has advanced past us. The old
+        // loop's terminal slot-clear must then stay silent, so its `idle` cannot
+        // land over the newer (failed) start's `error` (else a failed reconnect
+        // during a restart would be wrongly cleared to idle).
+        const GEN_A: u64 = 1;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> = Arc::new(TokioMutex::new(None));
+        // Counter past GEN_A + 1: a newer start (generation GEN_A + 1) has begun,
+        // even though it left nothing in the slot (it failed before storing).
+        let counter = Arc::new(AtomicU64::new(GEN_A + 2));
+
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (log, emit) = collect_emit();
+
+        run_read_loop(
+            frame_stream(vec![]), // clean server-close exit (terminal_error = None → would-be idle)
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN_A,
+            Arc::clone(&counter),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+        )
+        .await;
+
+        let emitted: Vec<_> = log.lock().unwrap().clone();
+        assert!(
+            !emitted.iter().any(|(s, _)| s == "idle"),
+            "None-arm must stay silent when a newer start has begun: {emitted:?}"
+        );
+    }
+
     #[tokio::test]
     async fn function_call_frame_is_dispatched_and_result_sent() {
         let disp = Arc::new(RecordingDispatcher { calls: StdMutex::new(Vec::new()) });
@@ -1029,6 +1506,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1104,6 +1583,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1182,6 +1663,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1232,6 +1715,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1268,6 +1753,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1387,6 +1874,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1448,6 +1937,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1498,6 +1989,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1537,6 +2030,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1582,6 +2077,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1618,6 +2115,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1662,6 +2161,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1723,6 +2224,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             audio_handler,
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
@@ -1766,6 +2269,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
             mic_running,
             move |_| { sac.store(true, Ordering::SeqCst); },
@@ -1812,6 +2317,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             move |_| { sc.store(true, Ordering::SeqCst); },
@@ -1862,6 +2369,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1907,6 +2416,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
@@ -1970,6 +2481,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(false)), // mic already lost → abnormal exit
             move |_| { sc.store(true, Ordering::SeqCst); },
@@ -2053,6 +2566,8 @@ mod tests {
             sd_rx,
             emit,
             Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
             |_| {},
             Arc::new(AtomicBool::new(true)),
             |_| {},
