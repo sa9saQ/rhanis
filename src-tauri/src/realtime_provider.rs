@@ -89,6 +89,29 @@ pub struct PendingCall {
     pub args_raw: String,
 }
 
+/// Which side of the conversation a [`ProviderEvent::Transcript`] turn came
+/// from. Maps to the `role` column of a stored `ConversationEvent` (koe-emd) via
+/// [`TranscriptRole::as_role_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptRole {
+    /// The user's spoken input, transcribed by the server.
+    User,
+    /// The assistant's spoken output, transcribed by the server.
+    Assistant,
+}
+
+impl TranscriptRole {
+    /// The `role` string persisted by `RecorderAdapter::log_conversation_event`.
+    /// Matches the values the existing sqlite tests already use ("user" /
+    /// "assistant"), so the conversation log stays consistent across callers.
+    pub fn as_role_str(self) -> &'static str {
+        match self {
+            TranscriptRole::User => "user",
+            TranscriptRole::Assistant => "assistant",
+        }
+    }
+}
+
 /// One server frame normalized across providers. [`RealtimeProvider::parse_frame`]
 /// maps a provider's wire event (OpenAI `response.*`, later Gemini
 /// `BidiGenerateContent`) to one of these so the session loop stays
@@ -99,13 +122,23 @@ pub enum ProviderEvent {
     FunctionCall(PendingCall),
     /// A usage report to add to the cost tracker (OpenAI: `response.done`).
     Usage(Usage),
+    /// A **finalized** speech transcript turn — user input (OpenAI:
+    /// `conversation.item.input_audio_transcription.completed`) or assistant
+    /// output (OpenAI GA: `response.output_audio_transcript.done`). Carries the
+    /// finalized text only; streaming `.delta` events map to [`Ignored`] so each
+    /// turn is journalled exactly once (no fragmented / double rows). The session
+    /// loop persists it via the recorder (koe-emd).
+    ///
+    /// [`Ignored`]: ProviderEvent::Ignored
+    Transcript { role: TranscriptRole, text: String },
     /// Server audio output. PR1's OpenAI impl never emits this — the
     /// `audio_handler` closure in `run_read_loop` already consumes
     /// `response.audio.delta`. Declared as the forward type contract for PR2
     /// (Gemini audio + 16 kHz integration).
     #[allow(dead_code)]
     AudioDelta,
-    /// Transcript / ack / delta / unknown — the loop continues without action.
+    /// Streaming transcript delta / ack / blank transcript / unknown — the loop
+    /// continues without action (and records nothing).
     Ignored,
 }
 
@@ -156,6 +189,18 @@ impl RealtimeProvider for OpenAiRealtime {
     fn initial_frames(&self, tools: &[ToolSchema]) -> Vec<Message> {
         // `session.update` advertising the dispatcher's tools so the model can
         // issue function calls (else the dispatch loop is permanently idle).
+        //
+        // koe-emd note: USER-speech transcripts require enabling
+        // `session.audio.input.transcription`, which turns on a SEPARATELY-BILLED
+        // ASR model. Enabling it here without also metering its
+        // `conversation.item.input_audio_transcription.completed.usage` into the
+        // CostTracker would leak the fail-closed monthly budget (koe's core
+        // invariant), so the enable + the ASR cost metering are coupled in a
+        // dedicated follow-up (koe-ef8 prerequisite) where the live usage shape is
+        // verified. Until then the user-transcript RECORDING path is wired and
+        // unit-tested but dormant in production; assistant transcripts
+        // (`response.output_audio_transcript.done`, emitted by default for audio
+        // output) and tool turns are recorded today.
         let session_update = serde_json::json!({
             "type": "session.update",
             "session": { "tools": tools, "tool_choice": "auto" }
@@ -208,6 +253,27 @@ impl RealtimeProvider for OpenAiRealtime {
             // loop, so the normalized path ignores them (PR1). PR2 will route
             // Gemini audio through `ProviderEvent::AudioDelta`.
             Some("response.audio.delta") => ProviderEvent::Ignored,
+            // Finalized user-speech transcription (koe-emd). The matching
+            // `.delta` stream falls through to `_ => Ignored`, so only the
+            // completed turn is journalled. NOTE: the server only sends this once
+            // `session.audio.input.transcription` is enabled — deliberately NOT
+            // enabled yet (see `initial_frames`): enabling it + metering its ASR
+            // cost is a coupled follow-up, so this arm is wired + unit-tested but
+            // dormant in production today.
+            Some("conversation.item.input_audio_transcription.completed") => {
+                transcript_event(event, TranscriptRole::User)
+            }
+            // Finalized assistant-speech transcript (koe-emd). The GA Realtime
+            // event is `response.output_audio_transcript.done`; the superseded
+            // beta interface used `response.audio_transcript.done`. Match both so
+            // the log fills regardless of which the live handshake selects (the
+            // exact server event shape is confirmed in koe-ef8 Windows E2E). Both
+            // carry the final text in `transcript`; the `.delta` stream is
+            // ignored below so the turn is recorded once.
+            Some("response.output_audio_transcript.done")
+            | Some("response.audio_transcript.done") => {
+                transcript_event(event, TranscriptRole::Assistant)
+            }
             _ => ProviderEvent::Ignored,
         }
     }
@@ -232,6 +298,21 @@ fn parse_usage(event: &Value) -> Option<Usage> {
         audio_output_tokens: get(output, "audio_tokens"),
         text_output_tokens: get(output, "text_tokens"),
     })
+}
+
+/// Builds a [`ProviderEvent::Transcript`] from a transcript-bearing frame, or
+/// [`ProviderEvent::Ignored`] when the `transcript` field is missing or blank —
+/// so a silent / empty turn never becomes an empty conversation-log row
+/// (koe-emd). The text is kept verbatim; its size is already bounded by the
+/// `MAX_WS_TEXT_BYTES` frame cap applied in `run_read_loop` before parsing.
+fn transcript_event(event: &Value, role: TranscriptRole) -> ProviderEvent {
+    match event.get("transcript").and_then(Value::as_str) {
+        Some(text) if !text.trim().is_empty() => ProviderEvent::Transcript {
+            role,
+            text: text.to_string(),
+        },
+        _ => ProviderEvent::Ignored,
+    }
 }
 
 // ---- provider selection ------------------------------------------------------
@@ -421,6 +502,107 @@ mod tests {
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({ "type": "response.created" });
         assert!(matches!(p.parse_frame(&ev), ProviderEvent::Ignored));
+    }
+
+    // ---- transcript (koe-emd) ------------------------------------------------
+
+    #[test]
+    fn transcript_role_maps_to_recorder_role_string() {
+        // The stored `role` must match the values the sqlite tests already use.
+        assert_eq!(TranscriptRole::User.as_role_str(), "user");
+        assert_eq!(TranscriptRole::Assistant.as_role_str(), "assistant");
+    }
+
+    #[test]
+    fn parse_frame_maps_user_input_transcription_completed() {
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "do a web search please"
+        });
+        match p.parse_frame(&ev) {
+            ProviderEvent::Transcript { role, text } => {
+                assert_eq!(role, TranscriptRole::User);
+                assert_eq!(text, "do a web search please");
+            }
+            _ => panic!("expected user Transcript"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_maps_assistant_transcript_ga_event() {
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "response.output_audio_transcript.done",
+            "transcript": "here are the results"
+        });
+        match p.parse_frame(&ev) {
+            ProviderEvent::Transcript { role, text } => {
+                assert_eq!(role, TranscriptRole::Assistant);
+                assert_eq!(text, "here are the results");
+            }
+            _ => panic!("expected assistant Transcript"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_maps_assistant_transcript_beta_event() {
+        // The superseded beta interface used `response.audio_transcript.done`;
+        // matched as a fallback so the log fills regardless of the handshake.
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "response.audio_transcript.done",
+            "transcript": "beta path reply"
+        });
+        match p.parse_frame(&ev) {
+            ProviderEvent::Transcript { role, text } => {
+                assert_eq!(role, TranscriptRole::Assistant);
+                assert_eq!(text, "beta path reply");
+            }
+            _ => panic!("expected assistant Transcript"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_blank_or_missing_transcript_is_ignored() {
+        // A silent / empty turn must NOT produce an empty conversation-log row.
+        let p = OpenAiRealtime::new();
+        for ev in [
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "   "
+            }),
+            serde_json::json!({
+                "type": "response.output_audio_transcript.done",
+                "transcript": ""
+            }),
+            serde_json::json!({ "type": "response.output_audio_transcript.done" }),
+        ] {
+            assert!(matches!(p.parse_frame(&ev), ProviderEvent::Ignored));
+        }
+    }
+
+    #[test]
+    fn parse_frame_transcript_delta_is_ignored() {
+        // Streaming deltas are skipped so each turn is journalled exactly once
+        // (only the `.completed` / `.done` finalized event records).
+        let p = OpenAiRealtime::new();
+        for ev in [
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": "do a"
+            }),
+            serde_json::json!({
+                "type": "response.audio_transcript.delta",
+                "delta": "here"
+            }),
+            serde_json::json!({
+                "type": "response.output_audio_transcript.delta",
+                "delta": "here"
+            }),
+        ] {
+            assert!(matches!(p.parse_frame(&ev), ProviderEvent::Ignored));
+        }
     }
 
     // ---- select_provider -----------------------------------------------------

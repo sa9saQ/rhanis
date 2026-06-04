@@ -45,6 +45,7 @@ use crate::realtime_types::{DispatcherSeam, FunctionCall, ManagedDispatcher};
 use crate::secret_store::{ManagedSecretStore, OPENAI_KEY_NAME};
 use crate::settings_store::ManagedSettings;
 use crate::storage::adapter::{ManagedRecorder, RecorderAdapter};
+use crate::tool_dispatcher::MAX_TOOL_NAME_LEN;
 
 /// Hard session cap (also a coarse cost backstop). Mirrors CLAUDE.md's 30 min.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -250,6 +251,14 @@ async fn run_read_loop<S, F, A, SA>(
         return;
     }
 
+    // Conversation journal (koe-emd): records flow to a single writer task so a
+    // SQLite write never blocks the read loop and the function-call hot path
+    // gains no `await` (which would perturb the koe-wj2 in-flight cap). Bounded
+    // so a hostile model cannot grow journal memory without bound; on overflow a
+    // record is dropped (fail-soft) rather than stalling the loop.
+    let (rec_tx, rec_rx) = mpsc::channel::<ConversationRecord>(CONVERSATION_LOG_CAP);
+    let conversation_writer = spawn_conversation_writer(Arc::clone(&recorder), rec_rx);
+
     loop {
         tokio::select! {
             _ = &mut shutdown => {
@@ -293,8 +302,9 @@ async fn run_read_loop<S, F, A, SA>(
                         };
                         audio_handler(&event);
                         match handle_text(
-                            &event, &provider, &write_tx, &cost, &recorder, &dispatcher,
-                            &emit, &mut dispatch_tasks, &mut save_failures, &mut cap_warned,
+                            &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
+                            &dispatcher, &emit, &mut dispatch_tasks, &mut save_failures,
+                            &mut cap_warned,
                         ).await {
                             LoopAction::Continue => {}
                             // handle_text already emitted the terminal error
@@ -344,6 +354,12 @@ async fn run_read_loop<S, F, A, SA>(
         // Drain in-flight dispatches so their side effects + final frames finish.
         while dispatch_tasks.join_next().await.is_some() {}
     }
+    // Close the journal channel and flush its tail before the session ends so a
+    // record still in flight is persisted (the seam tests rely on this drain).
+    // Unconditional: turns that already happened belong in the history even on an
+    // abnormal exit.
+    drop(rec_tx);
+    let _ = conversation_writer.await;
     // Clear the session slot on EVERY exit (server close / budget / timeout /
     // shutdown) so a stale `Some` cannot permanently block the next
     // start_session. The read loop is the SINGLE place that emits a terminal
@@ -356,6 +372,59 @@ async fn run_read_loop<S, F, A, SA>(
     }
 }
 
+/// One conversation event queued for the journal writer (koe-emd). `role` /
+/// `kind` are fixed `&'static str` labels; `summary` is owned, pre-vetted safe
+/// content — a finalized transcript or a tool name, never tool arguments /
+/// results, paths, or the BYOK key (the recorder stores `summary` verbatim).
+struct ConversationRecord {
+    role: &'static str,
+    kind: &'static str,
+    summary: String,
+}
+
+/// Bounded backlog for the conversation journal (koe-emd). Turns are human-paced
+/// so this is never reached in normal use; it is purely a flood backstop so a
+/// hostile model spamming function calls cannot grow journal memory without
+/// bound. On overflow the record is dropped (best-effort journalling, fail-soft)
+/// rather than blocking the read loop. See [`spawn_conversation_writer`].
+const CONVERSATION_LOG_CAP: usize = 256;
+
+/// Spawns the conversation journal writer (koe-emd): a single task that drains
+/// records in send order and persists each via the recorder, so the read loop
+/// never blocks on a SQLite write and never adds an `await` to the function-call
+/// hot path (an `await` there would let the koe-wj2 in-flight cap reap an
+/// instant dispatch and admit more than `MAX_INFLIGHT_DISPATCHES`).
+///
+/// Ordering: a single FIFO consumer + sequential `await` means insert order ==
+/// send order == frame order, so `list_recent_events` (ordered by row id)
+/// reflects the conversation timeline. Each write runs on the blocking pool
+/// (mirrors `save_cost_snapshot`) so it never blocks an async worker.
+///
+/// Fail-soft: a store error is logged (content-free) and skipped — a failed
+/// journal write is a side effect, never a reason to stop the session (contrast
+/// the cost snapshot, which is a billing safety invariant). The caller drops the
+/// sender and `await`s the returned handle on loop exit so the tail is flushed.
+fn spawn_conversation_writer(
+    recorder: Arc<dyn RecorderAdapter>,
+    mut rx: mpsc::Receiver<ConversationRecord>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(rec) = rx.recv().await {
+            let r = Arc::clone(&recorder);
+            let stored = tokio::task::spawn_blocking(move || {
+                r.log_conversation_event(rec.role, rec.kind, &rec.summary)
+            })
+            .await;
+            if !matches!(stored, Ok(Ok(_))) {
+                // Content-free (no role / summary / path) so a dropped write is
+                // observable without leaking the turn. The writer keeps draining
+                // — one bad write never abandons later records.
+                eprintln!("[session] conversation event not recorded (store unavailable)");
+            }
+        }
+    })
+}
+
 /// Handles one decoded server frame via the provider's normalizer. Returns
 /// whether to keep looping.
 #[allow(clippy::too_many_arguments)]
@@ -365,6 +434,7 @@ async fn handle_text<F>(
     write_tx: &mpsc::Sender<Message>,
     cost: &Arc<TokioMutex<CostTracker>>,
     recorder: &Arc<dyn RecorderAdapter>,
+    rec_tx: &mpsc::Sender<ConversationRecord>,
     dispatcher: &Arc<dyn DispatcherSeam>,
     emit: &F,
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
@@ -401,6 +471,26 @@ where
             // Back below the cap — re-arm the latch so the next saturation
             // episode logs once more.
             *cap_warned = false;
+
+            // Journal the tool invocation (koe-emd). The tool NAME is a fixed,
+            // safe identifier — no arguments / result, so no PII / secret reaches
+            // the log; the result-content path stays owned by the dispatcher's
+            // own redaction. `try_send` is synchronous (no `await` in this hot
+            // path, so the koe-wj2 cap dynamics are unchanged) and FIFO-ordered
+            // with the surrounding transcripts; a full backlog drops the record
+            // (fail-soft) rather than blocking the loop. The name is bounded by
+            // MAX_TOOL_NAME_LEN — the same cap the dispatcher applies — so a
+            // hostile model cannot drive an oversized string into a persisted
+            // row; an over-long name is left unjournalled because the dispatcher
+            // will reject it ("tool name too long") and it never advances the
+            // conversation.
+            if pending.name.len() <= MAX_TOOL_NAME_LEN {
+                let _ = rec_tx.try_send(ConversationRecord {
+                    role: "tool",
+                    kind: "tool",
+                    summary: pending.name.clone(),
+                });
+            }
 
             // Only now that the cap has admitted the call do we parse the
             // (already size-capped) arguments. Default to null so a malformed blob
@@ -450,6 +540,18 @@ where
                 emit("error", Some("monthly budget exceeded"));
                 return LoopAction::Stop; // fail-closed
             }
+            LoopAction::Continue
+        }
+        ProviderEvent::Transcript { role, text } => {
+            // Journal a user / assistant speech turn (koe-emd). kind="speech"
+            // matches the existing sqlite tests. `try_send` is non-blocking and
+            // FIFO-ordered; a full backlog drops the turn (fail-soft) so a
+            // journal write can never stall or stop the conversation.
+            let _ = rec_tx.try_send(ConversationRecord {
+                role: role.as_role_str(),
+                kind: "speech",
+                summary: text,
+            });
             LoopAction::Continue
         }
         // PR1: OpenAI's parse_frame never emits AudioDelta (the audio_handler seam
@@ -699,6 +801,7 @@ pub async fn stop_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
 
     use base64::Engine as _;
@@ -739,7 +842,8 @@ mod tests {
         }
     }
 
-    /// Minimal recorder double; save_cost_snapshot succeeds, the rest is unused.
+    /// Minimal recorder double; conversation logging + cost-snapshot saves
+    /// succeed (so neither stops the loop), the rest is unused.
     struct OkRecorder;
     impl RecorderAdapter for OkRecorder {
         fn save_note(&self, _t: &str) -> Result<i64, RecorderError> {
@@ -749,7 +853,53 @@ mod tests {
             unimplemented!()
         }
         fn log_conversation_event(&self, _r: &str, _k: &str, _s: &str) -> Result<i64, RecorderError> {
+            Ok(0)
+        }
+        fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
             unimplemented!()
+        }
+        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<(), RecorderError> {
+            Ok(())
+        }
+        fn load_cost_snapshot(&self, _m: u32) -> Result<Option<u64>, RecorderError> {
+            Ok(None)
+        }
+        fn health_check(&self) -> Result<(), RecorderError> {
+            Ok(())
+        }
+    }
+
+    /// Captured `(role, kind, summary)` tuples shared with a test after a run.
+    type RecordedEvents = Arc<StdMutex<Vec<(String, String, String)>>>;
+
+    /// Recorder double that captures every `log_conversation_event` call in
+    /// order (koe-emd) so a test can assert the journalled sequence + role/kind.
+    /// Cost-snapshot saves succeed so the cost path never stops the loop.
+    struct RecordingRecorder {
+        events: RecordedEvents,
+    }
+    impl RecordingRecorder {
+        fn new() -> (Self, RecordedEvents) {
+            let events = RecordedEvents::default();
+            (
+                Self {
+                    events: Arc::clone(&events),
+                },
+                events,
+            )
+        }
+    }
+    impl RecorderAdapter for RecordingRecorder {
+        fn save_note(&self, _t: &str) -> Result<i64, RecorderError> {
+            unimplemented!()
+        }
+        fn list_recent_notes(&self, _l: u32) -> Result<Vec<Note>, RecorderError> {
+            unimplemented!()
+        }
+        fn log_conversation_event(&self, role: &str, kind: &str, summary: &str) -> Result<i64, RecorderError> {
+            let mut e = self.events.lock().unwrap();
+            e.push((role.to_string(), kind.to_string(), summary.to_string()));
+            Ok(e.len() as i64)
         }
         fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
             unimplemented!()
@@ -825,6 +975,92 @@ mod tests {
         let f2 = write_rx.recv().await.expect("response.create frame");
         assert!(matches!(f1, Message::Text(_)));
         assert!(matches!(f2, Message::Text(_)));
+    }
+
+    // ---- conversation log wiring (koe-emd) -----------------------------------
+
+    #[tokio::test]
+    async fn conversation_turns_are_recorded_in_frame_order() {
+        // The core wiring contract: a user-speech transcript, a tool invocation,
+        // and an assistant-speech transcript are journalled in frame order with
+        // the role/kind the ConversationEvent type expects. Records flow through a
+        // single bounded mpsc (FIFO) via non-blocking try_send on the read loop,
+        // drained by one writer task that awaits each write sequentially, so send
+        // order == insert order == frame order (list_recent_events orders by row
+        // id). The drain on loop exit (drop(rec_tx) + writer.await) flushes the
+        // tail, so all three records are persisted before run_read_loop returns.
+        //
+        // Streaming `.delta` frames are interleaved before each finalized turn to
+        // prove exactly-once end to end: deltas map to Ignored, so the recorded
+        // vector still contains only the finalized turns (no fragment / no dupe).
+        let (rec, events) = RecordingRecorder::new();
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        // Keep the receiver alive so the dispatch task's sends don't fail-fast.
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        let frames = vec![
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": "search the"
+            }),
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "search the web for rust"
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.done",
+                "call_id": "call_1",
+                "name": "web_search",
+                "arguments": "{\"q\":\"rust\"}"
+            }),
+            serde_json::json!({
+                "type": "response.output_audio_transcript.delta",
+                "delta": "here is"
+            }),
+            serde_json::json!({
+                "type": "response.output_audio_transcript.done",
+                "transcript": "here is what I found"
+            }),
+        ];
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(rec) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+        )
+        .await;
+
+        let recorded = events.lock().unwrap();
+        assert_eq!(
+            recorded.as_slice(),
+            [
+                (
+                    "user".to_string(),
+                    "speech".to_string(),
+                    "search the web for rust".to_string()
+                ),
+                ("tool".to_string(), "tool".to_string(), "web_search".to_string()),
+                (
+                    "assistant".to_string(),
+                    "speech".to_string(),
+                    "here is what I found".to_string()
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -984,7 +1220,10 @@ mod tests {
             unimplemented!()
         }
         fn log_conversation_event(&self, _r: &str, _k: &str, _s: &str) -> Result<i64, RecorderError> {
-            unimplemented!()
+            // Fails like every write here; not exercised by the cost-snapshot
+            // test below, but a real (non-panicking) error keeps this double safe
+            // if a future test routes a transcript / tool frame through it.
+            Err(RecorderError::Db)
         }
         fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
             unimplemented!()
@@ -998,6 +1237,217 @@ mod tests {
         fn health_check(&self) -> Result<(), RecorderError> {
             Ok(())
         }
+    }
+
+    /// Recorder whose conversation-log writes always fail but whose cost snapshot
+    /// succeeds — isolates the koe-emd fail-soft path (a failed log must NOT stop
+    /// the session) from the cost-tracking fail-closed path. Counts log attempts
+    /// so a test can prove the failing write was actually attempted-and-swallowed
+    /// (not merely never sent).
+    struct LogFailRecorder {
+        log_attempts: Arc<AtomicUsize>,
+    }
+    impl LogFailRecorder {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let n = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    log_attempts: Arc::clone(&n),
+                },
+                n,
+            )
+        }
+    }
+    impl RecorderAdapter for LogFailRecorder {
+        fn save_note(&self, _t: &str) -> Result<i64, RecorderError> {
+            unimplemented!()
+        }
+        fn list_recent_notes(&self, _l: u32) -> Result<Vec<Note>, RecorderError> {
+            unimplemented!()
+        }
+        fn log_conversation_event(&self, _r: &str, _k: &str, _s: &str) -> Result<i64, RecorderError> {
+            self.log_attempts.fetch_add(1, Ordering::Relaxed);
+            Err(RecorderError::Db)
+        }
+        fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
+            unimplemented!()
+        }
+        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<(), RecorderError> {
+            Ok(())
+        }
+        fn load_cost_snapshot(&self, _m: u32) -> Result<Option<u64>, RecorderError> {
+            Ok(None)
+        }
+        fn health_check(&self) -> Result<(), RecorderError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_conversation_log_does_not_stop_session() {
+        // A recorder error on a transcript / tool turn must be swallowed
+        // (koe-emd fail-soft): the loop keeps processing later frames (the tool
+        // still dispatches) and exits cleanly (idle), never an error status.
+        let disp = Arc::new(RecordingDispatcher { calls: StdMutex::new(Vec::new()) });
+        let (rec, log_attempts) = LogFailRecorder::new();
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (log, emit) = collect_emit();
+
+        let frames = vec![
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "hello there"
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.done",
+                "call_id": "call_1",
+                "name": "web_search",
+                "arguments": "{}"
+            }),
+        ];
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(rec) as Arc<dyn RecorderAdapter>,
+            disp.clone() as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+        )
+        .await;
+
+        // Both journal writes (the transcript + the tool turn) were actually
+        // attempted and the errors swallowed — not silently skipped. run_read_loop
+        // awaits the writer before returning, so the count is settled here.
+        assert_eq!(
+            log_attempts.load(Ordering::Relaxed),
+            2,
+            "both the transcript and tool turns must reach (and fail at) the recorder"
+        );
+        // The loop continued past the failed transcript record and dispatched.
+        assert_eq!(disp.calls.lock().unwrap().as_slice(), ["web_search"]);
+        // It exited cleanly: no error status despite both log writes failing.
+        let emits = log.lock().unwrap();
+        assert!(
+            !emits.iter().any(|(s, _)| s == "error"),
+            "a failed log must not emit error: {emits:?}"
+        );
+        assert!(
+            emits.iter().any(|(s, _)| s == "idle"),
+            "expected idle on normal close: {emits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_frame_is_not_journalled() {
+        // Invariant 2 (no double recording): usage is persisted via the cost
+        // snapshot, NOT the conversation log. A response.done usage frame must
+        // produce ZERO conversation rows — guards against a future contributor
+        // "also logging usage" in the Usage arm, which would double-record turns.
+        let (rec, events) = RecordingRecorder::new();
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        let frames = vec![serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": {
+                "input_token_details": { "audio_tokens": 10, "text_tokens": 1, "cached_tokens": 0 },
+                "output_token_details": { "audio_tokens": 20, "text_tokens": 2 }
+            }}
+        })];
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(rec) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+        )
+        .await;
+
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a usage frame must not produce a conversation-log row (cost snapshot owns usage)"
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_turn_survives_abnormal_exit() {
+        // The tail-drain on loop exit is unconditional: a turn that already
+        // happened must be persisted even when the session ends abnormally (here a
+        // connection error). Guards the "turns belong in the history even on an
+        // abnormal exit" contract — a regression that moved the drain into the
+        // normal-close branch would lose the tail on every error exit.
+        let (rec, events) = RecordingRecorder::new();
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (log, emit) = collect_emit();
+        // A user transcript, then an abnormal connection-error exit.
+        let stream = futures_util::stream::iter(vec![
+            Ok(Message::Text(
+                serde_json::json!({
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "remember this"
+                })
+                .to_string()
+                .into(),
+            )),
+            Err(WsError::ConnectionClosed),
+        ]);
+        run_read_loop(
+            stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(rec) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+        )
+        .await;
+
+        // The abnormal exit emitted the terminal error...
+        assert!(
+            log.lock().unwrap().iter().any(|(s, _)| s == "error"),
+            "expected a terminal error status on abnormal exit"
+        );
+        // ...yet the turn that already happened was still flushed to the journal.
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [("user".to_string(), "speech".to_string(), "remember this".to_string())]
+        );
     }
 
     #[tokio::test]
