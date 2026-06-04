@@ -13,7 +13,7 @@
   - **上級設定（技術層）**: BYOK + アプリ本体有料化（買い切り or ソフト月額）。廃止せず奥に退避
   - 接続層を `RealtimeAuth` enum (`ManagedCredit` 主役 / `Byok` 退避) で抽象化
   - **従量課金（後払い meter）は採用しない**（使った後の高額請求を避ける、前払い消費型）。**月額固定サブスクも採用しない**（音声 API コスト構造で赤字確定のため）
-- **対象 OS**: M1 = Windows のみ、M3 で Mac 追加
+- **対象 OS**: M1 = Windows のみ、M3 で Mac 追加 → **将来 Windows/Linux/Mac の3OS（user 方針 2026-06-04、`koe-cgw`。Tauri は3対応、Linux は cpal/AppImage/署名が追加作業）**
 - **重要な開発環境制約**: WSL ではマイク（cpal）が動作不可。コード作成・cargo test（純粋ロジック）は WSL で OK、音声/E2E は **ネイティブ Windows 必須**
 
 ## Plan Reference (SoT)
@@ -144,6 +144,7 @@ M1 では `.env` 不使用。API キーはユーザーがアプリ UI で入力 
 - **製品方向（2026-06）**: multi-provider キー設定基盤 `koe-31u` ✅ merged（#20。声 = OpenAI / Google 選択 + 手足 tool キーの暗号保管 + 設定 UI）→ 接続層 trait 化 `koe-zv3` **PR1 ✅ merged**（#25 `81576bf`。`RealtimeProvider` trait 抽象化 + OpenAI 切り出しの挙動不変リファクタ。realtime_provider.rs 新設 = trait + `ProviderEvent` enum + `RealtimeAuth` 移動 + `OpenAiRealtime` + `select_provider`。333 tests green）→ **次**: `koe-y1j`（PR2 = `GeminiLive` impl + `google/*` 実配線 + audio 16kHz 入力 + fallback chain。Plan の PR2 セクション参照）+ 手足 tool `koe-eal`（x_search 等を tool_dispatcher に追加。`tool_providers` フラグと各プロバイダキーを consume）。許可ポリシー層 `koe-351` ✅ merged（#29 `c1740f9`。フォルダ/URL allowlist + 禁止 denylist + ビジュアル編集。禁止>許可>既定 fail-closed、組み込み baseline 非上書き、IDNA host マッチ、UI→settings_store→`SettingsPolicyProvider`→dispatcher 端まで配線。383 cargo + 187 vitest green）
 - **follow-up（review 派生）**: `koe-rxh` ✅ merged（#23, 承認待ち cap = modal-flood + approval-map guard）/ `koe-a4h` ✅ merged（#22, clippy never_loop/absurd）→ `koe-e2b`（P2, koe-rxh の R-C で Codex 捕捉。approval cap は `register()` で効くが dispatch slot 消費は task `spawn` 時点なので、64 DANGER 連射の spawn-burst で一時的に starvation が残る。根本解決 = spawn 前の risk-aware admission（DispatcherSeam に `try_admit`）。**koe-zv3 PR1 完了で着手しやすく**: handle_text が `ProviderEvent::FunctionCall(PendingCall)` 分岐 + typed value なので try_admit を cap check 周辺に挿せる、approval cap は backstop）/ `koe-2br`（P2 bug, koe-zv3 #25 で CodeRabbit Major 捕捉。`response.done` usage 解析失敗時の fail-open を fail-closed 化。既存挙動で「usage なし正常 vs malformed」区別 + koe-ef8 で実 payload 確認後）
 - **koe-351 派生 follow-up**: `koe-6as`（P2, 許可フォルダを `validation.rs` の `allowed_bases` に連動 = 承認だけでなく IO 書込境界も拡張、段階導入）/ `koe-gap`（P2, open_url query/userinfo・web_search 経由の exfil 深掘り、open_url 実装時に「外部送信」カテゴリ化）/ `koe-1zw`（P3, policy 再読込の dispatch 毎 load をキャッシュ化）/ `koe-eh4`（P3, model 制御の tool 名が event/approval payload に出る既存挙動の hardening）/ `koe-vxg`（P3, macOS baseline `/private/*`・`~/Library` + Windows case-fold テスト）
+- **2026-06-04 技術スカウト（最新技術を koe に）**: 研究 `~/research/koe-integration-tech-2026-06/report.md`（7次元+定量実験）。**自前 realtime 音声の答え = Qwen3.5-Omni（2026-03-30, Apache 2.0, semantic interruption=barge-in / tool / voice clone / realtime / 音声生成36言語に日本語）一択**（Gemma4+Miso=英語不可 / cascaded=847ms>700ms で却下）。経済性=自前 H100 で OpenAI Realtime の **10-36x 安**、損益分岐 月42-100h。中心思想シナジー=自前なら隠れ状態で SEP（校正信号）が取れる（BYOK API 不可）。**ただし全て M2以降 or 将来（`koe-aja` post-M1、学習不要・そのまま動く、日本語視聴は着手時の最初の spike）で M1 は変更なし**。STT/TTS=Deepgram Nova-3+Qwen3-TTS/ASR（`koe-eru`）/ 手足=MCP client 化（`koe-eal`+`koe-dcj`）/ メモリ=Zep bi-temporal+Letta（`koe-9ds`）/ 校正=conformal/ACI（`koe-sua.2/.4`/`koe-1r1`）。session memory=`koe-2026-06-04-tech-scout-session` / `koe-selfhosted-voice-vision`
 - タスクの最新状態は markdown ではなく **bd**（`bd ready` / `bd show <id>`）が真実の源。本節は節目の要約のみに留める
 
 詳細マイルストーンは `~/.claude/plans/virtual-riding-hearth.md` 参照。
