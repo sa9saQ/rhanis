@@ -357,22 +357,32 @@ async fn run_read_loop<S, F, A, SA>(
         // Drain in-flight dispatches so their side effects + final frames finish.
         while dispatch_tasks.join_next().await.is_some() {}
     }
-    // Close the journal channel and flush its tail before the session ends so a
-    // record still in flight is persisted (the seam tests rely on this drain).
-    // Unconditional: turns that already happened belong in the history even on an
-    // abnormal exit.
-    drop(rec_tx);
-    let _ = conversation_writer.await;
     // Clear the session slot on EVERY exit (server close / budget / timeout /
     // shutdown) so a stale `Some` cannot permanently block the next
     // start_session. The read loop is the SINGLE place that emits a terminal
     // status (stop_session relies on this), so there is never a double idle.
+    //
+    // This is done BEFORE the journal flush below: clearing the slot must not be
+    // delayed by the conversation-writer drain, otherwise koe-emd would widen the
+    // pre-existing stop_session->start_session slot-handover window (stop_session
+    // takes the slot, then a racing start_session could store a new ActiveSession
+    // that this exiting loop would then clear). Keeping the slot-clear at the same
+    // point as before koe-emd holds that window at its prior size. The residual
+    // pre-existing race (this loop can still clear a *newer* session's slot) is a
+    // separate session-lifecycle fix tracked as a follow-up (generation-id guard).
     session.lock().await.take();
     // Only a clean stop/close transitions to idle; an error exit leaves the
     // already-emitted `error` as the terminal status so the UI keeps the reason.
     if !ended_with_error {
         emit("idle", None);
     }
+    // Close the journal channel and flush its tail before run_read_loop returns so
+    // a record still in flight is persisted (the seam tests rely on this drain).
+    // Unconditional: turns that already happened belong in the history even on an
+    // abnormal exit. Done last (after the slot-clear) so journalling never delays
+    // the session-status transition or the slot handover.
+    drop(rec_tx);
+    let _ = conversation_writer.await;
 }
 
 /// One conversation event queued for the journal writer (koe-emd). `role` /
@@ -436,8 +446,17 @@ fn spawn_conversation_writer(
 /// next successful send) so a sustained flood cannot turn the drop into a
 /// stderr-backpressure DoS — while still surfacing the audit gap koe-emd exists
 /// to close (a silently-dropped record is exactly the "log is empty" failure we
-/// are fixing). `Closed` (writer task gone — an anomaly, the writer outlives the
-/// loop) is reported distinctly from `Full` (backlog saturated under flood).
+/// are fixing). `Closed` (writer task gone) is reported distinctly from `Full`
+/// (backlog saturated under flood).
+///
+/// `Full` and `Closed` share one `drop_warned` latch. That is sufficient because
+/// `Closed` is effectively unreachable during the read loop: the writer task
+/// owns the receiver and outlives the loop (the channel only closes when the loop
+/// drops `rec_tx` on exit), and the writer body cannot panic (its only fallible
+/// call, the recorder write, is a `spawn_blocking` whose `JoinError`/`Err` is
+/// handled, not unwrapped). So a `Full`-latched-then-`Closed` gap cannot occur in
+/// practice; if the writer is ever made fallible mid-loop, split the latch (per
+/// the koe-a4f follow-up).
 fn enqueue_record(
     rec_tx: &mpsc::Sender<ConversationRecord>,
     record: ConversationRecord,
