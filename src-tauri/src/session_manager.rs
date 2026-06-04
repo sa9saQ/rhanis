@@ -729,25 +729,43 @@ async fn handle_text(
                     }
                     // The WRITE failed, but the persisted total is usually still
                     // READABLE (e.g. write-lock contention / disk-full hit the
-                    // INSERT, not a SELECT). Read it back and gate on
-                    // max(persisted, local) so a handover sibling's over-cap spend
-                    // still stops THIS session across a transient write failure,
-                    // instead of charging fail-open on the stale local baseline for
-                    // up to MAX_SNAPSHOT_SAVE_FAILURES-1 more frames. If the read
-                    // ALSO fails (DB fully down) we degrade to the local total; the
-                    // failure counter above stays the durability backstop.
+                    // INSERT, not a SELECT). Recover the authoritative total with a
+                    // read so a handover sibling's over-cap spend still stops THIS
+                    // session across a transient write failure, instead of charging
+                    // fail-open on the stale local baseline.
                     let rec_read = Arc::clone(recorder);
-                    let loaded = tokio::task::spawn_blocking(move || {
+                    let readback = tokio::task::spawn_blocking(move || {
                         rec_read.load_cost_snapshot(effective_month)
                     })
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .flatten()
-                    .unwrap_or(0);
-                    loaded.max(local_total)
+                    .await;
+                    match readback {
+                        // Read OK: the persisted total (None = no snapshot yet this
+                        // month = a known 0) is the authoritative cross-session lower
+                        // bound; gate on max(persisted, local).
+                        Ok(Ok(persisted)) => persisted.unwrap_or(0).max(local_total),
+                        // Both the WRITE and the READ failed → the authoritative
+                        // balance is UNKNOWN. Fail-closed: an unknown balance must
+                        // never permit continued charging (koe rule: unknown / error
+                        // / timeout reject rather than default to allowing spend).
+                        _ => return LoopAction::Stop("cost tracking unavailable"),
+                    }
                 }
             };
+            // Rebase the session-LOCAL tracker UP to the authoritative cross-session
+            // total for this month (koe-ixt, Codex P1). Otherwise, once this
+            // session's local total overtakes a handover sibling's snapshot, the
+            // next monotonic max() discards the sibling's contribution and the gate
+            // fails open by that amount. Absorbing it means subsequent usage
+            // accumulates ON TOP of the combined total and is persisted forward.
+            // Guarded on the effective month and only ever RAISES the total, so it
+            // preserves the within-month monotonic + saturating invariants and can
+            // only tighten (never loosen) the budget gate.
+            {
+                let mut c = cost.lock().await;
+                if c.current_month == effective_month {
+                    c.month_total_nanodollars = c.month_total_nanodollars.max(authoritative_total);
+                }
+            }
             // Fail-closed against the AUTHORITATIVE (cross-session) total, not just
             // this session's local total, so a handover sibling's spend stops THIS
             // session too. Terminal error emitted by finalize_session_slot under the
@@ -1938,11 +1956,15 @@ mod tests {
             matches!(b_result, LoopAction::Stop("monthly budget exceeded")),
             "newer session B must fail-closed on the global persisted total, not its stale local baseline (koe-ixt mechanism 4)"
         );
-        // Proof the stop came from the GLOBAL total, not B's local one: B's local
-        // tracker alone is still under the cap.
-        assert!(
-            !cost_b.lock().await.is_over_budget(),
-            "B's local total ($11) must be under the cap — the stop must come from the shared global total"
+        // After the fix B's tracker is REBASED up to the authoritative
+        // cross-session total ($40), absorbing A's handover spend so a subsequent
+        // frame would accumulate on top (no max-vs-sum drift). B's own pre-frame
+        // spend was only $11 (< the $32 cap), so the stop provably came from the
+        // shared global total, not B's local baseline.
+        assert_eq!(
+            cost_b.lock().await.month_total_nanodollars,
+            40 * NANODOLLARS_PER_USD,
+            "B's tracker must rebase up to the authoritative cross-session total (absorbing the sibling's spend)"
         );
     }
 
@@ -2017,6 +2039,114 @@ mod tests {
         assert!(
             !map.contains_key(&current_yyyymm()),
             "usage must NOT persist under the raw observed clock month"
+        );
+    }
+
+    /// Recorder whose cost-snapshot SAVE *and* LOAD both fail — models a DB that is
+    /// fully unavailable, so the authoritative balance is unknowable.
+    struct ReadWriteFailRecorder;
+    impl RecorderAdapter for ReadWriteFailRecorder {
+        fn save_note(&self, _t: &str) -> Result<i64, RecorderError> {
+            unimplemented!()
+        }
+        fn list_recent_notes(&self, _l: u32) -> Result<Vec<Note>, RecorderError> {
+            unimplemented!()
+        }
+        fn log_conversation_event(&self, _r: &str, _k: &str, _s: &str) -> Result<i64, RecorderError> {
+            unimplemented!()
+        }
+        fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
+            unimplemented!()
+        }
+        fn save_cost_snapshot(&self, _m: u32, _n: u64) -> Result<u64, RecorderError> {
+            Err(RecorderError::Db)
+        }
+        fn load_cost_snapshot(&self, _m: u32) -> Result<Option<u64>, RecorderError> {
+            Err(RecorderError::Db)
+        }
+        fn health_check(&self) -> Result<(), RecorderError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn readback_failure_after_save_failure_stops_fail_closed_immediately() {
+        // koe-ixt (CodeRabbit Major): when BOTH the snapshot SAVE and the recovery
+        // READ fail, the authoritative balance is UNKNOWN. Fail-closed — stop with
+        // "cost tracking unavailable" IMMEDIATELY (on the first failure), NOT after
+        // MAX_SNAPSHOT_SAVE_FAILURES: an unknown balance must never permit continued
+        // charging. (Contrast Ok(None) = a known-empty month, which falls through to
+        // the local-total gate + the failure counter — see
+        // repeated_snapshot_save_failure_stops_fail_closed / FailingRecorder.)
+        let month = current_yyyymm();
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig {
+                enabled: true,
+                monthly_limit_nanodollars: 32 * NANODOLLARS_PER_USD,
+            },
+            month,
+        )));
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(ReadWriteFailRecorder);
+        // A tiny, well-under-cap usage: the stop must come from the UNKNOWN balance,
+        // not from the budget gate.
+        let usage = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 1u64 } } }
+        });
+        let result = drive_usage(&usage, &provider, &recorder, &cost).await;
+        assert!(
+            matches!(result, LoopAction::Stop("cost tracking unavailable")),
+            "an unknown authoritative balance (save AND read both failed) must stop fail-closed on the first frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn handover_rebase_absorbs_sibling_spend_so_it_is_not_lost() {
+        // koe-ixt (Codex P1): after gating on a higher cross-session total, the
+        // session's LOCAL tracker is rebased UP to it, so a handover sibling's spend
+        // is absorbed and subsequent usage accumulates ON TOP (and is persisted
+        // forward), instead of being discarded by the next monotonic max() once the
+        // local total overtakes the sibling snapshot. Cap is high so the session
+        // keeps running across two frames.
+        let month = current_yyyymm();
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 1000 * NANODOLLARS_PER_USD,
+        };
+        let (rec, persisted) = SharedSnapshotRecorder::new();
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(rec);
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        // A sibling (A) left a $40 snapshot (its drained late spend); B starts at $0.
+        recorder.save_cost_snapshot(month, 40 * NANODOLLARS_PER_USD).unwrap();
+        let cost_b = Arc::new(TokioMutex::new(CostTracker::new(budget, month)));
+        // $10 usage = 312_500 audio-input tokens * 32_000 nanodollars.
+        let ten_dollars = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 312_500u64 } } }
+        });
+
+        // Frame 1: B spends $10 locally but rebases UP to the sibling's $40.
+        drive_usage(&ten_dollars, &provider, &recorder, &cost_b).await;
+        assert_eq!(
+            cost_b.lock().await.month_total_nanodollars,
+            40 * NANODOLLARS_PER_USD,
+            "B must rebase up to the sibling's $40 snapshot on the first frame (absorb, not discard)"
+        );
+
+        // Frame 2: B's next $10 accumulates ON TOP of the absorbed $40 → $50, and
+        // the combined total is persisted (NOT lost to max() as it would be without
+        // the rebase, where persisted would stay stuck at $40).
+        drive_usage(&ten_dollars, &provider, &recorder, &cost_b).await;
+        assert_eq!(
+            cost_b.lock().await.month_total_nanodollars,
+            50 * NANODOLLARS_PER_USD,
+            "B's spend must accumulate on top of the absorbed sibling total"
+        );
+        assert_eq!(
+            *persisted.lock().unwrap().get(&month).unwrap(),
+            50 * NANODOLLARS_PER_USD,
+            "the combined total (sibling $40 + B's $10) must be persisted, not lost to max()"
         );
     }
 
