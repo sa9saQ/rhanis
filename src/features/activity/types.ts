@@ -82,6 +82,39 @@ export interface SessionStatusEvent {
 }
 
 /**
+ * A point-in-time view of this month's spend + budget state (koe-9xi). Mirrors
+ * Rust `cost_tracker::CostSnapshot`; field names are snake_case (the backend uses
+ * no serde rename). Arrives two ways, both folded through the SAME store guard:
+ * the `get_cost_snapshot` command (pull, on mount) and the `cost-update` event
+ * (push, on each usage frame).
+ *
+ * Invariant: `over_budget` is decided in Rust by u64 comparison. The UI MUST show
+ * `over_budget` / `used_usd` / `remaining_usd` directly and MUST NOT recompute the
+ * over-budget state from the f64 values (judge in u64, display in f64). The
+ * `*_nanodollars` integers are carried for completeness (and the M4 prepaid UI),
+ * but exceed `Number.MAX_SAFE_INTEGER` at extreme values — never do math on them
+ * in JS; render the `*_usd` fields the backend already computed.
+ */
+export interface CostSnapshot {
+  /** Accounting month, YYYYMM. */
+  month: number;
+  /** Spend so far this month (nanodollars). Informational — render `used_usd`. */
+  used_nanodollars: number;
+  /** Cap in nanodollars, or null when the budget is disabled (unlimited). */
+  limit_nanodollars: number | null;
+  /** Whether a hard cap is active. */
+  enabled: boolean;
+  /** Reached/exceeded the cap (u64 `>=`, decided in Rust). false when unlimited. */
+  over_budget: boolean;
+  /** Monotonic sequence (shared counter); the store drops a stale lower one. */
+  sequence: number;
+  /** Display-only USD (used). */
+  used_usd: number;
+  /** Display-only USD remaining to the cap, or null when unlimited. */
+  remaining_usd: number | null;
+}
+
+/**
  * Status shown to the user. Derived from connection state + whether any tool is
  * actively running + sticky last error. Labels map to CLAUDE.md's
  * 待機 / 準備 / 会話 / 作業 / エラー.
