@@ -752,12 +752,16 @@ where
             let rec = Arc::clone(recorder);
             let added =
                 tokio::task::spawn_blocking(move || rec.add_month_cost(effective_month, to_add)).await;
-            let authoritative_total = match added {
+            // `durable` is true only when the add SUCCEEDED, i.e. `authoritative_total`
+            // equals what a later `get_cost_snapshot` pull (reading the persisted
+            // ledger) would also see. On the add-fail / readback path the total
+            // includes the not-yet-persisted carried amount, so it is NOT durable.
+            let (authoritative_total, durable) = match added {
                 Ok(Ok(new_total)) => {
                     // The whole unpersisted amount is now durably in the ledger.
                     *save_failures = 0;
                     pending.nanodollars = 0;
-                    new_total
+                    (new_total, true)
                 }
                 _ => {
                     *save_failures += 1;
@@ -780,27 +784,36 @@ where
                     // over-cap total still stops THIS session across a transient write
                     // failure. If the READ also fails the balance is UNKNOWN → an
                     // unknown balance must never permit continued charging (koe rule:
-                    // unknown / error / timeout reject), so fail-closed stop.
+                    // unknown / error / timeout reject), so fail-closed stop. NOT
+                    // durable: this total carries the unpersisted amount.
                     let rec_read = Arc::clone(recorder);
                     let readback = tokio::task::spawn_blocking(move || {
                         rec_read.load_cost_snapshot(effective_month)
                     })
                     .await;
                     match readback {
-                        Ok(Ok(persisted)) => persisted.unwrap_or(0).saturating_add(to_add),
+                        Ok(Ok(persisted)) => (persisted.unwrap_or(0).saturating_add(to_add), false),
                         _ => return LoopAction::Stop("cost tracking unavailable"),
                     }
                 }
             };
-            // Push the authoritative (cross-session) cost snapshot to the UI
-            // (koe-9xi). Emitted BEFORE the budget gate so even the over-budget
-            // snapshot reaches the header and it flips to the stop UI. The payload
-            // is numbers + a bool only (no key / path / PII). NOTE: the two "cost
-            // tracking unavailable" hard-stops above return EARLIER without emitting
-            // — the balance is unknown there (no authoritative_total), and the
-            // session-status `error` already tells the UI; emitting a fabricated
-            // total would be fail-open.
-            emit_cost(effective_month, authoritative_total, budget);
+            // Push the cost snapshot to the UI (koe-9xi) — but ONLY when the total is
+            // DURABLE (the add succeeded), so the pushed value equals what a later
+            // `get_cost_snapshot` pull (reading only the persisted ledger) would also
+            // see. Emitting the NON-durable readback total (persisted + carried
+            // pending) would let a subsequent pull mint a HIGHER sequence with a LOWER
+            // (persisted-only) total and overwrite an over-budget display, hiding the
+            // stop state after a transient SQLite-BUSY write failure (Codex Cloud P2).
+            // The budget GATE below still uses the non-durable lower bound to stop
+            // fail-closed; on that rare path the stop is conveyed by the session-status
+            // `error`, not by repainting the cost header with a value a pull can't
+            // reproduce. The two "cost tracking unavailable" hard-stops above also
+            // return EARLIER without emitting (unknown balance). Emitted BEFORE the
+            // gate so a durable over-budget snapshot still reaches the header. Payload
+            // is numbers + a bool only (no key / path / PII).
+            if durable {
+                emit_cost(effective_month, authoritative_total, budget);
+            }
             // Fail-closed against the AUTHORITATIVE (cross-session) ledger total, not
             // just this session's local total. Terminal error emitted by
             // finalize_session_slot under the slot lock (koe-ego), not here, so a
@@ -3442,6 +3455,40 @@ mod tests {
         assert!(
             emits.lock().unwrap().is_empty(),
             "no cost-update for a non-usage frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_failure_with_readback_does_not_emit_nondurable_total() {
+        // Codex Cloud P2: when add_month_cost fails but the readback succeeds, the
+        // total carries non-durable (unpersisted) spend. Emitting it would let a
+        // later get_cost_snapshot pull (reading only the persisted ledger, a LOWER
+        // value) mint a higher sequence and overwrite an over-budget display, hiding
+        // the stop state. So the non-durable path must NOT emit. The budget gate
+        // still stops fail-closed on the lower bound; here the cap is high enough that
+        // the loop continues, isolating the no-emit behavior.
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        let month = current_yyyymm();
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 1000 * NANODOLLARS_PER_USD,
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(budget, month)));
+        // add_month_cost -> Err, load_cost_snapshot -> Ok(None): one failure leaves
+        // save_failures = 1 (< MAX), readback succeeds, total = 0 + delta (non-durable).
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(FailingRecorder);
+        let usage = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 1_000_000u64 } } }
+        });
+        let (action, emits) = drive_capturing_cost(&usage, &provider, &recorder, &cost).await;
+        assert!(
+            matches!(action, LoopAction::Continue),
+            "under-cap non-durable add-failure continues"
+        );
+        assert!(
+            emits.lock().unwrap().is_empty(),
+            "no cost-update for a non-durable (unpersisted) total"
         );
     }
 }
