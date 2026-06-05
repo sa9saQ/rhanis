@@ -4,6 +4,7 @@ import { ActivityLog } from "./features/activity/ActivityLog";
 import { ApprovalModal } from "./features/activity/ApprovalModal";
 import { DevMockEmitter } from "./features/activity/DevMockEmitter";
 import { useActivityEvents } from "./features/activity/useActivityEvents";
+import { useCostEvents } from "./features/activity/useCostEvents";
 import { VoiceButton } from "./features/session/VoiceButton";
 import { useSessionEvents } from "./features/session/useSessionEvents";
 import { OnboardingGate } from "./features/settings/OnboardingGate";
@@ -16,6 +17,8 @@ function ActivityConsole() {
   useActivityEvents();
   // Subscribe to the backend session-status stream; drives sessionStore.
   useSessionEvents();
+  // Pull + subscribe to the live monthly cost snapshot; drives costStore (koe-9xi).
+  useCostEvents();
 
   const [showSettings, setShowSettings] = useState(false);
 

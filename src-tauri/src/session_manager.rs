@@ -38,7 +38,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use crate::audio_bridge::{ManagedAudioBridge, MAX_WS_TEXT_BYTES};
-use crate::cost_tracker::CostTracker;
+use crate::cost_tracker::{BudgetConfig, CostSnapshot, CostTracker};
 use crate::events::{ManagedSequenceCounter, SequenceCounter};
 use crate::realtime_provider::{select_provider, ProviderEvent, RealtimeAuth, RealtimeProvider};
 use crate::realtime_types::{DispatcherSeam, FunctionCall, ManagedDispatcher};
@@ -303,7 +303,7 @@ async fn finalize_session_slot<F>(
 /// when its `AbortHandle::abort()` is called.  This meant already-queued PCM
 /// could still be flushed after an abnormal stop.
 #[allow(clippy::too_many_arguments)]
-async fn run_read_loop<S, F, A, SA>(
+async fn run_read_loop<S, F, EC, A, SA>(
     mut stream: S,
     provider: Arc<dyn RealtimeProvider>,
     write_tx: mpsc::Sender<Message>,
@@ -319,9 +319,15 @@ async fn run_read_loop<S, F, A, SA>(
     mic_running: Arc<AtomicBool>,
     stop_audio: SA,
     writer_abort: Option<tokio::task::AbortHandle>,
+    // Live cost emitter (koe-9xi): called on each usage frame with the authoritative
+    // (month, cross-session total, budget) so `start_session` can push a `cost-update`
+    // to the UI. Injected (not an `AppHandle`) so the loop stays unit-testable with a
+    // no-op closure — the same AppHandle-free discipline as `emit` / `audio_handler`.
+    emit_cost: EC,
 ) where
     S: Stream<Item = Result<Message, WsError>> + Unpin,
     F: Fn(&str, Option<&str>),
+    EC: Fn(u32, u64, BudgetConfig),
     A: Fn(&serde_json::Value),
     SA: Fn(bool), // true = graceful (flush tail), false = immediate (discard tail)
 {
@@ -429,6 +435,7 @@ async fn run_read_loop<S, F, A, SA>(
                             &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
                             &dispatcher, &mut dispatch_tasks, &mut save_failures,
                             &mut pending, &mut cap_warned, &mut journal_drop_warned,
+                            &emit_cost,
                         ).await {
                             LoopAction::Continue => {}
                             // Carry the terminal error reason out to finalize so it
@@ -602,7 +609,7 @@ fn enqueue_record(
 /// Handles one decoded server frame via the provider's normalizer. Returns
 /// whether to keep looping.
 #[allow(clippy::too_many_arguments)]
-async fn handle_text(
+async fn handle_text<EC>(
     event: &Value,
     provider: &Arc<dyn RealtimeProvider>,
     write_tx: &mpsc::Sender<Message>,
@@ -615,7 +622,11 @@ async fn handle_text(
     pending: &mut PendingCost,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
-) -> LoopAction {
+    emit_cost: &EC,
+) -> LoopAction
+where
+    EC: Fn(u32, u64, BudgetConfig),
+{
     match provider.parse_frame(event) {
         ProviderEvent::FunctionCall(pending) => {
             // Reap finished dispatches so the in-flight count reflects reality,
@@ -781,6 +792,15 @@ async fn handle_text(
                     }
                 }
             };
+            // Push the authoritative (cross-session) cost snapshot to the UI
+            // (koe-9xi). Emitted BEFORE the budget gate so even the over-budget
+            // snapshot reaches the header and it flips to the stop UI. The payload
+            // is numbers + a bool only (no key / path / PII). NOTE: the two "cost
+            // tracking unavailable" hard-stops above return EARLIER without emitting
+            // — the balance is unknown there (no authoritative_total), and the
+            // session-status `error` already tells the UI; emitting a fabricated
+            // total would be fail-open.
+            emit_cost(effective_month, authoritative_total, budget);
             // Fail-closed against the AUTHORITATIVE (cross-session) ledger total, not
             // just this session's local total. Terminal error emitted by
             // finalize_session_slot under the slot lock (koe-ego), not here, so a
@@ -1017,6 +1037,20 @@ pub async fn start_session(
     // On normal server-close exits the writer is left to drain gracefully.
     let writer_abort_handle = write_handle.abort_handle();
 
+    // Live cost emitter (koe-9xi): on each usage frame the read loop calls this with
+    // the authoritative (effective month, cross-session total, budget); we mint a
+    // shared sequence, build the single `CostSnapshot` DTO, and push it on the
+    // `cost-update` channel for the UI's live header. The payload is numbers + a bool
+    // only — no key / path / PII ever reaches the WebView (cf. session-status). Owns
+    // its own `AppHandle` + sequence clones so the spawned loop is `'static`.
+    let app_for_cost = app.clone();
+    let seq_for_cost = Arc::clone(&seq.0);
+    let emit_cost = move |month: u32, used: u64, budget: BudgetConfig| {
+        use tauri::Emitter;
+        let snapshot = CostSnapshot::new(month, used, &budget, seq_for_cost.next());
+        let _ = app_for_cost.emit("cost-update", snapshot);
+    };
+
     // Detached: the loop clears the session slot + emits idle on its own exit;
     // stop_session signals it via shutdown_tx rather than holding its handle.
     // `generation` was minted above (right after the is_some check) and
@@ -1037,6 +1071,7 @@ pub async fn start_session(
         mic_running,
         stop_audio,
         Some(writer_abort_handle),
+        emit_cost,
     ));
 
     *guard = Some(ActiveSession {
@@ -1070,6 +1105,53 @@ pub async fn stop_session(
     // even if start() was never called.
     audio.0.lock().await.stop_immediate();
     Ok(())
+}
+
+/// Builds a [`CostSnapshot`] from the recorder's authoritative monthly total and a
+/// budget (koe-9xi). The spend is the additive ledger value for `month`
+/// ([`RecorderAdapter::load_cost_snapshot`]); an absent row (no usage yet this
+/// month) is `0` spent — NOT an error. A recorder failure is propagated as `Err`
+/// (fail-closed): the caller surfaces an explicit "unknown" state rather than a
+/// fabricated $0 that would hide real spend. Pure + sync so it is unit-testable
+/// with a recorder double (no Tauri runtime); the command wraps it in
+/// `spawn_blocking`.
+fn build_cost_snapshot(
+    recorder: &dyn RecorderAdapter,
+    budget: &BudgetConfig,
+    month: u32,
+    sequence: u64,
+) -> Result<CostSnapshot, String> {
+    let used = recorder
+        .load_cost_snapshot(month)
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0);
+    Ok(CostSnapshot::new(month, used, budget, sequence))
+}
+
+/// Returns the current month's cost snapshot for the UI's live header (koe-9xi) —
+/// the **pull** path (the matching **push** is the `cost-update` emit in the read
+/// loop). The spend comes from the recorder's additive ledger (the cross-session
+/// authority, not a session-local total), the cap from the persisted
+/// [`BudgetConfig`]; `over_budget` is decided in u64 (`is_over`), never recomputed
+/// from the display f64. A shared sequence is minted so the frontend can drop this
+/// snapshot if a newer push already arrived (and vice-versa). Fail-closed: a
+/// settings- or recorder-load failure returns `Err` (the UI shows "unknown"), never
+/// a fabricated $0 / unlimited. Contains no secret / PII (numbers + a bool only).
+#[tauri::command]
+pub async fn get_cost_snapshot(
+    settings: tauri::State<'_, ManagedSettings>,
+    recorder: tauri::State<'_, ManagedRecorder>,
+    seq: tauri::State<'_, ManagedSequenceCounter>,
+) -> Result<CostSnapshot, String> {
+    // Settings is a small JSON read (mirrors start_session's direct load); the
+    // blocking SQLite read is wrapped in spawn_blocking below.
+    let budget = settings.0.load().map_err(|e| e.to_string())?.budget;
+    let month = current_yyyymm();
+    let sequence = seq.0.next();
+    let rec = Arc::clone(&recorder.0);
+    tokio::task::spawn_blocking(move || build_cost_snapshot(rec.as_ref(), &budget, month, sequence))
+        .await
+        .map_err(|_| "cost snapshot unavailable".to_string())?
 }
 
 #[cfg(test)]
@@ -1287,7 +1369,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_graceful: bool| {},
             None,
-        ));
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},));
 
         // Let A's loop reach its select and park on the pending stream.
         tokio::task::yield_now().await;
@@ -1350,7 +1432,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         assert_eq!(
@@ -1401,7 +1483,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)), // mic NOT running → pre-loop early return
             |_| {},
             None,
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         assert_eq!(
@@ -1455,7 +1537,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         assert_eq!(
@@ -1503,7 +1585,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         assert!(
@@ -1556,7 +1638,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         let emitted: Vec<_> = log.lock().unwrap().clone();
@@ -1599,6 +1681,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
 
@@ -1676,7 +1759,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         let recorded = events.lock().unwrap();
@@ -1756,6 +1839,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
 
@@ -1808,6 +1892,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
 
@@ -1901,7 +1986,7 @@ mod tests {
             &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
-        )
+        &|_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await
     }
 
@@ -2175,7 +2260,7 @@ mod tests {
             &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
-        )
+        &|_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
         assert!(
             matches!(r1, LoopAction::Continue),
@@ -2203,7 +2288,7 @@ mod tests {
             &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
-        )
+        &|_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
         assert!(
             matches!(r2, LoopAction::Stop("monthly budget exceeded")),
@@ -2267,7 +2352,7 @@ mod tests {
             &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
-        )
+        &|_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
         assert!(
             matches!(result, LoopAction::Continue),
@@ -2362,6 +2447,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
         assert!(log.lock().unwrap().iter().any(|(s, _)| s == "idle"));
@@ -2483,7 +2569,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         // Both journal writes (the transcript + the tool turn) were actually
@@ -2546,7 +2632,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         assert!(
@@ -2598,7 +2684,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         // The abnormal exit emitted the terminal error...
@@ -2639,6 +2725,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
         let events = log.lock().unwrap();
@@ -2686,6 +2773,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
         assert_eq!(disp.calls.lock().unwrap().as_slice(), ["write_note"]);
@@ -2724,6 +2812,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
         assert!(log
@@ -2770,6 +2859,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
         // The unparseable frame was skipped and the following valid call dispatched.
@@ -2833,6 +2923,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // mic always running in tests
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
 
@@ -2878,6 +2969,7 @@ mod tests {
             mic_running,
             move |_| { sac.store(true, Ordering::SeqCst); },
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
         let events = log.lock().unwrap();
@@ -2926,6 +3018,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             move |_| { sc.store(true, Ordering::SeqCst); },
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
         let events = log.lock().unwrap();
@@ -2978,6 +3071,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
         // The oversized frame was dropped but the following valid dispatch fired.
@@ -3025,6 +3119,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
         // Oversized args must be dropped — the tool must NOT be dispatched.
@@ -3090,7 +3185,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)), // mic already lost → abnormal exit
             move |_| { sc.store(true, Ordering::SeqCst); },
             Some(abort_handle),
-        )
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
         .await;
 
         // Verify the emitted events show an abnormal exit.
@@ -3175,6 +3270,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None, // normal close: don't pass AbortHandle so writer runs to completion
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
         )
         .await;
 
@@ -3187,5 +3283,165 @@ mod tests {
             std::time::Duration::from_secs(2),
             writer_handle,
         ).await.expect("writer task must finish naturally after normal close");
+    }
+
+    // ---- get_cost_snapshot / build_cost_snapshot (pull path, koe-9xi) -----
+
+    #[test]
+    fn build_cost_snapshot_absent_row_is_zero_spent() {
+        // No ledger row yet this month (load -> None) means $0 spent, NOT an error.
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 32 * NANODOLLARS_PER_USD,
+        };
+        let snap = build_cost_snapshot(&OkRecorder, &budget, 202605, 5)
+            .expect("absent row is a valid $0 snapshot");
+        assert_eq!(snap.used_nanodollars, 0);
+        assert_eq!(snap.month, 202605);
+        assert_eq!(snap.sequence, 5);
+        assert_eq!(snap.limit_nanodollars, Some(32 * NANODOLLARS_PER_USD));
+        assert!(!snap.over_budget);
+    }
+
+    #[test]
+    fn build_cost_snapshot_uses_persisted_authoritative_total() {
+        // The spend comes from the recorder's additive ledger (the authority); the
+        // over_budget bool is judged on that u64 total via is_over.
+        let (rec, persisted) = SharedSnapshotRecorder::new();
+        persisted
+            .lock()
+            .unwrap()
+            .insert(202605, 40 * NANODOLLARS_PER_USD);
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 32 * NANODOLLARS_PER_USD,
+        };
+        let snap = build_cost_snapshot(&rec, &budget, 202605, 9).expect("ok");
+        assert_eq!(snap.used_nanodollars, 40 * NANODOLLARS_PER_USD);
+        assert!(snap.over_budget, "$40 of a $32 cap is over budget");
+        assert_eq!(snap.remaining_usd, Some(0.0));
+    }
+
+    #[test]
+    fn build_cost_snapshot_recorder_error_is_fail_closed() {
+        // A recorder load failure must propagate as Err — the caller surfaces an
+        // explicit "unknown" state, never a fabricated $0 that hides real spend.
+        let budget = BudgetConfig::default();
+        assert!(build_cost_snapshot(&ReadWriteFailRecorder, &budget, 202605, 0).is_err());
+    }
+
+    // ---- cost-update emit (push path, koe-9xi) ---------------------------
+
+    type CostEmits = Arc<StdMutex<Vec<(u32, u64, BudgetConfig)>>>;
+
+    /// Drives one frame through `handle_text` capturing every `emit_cost` call, so a
+    /// test can assert the live `cost-update` payload (effective month, authoritative
+    /// total, budget) without a socket / `AppHandle` (same AppHandle-free discipline
+    /// as `drive_usage`, but with a recording cost emitter instead of a no-op).
+    async fn drive_capturing_cost(
+        frame: &Value,
+        provider: &Arc<dyn RealtimeProvider>,
+        recorder: &Arc<dyn RecorderAdapter>,
+        cost: &Arc<TokioMutex<CostTracker>>,
+    ) -> (LoopAction, CostEmits) {
+        let emits: CostEmits = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&emits);
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
+        let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
+        let mut dispatch_tasks = tokio::task::JoinSet::new();
+        let mut save_failures = 0u32;
+        let mut pending = PendingCost::default();
+        let (mut cap_warned, mut journal_drop_warned) = (false, false);
+        let action = handle_text(
+            frame,
+            provider,
+            &write_tx,
+            cost,
+            recorder,
+            &rec_tx,
+            &dispatcher,
+            &mut dispatch_tasks,
+            &mut save_failures,
+            &mut pending,
+            &mut cap_warned,
+            &mut journal_drop_warned,
+            &move |m: u32, u: u64, b: BudgetConfig| sink.lock().unwrap().push((m, u, b)),
+        )
+        .await;
+        (action, emits)
+    }
+
+    #[tokio::test]
+    async fn usage_frame_emits_cost_update_with_authoritative_total() {
+        // A response.done usage frame pushes exactly ONE cost-update carrying the
+        // effective accounting month, the authoritative (ledger) total, and the budget.
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        let month = current_yyyymm();
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 100 * NANODOLLARS_PER_USD,
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(budget, month)));
+        // OkRecorder.add_month_cost echoes the delta as the new total (single session).
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(OkRecorder);
+        // 1_000_000 audio input tokens = $32.
+        let usage = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 1_000_000u64 } } }
+        });
+        let (action, emits) = drive_capturing_cost(&usage, &provider, &recorder, &cost).await;
+        assert!(matches!(action, LoopAction::Continue));
+        let calls = emits.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one cost-update per usage frame");
+        let (emit_month, emit_used, emit_budget) = calls[0];
+        assert_eq!(emit_month, month);
+        assert_eq!(emit_used, 32 * NANODOLLARS_PER_USD);
+        assert_eq!(emit_budget, budget);
+        // The snapshot the production closure would build from this is under budget.
+        assert!(!CostSnapshot::new(emit_month, emit_used, &emit_budget, 0).over_budget);
+    }
+
+    #[tokio::test]
+    async fn over_budget_usage_emits_snapshot_then_stops_fail_closed() {
+        // Even when the usage trips the cap, the over-budget snapshot is emitted
+        // BEFORE the loop stops, so the UI flips to the stop state (then the session
+        // stops fail-closed).
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        let month = current_yyyymm();
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: NANODOLLARS_PER_USD, // $1 cap
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(budget, month)));
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(OkRecorder);
+        // $32 >> $1 cap.
+        let usage = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 1_000_000u64 } } }
+        });
+        let (action, emits) = drive_capturing_cost(&usage, &provider, &recorder, &cost).await;
+        assert!(matches!(action, LoopAction::Stop("monthly budget exceeded")));
+        let calls = emits.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "the over-budget snapshot is still emitted");
+        let (m, used, b) = calls[0];
+        assert!(CostSnapshot::new(m, used, &b, 0).over_budget);
+    }
+
+    #[tokio::test]
+    async fn non_usage_frame_does_not_emit_cost_update() {
+        // A non-usage frame (no spend) must not push a cost-update.
+        let provider: Arc<dyn RealtimeProvider> = Arc::new(OpenAiRealtime::new());
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig::default(),
+            current_yyyymm(),
+        )));
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(OkRecorder);
+        let frame = serde_json::json!({ "type": "response.created" });
+        let (_action, emits) = drive_capturing_cost(&frame, &provider, &recorder, &cost).await;
+        assert!(
+            emits.lock().unwrap().is_empty(),
+            "no cost-update for a non-usage frame"
+        );
     }
 }

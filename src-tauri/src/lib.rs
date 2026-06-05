@@ -31,7 +31,7 @@ use settings_store::{
     JsonSettingsStore, ManagedSettings, SettingsPolicyProvider, SettingsStore,
 };
 use realtime_types::ManagedDispatcher;
-use session_manager::{start_session, stop_session, ManagedSession};
+use session_manager::{get_cost_snapshot, start_session, stop_session, ManagedSession};
 use storage::{
     adapter::{ManagedRecorder, RecorderAdapter},
     sqlite::SqliteAdapter,
@@ -145,6 +145,7 @@ pub fn run() {
             pick_folder,
             start_session,
             stop_session,
+            get_cost_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 
 import { selectActiveActions, selectDisplayStatus, useActivityStore } from "./activityStore";
+import { CostHeader } from "./CostHeader";
 import type { ActionState, DisplayStatus, ToolEvent } from "./types";
 import "./ActivityLog.css";
 
@@ -94,6 +95,9 @@ export function ActivityLog() {
           <span className="koe-approval-badge">承認待ち {pendingApprovals}</span>
         )}
       </header>
+
+      {/* Live monthly cost + over-budget stop / raise control (koe-9xi). */}
+      <CostHeader />
 
       {status === "error" && lastError && (
         <p className="koe-error-line" role="alert">

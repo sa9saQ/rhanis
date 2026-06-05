@@ -132,6 +132,23 @@ impl BudgetConfig {
     pub fn is_over(&self, total_nanodollars: u64) -> bool {
         self.enabled && total_nanodollars >= self.monthly_limit_nanodollars
     }
+
+    /// 任意の `total_nanodollars` に対する上限までの残額（ナノドル、負にはならない）。
+    /// `enabled = false`（無制限）なら `None`。
+    ///
+    /// 「残額」の単一の真実源。[`CostTracker::remaining_nanodollars`] と
+    /// [`CostSnapshot::new`] の両方がこれに委譲するので、tracker の残額と UI に
+    /// 出す残額が drift しない（`is_over` を共有述語化したのと同じ理由、git.md の
+    /// dual-validator drift 教訓）。`is_over` と同様に世代横断の永続合計を渡せる。
+    pub fn remaining_nanodollars(&self, total_nanodollars: u64) -> Option<u64> {
+        if !self.enabled {
+            return None;
+        }
+        Some(
+            self.monthly_limit_nanodollars
+                .saturating_sub(total_nanodollars),
+        )
+    }
 }
 
 /// 月次のコスト累計 + 予算判定。
@@ -190,20 +207,89 @@ impl CostTracker {
     }
 
     /// 上限までの残額（ナノドル、負にはならない）。`enabled = false` なら None（無制限）。
+    /// 残額の述語は [`BudgetConfig::remaining_nanodollars`] に委譲する（CostSnapshot が
+    /// 世代横断の永続合計で残額を出す経路と同一の述語を使い、drift を防ぐ）。
     pub fn remaining_nanodollars(&self) -> Option<u64> {
-        if !self.config.enabled {
-            return None;
-        }
-        Some(
-            self.config
-                .monthly_limit_nanodollars
-                .saturating_sub(self.month_total_nanodollars),
-        )
+        self.config
+            .remaining_nanodollars(self.month_total_nanodollars)
     }
 
     /// 上限までの残額（表示用 USD）。
     pub fn remaining_usd(&self) -> Option<f64> {
         self.remaining_nanodollars().map(nanodollars_to_usd)
+    }
+}
+
+/// ある時点の「今月の使用額 + 予算状態」を frontend に渡す単一の DTO（koe-9xi）。
+///
+/// pull（`get_cost_snapshot` コマンド、起動直後の確定値）と push（session_manager の
+/// `cost-update` emit、会話中のライブ更新）が **この同一コンストラクタ**で組むので、
+/// 二経路で表示が drift しない。
+///
+/// ## 不変条件（崩すと課金事故 = 信用崩壊）
+/// - `over_budget` は **ここ Rust 側で u64 比較**（[`BudgetConfig::is_over`] = `>=`、
+///   上限ちょうども超過）で確定し bool で渡す。`used_usd` / `remaining_usd` は
+///   **表示専用の f64**。frontend はこの f64 から超過を再計算してはならない
+///   （判定は u64、表示のみ f64）。
+/// - `used_nanodollars` は **権威ある整数合計**（pull は `load_cost_snapshot` の値、
+///   push は additive ledger の戻り値 = 世代横断合計）。session-local tracker の
+///   total を表示権威にしない（koe-ixt）。
+/// - payload は **数値と bool のみ**。API キー・パス・PII を一切含めない。
+/// - `sequence` は共有 [`crate::events::SequenceCounter`] から採番した単調増加値。
+///   frontend (costStore) は `sequence` が小さい古い snapshot を捨てるので、古い
+///   低額 snapshot が新しい超過 snapshot を上書きして停止 UI を隠す fail-open 表示
+///   が起きない（session-status / activityStore と同じ stale guard 思想）。
+///
+/// f64 を含むため `Eq` は導出しない（`PartialEq` のみ）。`used_usd` / `remaining_usd`
+/// は `u64 / 1e9` なので NaN/Inf になり得ず、serde_json で `null` に化けることはない。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct CostSnapshot {
+    /// 会計上の月（`YYYYMM`）。
+    pub month: u32,
+    /// 今月の使用額（ナノドル）— 権威ある整数合計。
+    pub used_nanodollars: u64,
+    /// 上限（ナノドル）。予算無効（無制限）なら `None`。
+    pub limit_nanodollars: Option<u64>,
+    /// ハードキャップが有効か。
+    pub enabled: bool,
+    /// 今月の使用額が上限に達した / 超えたか（u64 `>=`）。無効なら常に false。
+    /// **Rust 側で確定**し、frontend は f64 から再計算しない。
+    pub over_budget: bool,
+    /// 共有カウンタ由来の単調増加 sequence。古い snapshot を捨てる stale guard 用。
+    pub sequence: u64,
+    /// 表示専用 USD（使用額）。比較・判定には使わない。
+    pub used_usd: f64,
+    /// 表示専用 USD（上限までの残額）。無制限なら `None`。
+    pub remaining_usd: Option<f64>,
+}
+
+impl CostSnapshot {
+    /// `(month, used_nanodollars, BudgetConfig, sequence)` から snapshot を組む純粋関数。
+    /// `over_budget` / `remaining` は [`BudgetConfig`] の共有述語に委譲し、f64 は
+    /// 表示用に [`nanodollars_to_usd`] で換算するだけ（判定には混ぜない）。
+    pub fn new(
+        month: u32,
+        used_nanodollars: u64,
+        config: &BudgetConfig,
+        sequence: u64,
+    ) -> Self {
+        let over_budget = config.is_over(used_nanodollars);
+        let remaining_nanodollars = config.remaining_nanodollars(used_nanodollars);
+        let limit_nanodollars = if config.enabled {
+            Some(config.monthly_limit_nanodollars)
+        } else {
+            None
+        };
+        Self {
+            month,
+            used_nanodollars,
+            limit_nanodollars,
+            enabled: config.enabled,
+            over_budget,
+            sequence,
+            used_usd: nanodollars_to_usd(used_nanodollars),
+            remaining_usd: remaining_nanodollars.map(nanodollars_to_usd),
+        }
     }
 }
 
@@ -423,5 +509,129 @@ mod tests {
         t.month_total_nanodollars = 32 * USD;
         assert!(t.is_over_budget());
         assert_eq!(t.is_over_budget(), on.is_over(t.month_total_nanodollars));
+    }
+
+    // ---- BudgetConfig::remaining_nanodollars (shared predicate) -----------
+
+    #[test]
+    fn budget_config_remaining_matches_tracker_remaining() {
+        // The shared predicate must agree with the tracker's own remaining for the
+        // tracker's running total (no drift between the UI's remaining and the
+        // tracker's), and clamp to 0 / None at the edges.
+        let on = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 32 * USD,
+        };
+        for used in [0u64, 16 * USD, 32 * USD, 100 * USD] {
+            let mut t = CostTracker::new(on, 202605);
+            t.month_total_nanodollars = used;
+            assert_eq!(t.remaining_nanodollars(), on.remaining_nanodollars(used));
+        }
+        // At/over the limit clamps to Some(0), never negative.
+        assert_eq!(on.remaining_nanodollars(40 * USD), Some(0));
+        assert_eq!(on.remaining_nanodollars(32 * USD), Some(0));
+        // Disabled = unlimited → None, even for a saturated total.
+        let off = BudgetConfig {
+            enabled: false,
+            monthly_limit_nanodollars: 32 * USD,
+        };
+        assert_eq!(off.remaining_nanodollars(u64::MAX), None);
+    }
+
+    // ---- CostSnapshot -----------------------------------------------------
+
+    #[test]
+    fn cost_snapshot_under_budget() {
+        let cfg = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 32 * USD,
+        };
+        let s = CostSnapshot::new(202605, 16 * USD, &cfg, 7);
+        assert_eq!(s.month, 202605);
+        assert_eq!(s.used_nanodollars, 16 * USD);
+        assert_eq!(s.limit_nanodollars, Some(32 * USD));
+        assert!(s.enabled);
+        assert!(!s.over_budget);
+        assert_eq!(s.sequence, 7);
+        assert_eq!(s.used_usd, 16.0);
+        assert_eq!(s.remaining_usd, Some(16.0));
+    }
+
+    #[test]
+    fn cost_snapshot_over_budget_at_exactly_limit() {
+        // 上限ちょうど ($32 of $32) は超過扱い（fail-closed、u64 `>=`）。
+        let cfg = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 32 * USD,
+        };
+        let s = CostSnapshot::new(202605, 32 * USD, &cfg, 1);
+        assert!(s.over_budget, "at-limit is over_budget (>=)");
+        assert_eq!(s.remaining_usd, Some(0.0));
+    }
+
+    #[test]
+    fn cost_snapshot_over_budget_above_limit_remaining_clamps() {
+        let cfg = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 10 * USD,
+        };
+        let s = CostSnapshot::new(202605, 32 * USD, &cfg, 2);
+        assert!(s.over_budget);
+        // remaining saturates at 0, never negative.
+        assert_eq!(s.remaining_usd, Some(0.0));
+        assert_eq!(s.used_usd, 32.0);
+    }
+
+    #[test]
+    fn cost_snapshot_unlimited_is_never_over_and_hides_limit() {
+        // enabled=false（明示的に無制限）: 巨額でも over_budget=false、limit/remaining は None。
+        let cfg = BudgetConfig {
+            enabled: false,
+            monthly_limit_nanodollars: 0,
+        };
+        let s = CostSnapshot::new(202605, 6_400 * USD, &cfg, 3);
+        assert!(!s.enabled);
+        assert!(!s.over_budget);
+        assert_eq!(s.limit_nanodollars, None);
+        assert_eq!(s.remaining_usd, None);
+        assert_eq!(s.used_usd, 6_400.0);
+    }
+
+    #[test]
+    fn cost_snapshot_over_budget_judged_in_u64_not_f64() {
+        // over_budget は u64 比較で確定する（f64 表示と独立）。over_budget は
+        // is_over に、used_usd は nanodollars_to_usd に厳密一致する。
+        let cfg = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 32 * USD,
+        };
+        for used in [0u64, 1, 31 * USD, 32 * USD - 1, 32 * USD, u64::MAX] {
+            let s = CostSnapshot::new(202605, used, &cfg, 0);
+            assert_eq!(s.over_budget, cfg.is_over(used));
+            assert_eq!(s.used_usd, nanodollars_to_usd(used));
+        }
+    }
+
+    #[test]
+    fn cost_snapshot_sequence_is_carried_verbatim() {
+        let cfg = BudgetConfig::default();
+        assert_eq!(CostSnapshot::new(202605, 0, &cfg, 0).sequence, 0);
+        assert_eq!(CostSnapshot::new(202605, 0, &cfg, 999).sequence, 999);
+        assert_eq!(
+            CostSnapshot::new(202605, 0, &cfg, u64::MAX).sequence,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn cost_snapshot_display_usd_is_finite_never_nan_or_inf() {
+        // used_usd / remaining_usd は u64/1e9 なので常に有限（serde_json で null 化しない）。
+        let cfg = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: u64::MAX,
+        };
+        let s = CostSnapshot::new(202605, u64::MAX, &cfg, 0);
+        assert!(s.used_usd.is_finite());
+        assert!(s.remaining_usd.unwrap().is_finite());
     }
 }

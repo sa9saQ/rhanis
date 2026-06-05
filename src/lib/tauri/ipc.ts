@@ -10,6 +10,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ApprovalDecision,
   ApprovalRequest,
+  CostSnapshot,
   SessionStatusEvent,
   ToolEvent,
 } from "../../features/activity/types";
@@ -30,6 +31,8 @@ export const EVENT = {
   toolEvent: "tool-event",
   approvalRequired: "tool-approval-required",
   sessionStatus: "session-status",
+  // Live monthly cost snapshot pushed on each usage frame (koe-9xi).
+  costUpdate: "cost-update",
 } as const;
 
 /** Backend command names. */
@@ -58,6 +61,8 @@ export const COMMAND = {
   // Session lifecycle commands (koe-e3m)
   startSession: "start_session",
   stopSession: "stop_session",
+  // Cost snapshot pull (koe-9xi)
+  getCostSnapshot: "get_cost_snapshot",
 } as const;
 
 /** Subscribe to live tool events. Returns an unlisten function. */
@@ -77,6 +82,15 @@ export function onSessionStatus(
   handler: (status: SessionStatusEvent) => void,
 ): Promise<UnlistenFn> {
   return listen<SessionStatusEvent>(EVENT.sessionStatus, (e) => handler(e.payload));
+}
+
+/**
+ * Subscribe to live monthly-cost snapshots (koe-9xi). The backend pushes one on
+ * every usage frame, including the over-budget snapshot just before it stops the
+ * session. Returns an unlisten function.
+ */
+export function onCostUpdate(handler: (snapshot: CostSnapshot) => void): Promise<UnlistenFn> {
+  return listen<CostSnapshot>(EVENT.costUpdate, (e) => handler(e.payload));
 }
 
 /**
@@ -237,4 +251,18 @@ export function startSession(): Promise<void> {
 /** Stops the active Realtime session. Idempotent (no-op if already stopped). */
 export function stopSession(): Promise<void> {
   return invoke(COMMAND.stopSession);
+}
+
+// ---------------------------------------------------------------------------
+// Cost snapshot (koe-9xi)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pulls the current month's cost snapshot (spend so far + cap + over-budget),
+ * read from the backend's authoritative ledger. Rejects (fail-closed) if settings
+ * or the ledger can't be read — the caller shows an explicit "unknown" state
+ * rather than a fabricated $0. Contains no secret values (numbers + a bool only).
+ */
+export function getCostSnapshot(): Promise<CostSnapshot> {
+  return invoke<CostSnapshot>(COMMAND.getCostSnapshot);
 }

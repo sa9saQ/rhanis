@@ -19,9 +19,11 @@ import {
   deleteProviderApiKey,
   deleteToolProviderKey,
   getAppSettings,
+  getCostSnapshot,
   hasOpenaiApiKey,
   hasProviderApiKey,
   onApprovalRequired,
+  onCostUpdate,
   onSessionStatus,
   onToolEvent,
   resolveToolApproval,
@@ -32,7 +34,12 @@ import {
   setToolProviderEnabled,
   setVoiceProvider,
 } from "./ipc";
-import type { ApprovalRequest, SessionStatusEvent, ToolEvent } from "../../features/activity/types";
+import type {
+  ApprovalRequest,
+  CostSnapshot,
+  SessionStatusEvent,
+  ToolEvent,
+} from "../../features/activity/types";
 
 beforeEach(() => {
   listen.mockReset();
@@ -74,6 +81,21 @@ describe("ipc event subscriptions", () => {
   it("onSessionStatus listens on the session-status channel", async () => {
     await onSessionStatus(() => {});
     expect(listen.mock.calls[0]?.[0]).toBe(EVENT.sessionStatus);
+  });
+
+  it("onCostUpdate listens on the cost-update channel and unwraps the payload", async () => {
+    let captured: CostSnapshot | undefined;
+    await onCostUpdate((s) => {
+      captured = s;
+    });
+    const [channel, cb] = listen.mock.calls[0] as [
+      string,
+      (e: { payload: CostSnapshot }) => void,
+    ];
+    expect(channel).toBe(EVENT.costUpdate);
+    const payload = { month: 202606, over_budget: false } as CostSnapshot;
+    cb({ payload });
+    expect(captured).toBe(payload);
   });
 
   it("forwards the unlisten function from listen", async () => {
@@ -219,5 +241,24 @@ describe("multi-provider key + voice/tool commands (koe-31u)", () => {
   it("deleteToolProviderKey invokes delete_tool_provider_key with {provider}", async () => {
     await deleteToolProviderKey("xai");
     expect(invoke).toHaveBeenCalledWith(COMMAND.deleteToolProviderKey, { provider: "xai" });
+  });
+});
+
+describe("getCostSnapshot", () => {
+  it("invokes get_cost_snapshot with no args and returns the snapshot", async () => {
+    const snap: CostSnapshot = {
+      month: 202606,
+      used_nanodollars: 16_000_000_000,
+      limit_nanodollars: 32_000_000_000,
+      enabled: true,
+      over_budget: false,
+      sequence: 3,
+      used_usd: 16,
+      remaining_usd: 16,
+    };
+    invoke.mockResolvedValueOnce(snap);
+    const result = await getCostSnapshot();
+    expect(invoke).toHaveBeenCalledWith(COMMAND.getCostSnapshot);
+    expect(result).toEqual(snap);
   });
 });
