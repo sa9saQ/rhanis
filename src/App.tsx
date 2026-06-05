@@ -1,5 +1,11 @@
 import { useState } from "react";
 
+// Base-layer styles (theme tokens + shared primitives like `.koe-btn`) must load
+// BEFORE any feature stylesheet, so feature VARIANTS (.koe-btn-approve /
+// .koe-btn-primary …) win the cascade over the base at equal specificity. Hence
+// this import precedes the feature-component imports below (koe-iyr).
+import "./App.css";
+
 import { ActivityLog } from "./features/activity/ActivityLog";
 import { ApprovalModal } from "./features/activity/ApprovalModal";
 import { DevMockEmitter } from "./features/activity/DevMockEmitter";
@@ -9,7 +15,6 @@ import { VoiceButton } from "./features/session/VoiceButton";
 import { useSessionEvents } from "./features/session/useSessionEvents";
 import { OnboardingGate } from "./features/settings/OnboardingGate";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
-import "./App.css";
 
 function ActivityConsole() {
   // Subscribe to the backend tool-event / approval / status streams for the

@@ -20,6 +20,11 @@ import { hasOpenaiApiKey } from "../../lib/tauri/ipc";
 import { useSettingsStore } from "./settingsStore";
 import { BudgetOnboarding } from "./BudgetOnboarding";
 import { ApiKeyInput } from "./ApiKeyInput";
+// Onboarding is the first screen, so it loads its own styles directly: the shared
+// form vocabulary (settings.css) + the first-run layout (onboarding.css). It does
+// NOT rely on another feature's stylesheet being in the boot bundle (koe-iyr).
+import "./settings.css";
+import "./onboarding.css";
 
 interface OnboardingGateProps {
   children: React.ReactNode;
@@ -122,8 +127,8 @@ export function OnboardingGate({ children }: OnboardingGateProps) {
       ) : (
         // Step 2: API key entry
         <div className="koe-onboarding-apikey-step">
-          <h2>OpenAI APIキーを設定</h2>
-          <p>
+          <h2 className="koe-onboarding-title">OpenAI APIキーを設定</h2>
+          <p className="koe-onboarding-desc">
             koe はあなた自身のOpenAI APIキーを使用します（BYOK方式）。
             <br />
             キーは暗号化されたローカルストレージに保存され、外部には送信されません。

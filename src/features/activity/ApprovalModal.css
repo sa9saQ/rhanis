@@ -81,21 +81,9 @@
   gap: 10px;
   justify-content: flex-end;
 }
-.koe-btn {
-  font-family: var(--font-ui);
-  font-size: 14px;
-  font-weight: 600;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 9px 18px;
-  cursor: pointer;
-  transition: transform var(--dur-hover) var(--ease-spring),
-    background var(--dur-hover) var(--ease-decel);
-}
-.koe-btn:disabled {
-  opacity: 0.5;
-  cursor: progress;
-}
+/* The shared `.koe-btn` base (+ :disabled + reduced-motion) now lives in the
+   always-loaded base layer (App.css). This file keeps only the modal's button
+   VARIANTS. */
 .koe-btn-deny {
   background: var(--panel-2);
   color: var(--text);
@@ -143,7 +131,5 @@
   .koe-approval-card {
     animation: none;
   }
-  .koe-btn {
-    transition: none;
-  }
+  /* `.koe-btn` reduced-motion is handled in the base layer (App.css). */
 }
