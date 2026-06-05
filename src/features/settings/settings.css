@@ -1,19 +1,29 @@
-/* Settings panel styling (koe-31u). The settings feature previously left its
- * koe-* classes undefined; this file gives them a WCAG-AA, anti-AI-smell
- * baseline. The shared `.koe-btn` base is intentionally NOT redefined here — it
- * lives in ApprovalModal.css (global) — so settings only adds the button
- * VARIANTS it needs plus its own layout/input classes. */
+/* Settings panel + shared form vocabulary (koe-31u; dark-themed in koe-iyr).
+ * Provides the input / button-variant / budget / policy classes used by BOTH the
+ * settings panel and the first-run onboarding wizard (which imports this file).
+ * The shared `.koe-btn` base lives in App.css (always-loaded base layer); this
+ * file adds only VARIANTS (.koe-btn-primary / .koe-btn-danger / .koe-btn-icon)
+ * plus layout/input classes. */
 
-:root {
-  /* WCAG-AA on white: body text ≥ 4.5:1, hints kept ≥ 4.5:1 too. */
-  --koe-text: #1f2430;
-  --koe-text-muted: #5f6b78; /* 4.6:1 on white */
-  --koe-border: #c2c9d2;
-  --koe-border-focus: #2563eb; /* blue-600, 4.68:1 white-on */
-  --koe-danger: #c94400; /* 4.87:1 white-on */
-  --koe-surface: #ffffff;
-  --koe-surface-alt: #f5f7fa;
-  --ko-ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+/* Sub-theme tokens, scoped to the component roots — never a global override — so
+ * they cannot repaint the rest of the dark desk (the koe-iyr theme-clash fix).
+ * Each token aliases an App.css palette value, so the panel and the onboarding
+ * wizard render in one dark theme. Contrast on these dark surfaces:
+ *   --koe-text  #e6e8ec on --panel #1c1f26 ≈ 13:1 (AAA)
+ *   --koe-text-muted #aeb6c2 on --panel ≈ 8:1 / on --panel-2 #232733 ≈ 7.3:1
+ *   --koe-danger (as text) #f0706a on --panel-2 ≈ 5.4:1 (AA). */
+.koe-settings-panel,
+.koe-onboarding-wizard,
+.koe-onboarding-gate-loading,
+.koe-onboarding-gate-error {
+  --koe-text: var(--text);
+  --koe-text-muted: var(--muted);
+  --koe-border: var(--border);
+  --koe-border-focus: var(--accent); /* focus ring = app accent (matches VoiceButton) */
+  --koe-danger: var(--tone-error);
+  --koe-surface: var(--panel);
+  --koe-surface-alt: var(--panel-2);
+  --ko-ease-standard: var(--ease-standard);
 }
 
 .koe-settings-panel {
@@ -68,16 +78,24 @@
 
 .koe-settings-error {
   margin: 0;
-  padding: 8px 10px;
+  padding: 8px 12px;
   font-size: 0.85rem;
-  color: var(--koe-danger);
-  background: #fdeee7;
+  color: var(--tone-error);
+  background: color-mix(in srgb, var(--tone-error) 12%, transparent);
+  border-left: 3px solid var(--tone-error);
   border-radius: 6px;
 }
 
 .koe-label {
   font-size: 0.9rem;
   font-weight: 550;
+}
+
+/* Voice provider selector — label + select stacked with a small gap. */
+.koe-voice-provider-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .koe-input,
@@ -109,22 +127,29 @@
   cursor: not-allowed;
 }
 
-/* Button VARIANTS only (base `.koe-btn` comes from ApprovalModal.css). */
+/* Button VARIANTS only (base `.koe-btn` comes from App.css). */
 .koe-btn-primary {
-  color: #fff;
-  background: var(--koe-border-focus);
+  /* Dark ink on the solid accent — the same AA-safe pair as .koe-btn-approve
+   * (#0c1413 on --accent #3fb6a8 ≈ 8:1). White-on-accent would fail AA. */
+  color: #0c1413;
+  background: var(--accent);
+  border-color: transparent;
   border-radius: 9px;
 }
 .koe-btn-primary:hover:not(:disabled) {
-  background: #1d4fd0;
+  background: color-mix(in srgb, var(--accent) 85%, white);
 }
+/* Destructive action: solid tone-error with dark ink — same button language as
+ * .koe-btn-primary / .koe-btn-approve (dark ink on a solid fill). #0c1413 on
+ * --tone-error #f0706a ≈ 6.5:1 (AA); white-on-tone-error would fail AA. */
 .koe-btn-danger {
-  color: #fff;
-  background: var(--koe-danger);
+  color: #0c1413;
+  background: var(--tone-error);
+  border-color: transparent;
   border-radius: 9px;
 }
 .koe-btn-danger:hover:not(:disabled) {
-  background: #a83800;
+  background: color-mix(in srgb, var(--tone-error) 85%, white);
 }
 .koe-btn-icon {
   border-radius: 999px; /* icon buttons: pill */
@@ -148,7 +173,7 @@
 .koe-api-key-status {
   margin: 0;
   font-size: 0.84rem;
-  color: #15803d; /* green-700, 4.5:1 white-on */
+  color: var(--tone-working); /* bright green, reads as success on the dark panel */
 }
 .koe-api-key-error {
   margin: 0;
@@ -174,8 +199,8 @@
   align-items: center;
   gap: 8px;
   font-size: 0.88rem;
-  /* Primary (not muted) token: this label sits on the alt surface (#f5f7fa),
-   * where the muted token's 4.6:1 (measured on white) would dip below AA. */
+  /* Primary token (not muted): this enable label is an actionable control, so it
+   * uses full-strength text on the alt surface (--panel-2) for emphasis. */
   color: var(--koe-text);
 }
 .koe-tool-key-row + .koe-tool-key-row {
