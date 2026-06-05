@@ -126,4 +126,83 @@ describe("ApprovalModal", () => {
     expect(useActivityStore.getState().approvalQueue).toHaveLength(0);
     expect(resolveToolApproval).not.toHaveBeenCalled();
   });
+
+  // --- a11y / keyboard operability (koe-471) ------------------------------
+
+  it("moves initial focus to the deny (safe) button, not approve (fail-closed)", () => {
+    render(<ApprovalModal />);
+    act(() => useActivityStore.getState().enqueueApproval(approval({ approvalId: "a1" })));
+    expect(screen.getByRole("button", { name: /拒否/ })).toHaveFocus();
+    expect(screen.getByRole("button", { name: /許可/ })).not.toHaveFocus();
+  });
+
+  it("re-focuses deny when the next queued approval becomes the head", async () => {
+    render(<ApprovalModal />);
+    act(() => {
+      useActivityStore.getState().enqueueApproval(approval({ approvalId: "a1" }));
+      useActivityStore.getState().enqueueApproval(approval({ approvalId: "a2" }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /拒否/ })); // resolve a1
+    });
+    // a2 is now the head — its deny button should hold focus, not approve.
+    expect(resolveToolApproval).toHaveBeenLastCalledWith("a1", "deny");
+    expect(screen.getByRole("button", { name: /拒否/ })).toHaveFocus();
+  });
+
+  it("traps forward Tab at the last control (wraps back to the first)", () => {
+    render(<ApprovalModal />);
+    act(() => useActivityStore.getState().enqueueApproval(approval({ approvalId: "a1" })));
+    const deny = screen.getByRole("button", { name: /拒否/ });
+    const approve = screen.getByRole("button", { name: /許可/ });
+    act(() => approve.focus());
+    fireEvent.keyDown(approve, { key: "Tab" });
+    expect(deny).toHaveFocus(); // did not escape the dialog
+  });
+
+  it("traps Shift+Tab at the first control (wraps to the last)", () => {
+    render(<ApprovalModal />);
+    act(() => useActivityStore.getState().enqueueApproval(approval({ approvalId: "a1" })));
+    const deny = screen.getByRole("button", { name: /拒否/ });
+    const approve = screen.getByRole("button", { name: /許可/ });
+    expect(deny).toHaveFocus(); // first control, focused on open
+    fireEvent.keyDown(deny, { key: "Tab", shiftKey: true });
+    expect(approve).toHaveFocus(); // did not escape the dialog
+  });
+
+  it("Escape denies (fail-closed) and dequeues — never approves", async () => {
+    render(<ApprovalModal />);
+    act(() => useActivityStore.getState().enqueueApproval(approval({ approvalId: "a1" })));
+    await act(async () => {
+      fireEvent.keyDown(screen.getByRole("button", { name: /拒否/ }), { key: "Escape" });
+    });
+    expect(resolveToolApproval).toHaveBeenCalledWith("a1", "deny");
+    expect(resolveToolApproval).not.toHaveBeenCalledWith("a1", "approve");
+    expect(useActivityStore.getState().approvalQueue).toHaveLength(0);
+  });
+
+  it("restores focus to the opener when the modal closes", async () => {
+    render(
+      <>
+        <button type="button">opener</button>
+        <ApprovalModal />
+      </>,
+    );
+    const opener = screen.getByRole("button", { name: "opener" });
+    opener.focus();
+    expect(opener).toHaveFocus();
+    act(() => useActivityStore.getState().enqueueApproval(approval({ approvalId: "a1" })));
+    expect(screen.getByRole("button", { name: /拒否/ })).toHaveFocus(); // focus entered the modal
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /拒否/ }));
+    });
+    expect(opener).toHaveFocus(); // focus returned to the caller
+  });
+
+  it("announces the remaining time to screen readers via a polite live region", () => {
+    render(<ApprovalModal />);
+    act(() => useActivityStore.getState().enqueueApproval(approval({ approvalId: "a1" })));
+    const live = screen.getByText(/^残り約?\d+秒$/); // SR-only region (not the visible "残り Ns")
+    expect(live).toHaveAttribute("aria-live", "polite");
+  });
 });

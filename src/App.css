@@ -71,3 +71,18 @@ body {
   text-transform: uppercase;
   color: var(--muted);
 }
+
+/* Visually hidden but exposed to assistive tech (SR-only). Used for the approval
+   countdown live region and the budget onboarding legend. */
+.koe-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%); /* `clip` is deprecated; clip-path is its successor. */
+  white-space: nowrap;
+  border: 0;
+}
