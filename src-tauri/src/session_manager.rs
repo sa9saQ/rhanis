@@ -606,8 +606,12 @@ fn enqueue_record(
     }
 }
 
-/// Handles one decoded server frame via the provider's normalizer. Returns
-/// whether to keep looping.
+/// Drives one decoded server frame: the provider normalizes it into zero or more
+/// [`ProviderEvent`]s, each handled by [`handle_event`] in order. A single frame
+/// can yield more than one event — the user `.completed` ASR frame yields a
+/// `Transcript` AND a `Usage` (koe-pbe) — and the normalizer surfaces the
+/// transcript FIRST, so the turn is journalled before a `Usage` budget gate could
+/// stop the loop. The first `Stop` short-circuits the rest of the frame's events.
 #[allow(clippy::too_many_arguments)]
 async fn handle_text<EC>(
     event: &Value,
@@ -627,7 +631,53 @@ async fn handle_text<EC>(
 where
     EC: Fn(u32, u64, BudgetConfig),
 {
-    match provider.parse_frame(event) {
+    for ev in provider.parse_frame(event) {
+        if let LoopAction::Stop(reason) = handle_event(
+            ev,
+            write_tx,
+            cost,
+            recorder,
+            rec_tx,
+            dispatcher,
+            dispatch_tasks,
+            save_failures,
+            pending,
+            cap_warned,
+            journal_drop_warned,
+            emit_cost,
+        )
+        .await
+        {
+            return LoopAction::Stop(reason);
+        }
+    }
+    LoopAction::Continue
+}
+
+/// Handles ONE normalized [`ProviderEvent`]. Returns whether to keep looping.
+/// (Extracted from `handle_text` unchanged when `parse_frame` became multi-event,
+/// koe-pbe — the cost-metering `Usage` arm is byte-for-byte the koe-9xi/koe-ixt
+/// logic; an ASR `Usage` flows through it identically, so there is no second cost
+/// path to keep in sync.)
+#[allow(clippy::too_many_arguments)]
+async fn handle_event<EC>(
+    ev: ProviderEvent,
+    write_tx: &mpsc::Sender<Message>,
+    cost: &Arc<TokioMutex<CostTracker>>,
+    recorder: &Arc<dyn RecorderAdapter>,
+    rec_tx: &mpsc::Sender<ConversationRecord>,
+    dispatcher: &Arc<dyn DispatcherSeam>,
+    dispatch_tasks: &mut tokio::task::JoinSet<()>,
+    save_failures: &mut u32,
+    pending: &mut PendingCost,
+    cap_warned: &mut bool,
+    journal_drop_warned: &mut bool,
+    emit_cost: &EC,
+) -> LoopAction
+where
+    EC: Fn(u32, u64, BudgetConfig),
+{
+    match ev {
         ProviderEvent::FunctionCall(pending) => {
             // Reap finished dispatches so the in-flight count reflects reality,
             // then bound it (DoS guard, koe-wj2 — see MAX_INFLIGHT_DISPATCHES for
@@ -1791,6 +1841,175 @@ mod tests {
                     "here is what I found".to_string()
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn asr_completed_records_user_turn_once_and_meters_asr_once() {
+        // koe-pbe end to end: enabling input_audio_transcription makes the server
+        // emit a user `.completed` frame carrying BOTH the transcript AND a
+        // SEPARATELY-BILLED ASR usage. ONE such frame must journal the user turn
+        // EXACTLY once AND meter the ASR cost EXACTLY once through the same
+        // add_month_cost / cost-update path — no double-record, no double-count, no
+        // second cost channel. A streaming delta first proves exactly-once.
+        let (rec, events) = RecordingRecorder::new();
+        let month = current_yyyymm();
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 100 * NANODOLLARS_PER_USD,
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(budget, month)));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+        let cost_emits: CostEmits = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&cost_emits);
+
+        let frames = vec![
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": "search the"
+            }),
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "item_1",
+                "content_index": 0,
+                "transcript": "search the web for rust",
+                "usage": {
+                    "type": "tokens",
+                    "total_tokens": 22,
+                    "input_tokens": 13,
+                    "input_token_details": { "text_tokens": 0, "audio_tokens": 13 },
+                    "output_tokens": 9
+                }
+            }),
+        ];
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(rec) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+            move |m: u32, u: u64, b: BudgetConfig| sink.lock().unwrap().push((m, u, b)),
+        )
+        .await;
+
+        // (a) the user turn is journalled EXACTLY once (delta Ignored, no dupe).
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [(
+                "user".to_string(),
+                "speech".to_string(),
+                "search the web for rust".to_string()
+            )]
+        );
+        // (b) the ASR usage is metered EXACTLY once via the cost path; the
+        //     conservative mapping bills 13 audio-input + 9 text-output tokens at
+        //     the realtime rates (over-count vs real ASR pricing = fail-closed).
+        let calls = cost_emits.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one cost-update for the ASR usage");
+        let expected = crate::cost_tracker::Usage {
+            audio_input_tokens: 13,
+            text_output_tokens: 9,
+            ..Default::default()
+        }
+        .cost_nanodollars();
+        assert_eq!(calls[0].0, month);
+        assert_eq!(calls[0].1, expected);
+        assert!(!CostSnapshot::new(calls[0].0, calls[0].1, &calls[0].2, 0).over_budget);
+    }
+
+    #[tokio::test]
+    async fn asr_over_budget_records_transcript_then_stops_fail_closed() {
+        // The ASR usage on a user `.completed` frame gates the budget like any other
+        // usage: an over-cap ASR turn STOPS the session fail-closed. Order matters —
+        // the transcript is surfaced FIRST, so the turn is still journalled (it
+        // happened) before the gate stops the loop; the over-budget snapshot is
+        // emitted before the stop (koe-9xi), and a second frame after the stop is
+        // never processed.
+        let (rec, events) = RecordingRecorder::new();
+        let month = current_yyyymm();
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 1, // 1 nanodollar — any ASR usage trips it
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(budget, month)));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (log, emit) = collect_emit();
+        let cost_emits: CostEmits = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&cost_emits);
+
+        let frames = vec![
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "expensive question",
+                "usage": {
+                    "type": "tokens",
+                    "total_tokens": 2000,
+                    "input_tokens": 1000,
+                    "input_token_details": { "text_tokens": 0, "audio_tokens": 1000 },
+                    "output_tokens": 1000
+                }
+            }),
+            // Must NOT be processed after the budget stop short-circuits the loop.
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "should not be recorded"
+            }),
+        ];
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(rec) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+            move |m: u32, u: u64, b: BudgetConfig| sink.lock().unwrap().push((m, u, b)),
+        )
+        .await;
+
+        // The over-budget turn was still journalled (transcript surfaced before the
+        // gate); the post-stop frame is not.
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [(
+                "user".to_string(),
+                "speech".to_string(),
+                "expensive question".to_string()
+            )],
+            "the over-budget turn is recorded; the post-stop frame is not"
+        );
+        // The over-budget cost snapshot was emitted before the stop (durable add).
+        let calls = cost_emits.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert!(CostSnapshot::new(calls[0].0, calls[0].1, &calls[0].2, 0).over_budget);
+        // The session terminated with the fail-closed budget error.
+        let statuses = log.lock().unwrap().clone();
+        assert!(
+            statuses
+                .iter()
+                .any(|(s, r)| s == "error" && r.as_deref() == Some("monthly budget exceeded")),
+            "session must stop fail-closed on the over-budget ASR usage; got {statuses:?}"
         );
     }
 

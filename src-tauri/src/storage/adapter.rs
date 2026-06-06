@@ -62,7 +62,12 @@ pub struct Note {
 }
 
 /// A logged conversation event: an assistant/user turn or a tool milestone.
-/// `summary` is expected to be pre-redacted by the caller (no key / path / PII).
+/// `summary` is pre-vetted by the caller to exclude the BYOK key, file paths, and
+/// tool arguments/results. It DOES, however, contain a finalized speech transcript
+/// verbatim for `kind = "speech"` turns (koe-pbe), which is **sensitive,
+/// local-only user data that can include PII** — it is intentionally persisted to
+/// the on-device SQLite store, but any future Tauri command / UI / export that
+/// surfaces `summary` outside the device MUST apply a PII review / redaction first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationEvent {
     pub id: i64,
