@@ -255,16 +255,22 @@ export const useActivityStore = create<ActivityState>((set) => ({
       if (status.sequence <= state.lastSessionSequence) {
         return state;
       }
-      // A stopped (idle) or failed (error) session has nothing "about to happen":
-      // drop stale pending disclosures so the present-tense thinking window never
-      // outlives its session (R-B/R-C). `connecting`/`connected` leave it intact.
-      const ended = status.state === "idle" || status.state === "error";
+      // Drop stale pending disclosures whenever there is nothing "about to happen":
+      // a stopped (idle) or failed (error) session, OR a reconnect (koe-byf) — a
+      // recoverable transport drop aborts the in-flight tool dispatches, so their
+      // "これから〜します" disclosures would never be cleared by a completion and
+      // would orphan in the window across the reconnect. `connecting`/`connected`
+      // leave the window intact.
+      const clearThinking =
+        status.state === "idle" ||
+        status.state === "error" ||
+        status.state === "reconnecting";
       return {
         ...state,
         connState: status.state,
         lastError: status.state === "error" ? (status.error ?? "unknown error") : null,
         lastSessionSequence: status.sequence,
-        ...(ended ? { thinking: [], seenThinkingIds: new Set<string>() } : {}),
+        ...(clearThinking ? { thinking: [], seenThinkingIds: new Set<string>() } : {}),
       };
     }),
 
@@ -316,6 +322,12 @@ export function selectDisplayStatus(state: ActivityState): DisplayStatus {
       return "idle";
     case "connecting":
       return "connecting";
+    // koe-byf: a recoverable transport drop is being retried — surface it as its own
+    // status (再接続中), not idle/conversing, so the operator sees the session is
+    // recovering rather than a frozen "会話". (setSessionStatus also clears the
+    // thinking window on reconnecting, since the in-flight dispatches were aborted.)
+    case "reconnecting":
+      return "reconnecting";
     case "connected":
       return selectActiveActions(state).length > 0 ? "working" : "conversing";
     default:

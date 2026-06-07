@@ -81,6 +81,25 @@ describe("VoiceButton", () => {
     expect(isBusy).toBe(true);
   });
 
+  it("stays enabled, busy, and stoppable while reconnecting (koe-byf)", async () => {
+    act(() => {
+      useSessionStore.getState().setFromEvent({ state: "reconnecting", sequence: 1 });
+    });
+    mockStopSession.mockResolvedValueOnce(undefined);
+    render(<VoiceButton />);
+    const btn = screen.getByRole("button");
+    // Unlike `loading`, a reconnecting session must NOT trap the user — the button
+    // is enabled, marked busy, and acts as "stop".
+    expect(btn).not.toBeDisabled();
+    expect(btn.getAttribute("aria-busy")).toBe("true");
+    expect(btn.getAttribute("aria-pressed")).toBe("true");
+    await act(async () => {
+      fireEvent.click(btn);
+    });
+    expect(mockStopSession).toHaveBeenCalledTimes(1);
+    expect(mockStartSession).not.toHaveBeenCalled();
+  });
+
   it("shows an error alert when in error state", () => {
     act(() => {
       useSessionStore.getState().setFromEvent({

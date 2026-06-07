@@ -134,6 +134,9 @@ export function DevMockEmitter() {
       <button type="button" onClick={() => setStatus("connected")}>
         接続
       </button>
+      <button type="button" onClick={() => setStatus("reconnecting")}>
+        再接続中
+      </button>
       <button type="button" onClick={() => setStatus("error")}>
         エラー
       </button>

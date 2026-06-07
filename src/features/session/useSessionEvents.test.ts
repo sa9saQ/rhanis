@@ -144,6 +144,25 @@ describe("useSessionEvents", () => {
     await waitFor(() => expect(mockStopSession).toHaveBeenCalledTimes(1));
   });
 
+  it("(P1-b) fires stopSession when listen() rejects during a reconnecting session (koe-byf)", async () => {
+    // Pre-condition: session is reconnecting — the backend supervisor is actively
+    // re-opening (billable) connections, so a dropped status channel must force-stop
+    // it (else the reconnect storm runs unbounded with the UI stuck on the error).
+    act(() => {
+      useSessionStore.getState().setFromEvent({ state: "reconnecting", sequence: 1 });
+    });
+    expect(useSessionStore.getState().status).toBe("reconnecting");
+
+    mockStopSession.mockResolvedValueOnce(undefined);
+    ipcShouldReject = true;
+    renderHook(() => useSessionEvents());
+
+    await waitFor(() =>
+      expect(useSessionStore.getState().listenerFailed).toBe(true),
+    );
+    await waitFor(() => expect(mockStopSession).toHaveBeenCalledTimes(1));
+  });
+
   it("(P1-b) does NOT fire stopSession when listen() rejects in idle state (no orphan)", async () => {
     // No session running — no backend to stop.
     expect(useSessionStore.getState().status).toBe("idle");

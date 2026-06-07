@@ -138,8 +138,18 @@ export interface ApprovalRequest {
 
 export type ApprovalDecision = "approve" | "deny";
 
-/** Raw connection state reported by the backend on `session-status`. */
-export type SessionConnState = "idle" | "connecting" | "connected" | "error";
+/**
+ * Raw connection state reported by the backend on `session-status`.
+ * `reconnecting` (koe-byf) is emitted by the session supervisor while it
+ * exponential-backoff-retries a recoverable transport drop; the session is NOT
+ * over (neither `connected` nor a terminal `idle`/`error`).
+ */
+export type SessionConnState =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "error";
 
 export interface SessionStatusEvent {
   state: SessionConnState;
@@ -189,6 +199,7 @@ export interface CostSnapshot {
 export type DisplayStatus =
   | "idle" // 待機
   | "connecting" // 準備
+  | "reconnecting" // 再接続中 (koe-byf)
   | "conversing" // 会話
   | "working" // 作業
   | "error"; // エラー

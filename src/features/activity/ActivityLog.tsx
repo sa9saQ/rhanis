@@ -22,6 +22,7 @@ const THINKING_VISIBLE = 3;
 const STATUS_META: Record<DisplayStatus, { label: string; tone: string }> = {
   idle: { label: "待機", tone: "idle" },
   connecting: { label: "準備", tone: "connecting" },
+  reconnecting: { label: "再接続中", tone: "reconnecting" },
   conversing: { label: "会話", tone: "conversing" },
   working: { label: "作業", tone: "working" },
   error: { label: "エラー", tone: "error" },

@@ -36,15 +36,23 @@ export function useSessionEvents(): void {
         // stuck on 'idle' silently (or 'loading' if startSession already ran).
         if (active) {
           const store = useSessionStore.getState();
-          // FAIL-CLOSED (cost-protection P1): if the listener fails while a
-          // session is already running (status === "connected" | "loading"),
+          // FAIL-CLOSED (cost-protection P1): if the listener fails while a session
+          // is already running (status === "connected" | "loading" | "reconnecting"),
           // fire an idempotent stopSession so the backend is not left running
-          // unbounded with no UI way to reach it.  setListenerError() is called
-          // first so the store transitions to listenerFailed=true / status="error",
-          // which unblocks stopSession() for the listenerFailed path.
+          // unbounded with no UI way to reach it. `reconnecting` (koe-byf) is a LIVE
+          // session — the backend supervisor is actively re-opening (billable)
+          // connections — so it MUST be force-stopped here too, else a dropped status
+          // channel during a reconnect storm leaves the supervisor reconnecting
+          // unbounded with the UI stuck on the listener error. setListenerError() is
+          // called first so the store transitions to listenerFailed=true /
+          // status="error", which unblocks stopSession() for the listenerFailed path.
           const priorStatus = store.status;
           store.setListenerError();
-          if (priorStatus === "connected" || priorStatus === "loading") {
+          if (
+            priorStatus === "connected" ||
+            priorStatus === "loading" ||
+            priorStatus === "reconnecting"
+          ) {
             // Best-effort — Rust stop_session is idempotent; ignore rejections
             // here since the UI is already showing the fatal listener error.
             void useSessionStore.getState().stopSession();
