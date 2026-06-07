@@ -251,22 +251,44 @@ describe("ingestThinkingEvent — thinking trace (glass-box M1)", () => {
     expect(t.confidence).toBeUndefined();
   });
 
-  it("a disclosure precedes (lower sequence) the tool it describes, sharing actionId", () => {
-    // The backend mints the disclosure's sequence BEFORE it dispatches, so a
-    // disclosure's sequence is below the `start` of the action it describes; both
-    // live in their own stream but relate through actionId.
+  it("consumes a disclosure once its action starts (ephemeral window)", () => {
+    // The disclosure window is ephemeral: once the tool-event for the same
+    // actionId arrives, the "about to" disclosure is dropped so it never lingers
+    // beside the live action or after it completes. Before the start it is shown,
+    // and — since the backend mints it before dispatching — it is sequenced below
+    // the start it precedes.
     const s = useActivityStore.getState();
     s.ingestThinkingEvent(think({ eventId: "t1", actionId: "shared", sequence: 1 }));
+    const before = selectRecentThinking(useActivityStore.getState());
+    expect(before).toHaveLength(1);
+    expect(before[0].sequence).toBeLessThan(2); // below the start it precedes
     s.ingestToolEvent(ev({ eventId: "e1", actionId: "shared", sequence: 2, phase: "start" }));
-    const state = useActivityStore.getState();
-    const disclosure = selectRecentThinking(state)[0];
-    const toolStart = state.events.find((e) => e.phase === "start");
-    expect(disclosure.actionId).toBe("shared");
-    expect(state.actions.get("shared")?.actionId).toBe("shared");
-    expect(toolStart).toBeDefined();
-    if (toolStart) {
-      expect(disclosure.sequence).toBeLessThan(toolStart.sequence);
-    }
+    // Consumed: the action is now live, so the disclosure is gone.
+    expect(selectRecentThinking(useActivityStore.getState())).toHaveLength(0);
+    expect(useActivityStore.getState().actions.get("shared")?.actionId).toBe("shared");
+  });
+
+  it("keeps disclosures for OTHER actions when one action starts", () => {
+    const s = useActivityStore.getState();
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
+    s.ingestThinkingEvent(think({ eventId: "t2", actionId: "a2", sequence: 2 }));
+    s.ingestToolEvent(ev({ eventId: "e1", actionId: "a1", sequence: 3, phase: "start" }));
+    // Only a1's disclosure is consumed; a2 is still pending.
+    expect(selectRecentThinking(useActivityStore.getState()).map((t) => t.actionId)).toEqual([
+      "a2",
+    ]);
+  });
+
+  it("clears pending disclosures when the session stops (idle) or errors", () => {
+    const s = useActivityStore.getState();
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
+    s.setSessionStatus({ state: "idle", sequence: 1 });
+    expect(useActivityStore.getState().thinking).toHaveLength(0);
+    expect(useActivityStore.getState().seenThinkingIds.size).toBe(0);
+    // And on error.
+    s.ingestThinkingEvent(think({ eventId: "t2", actionId: "a2", sequence: 2 }));
+    s.setSessionStatus({ state: "error", error: "boom", sequence: 2 });
+    expect(useActivityStore.getState().thinking).toHaveLength(0);
   });
 
   it("reset clears the thinking trace", () => {

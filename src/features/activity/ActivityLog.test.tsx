@@ -65,9 +65,13 @@ describe("ActivityLog", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("接続に失敗しました");
   });
 
-  it("hides the thinking trace when there is nothing to disclose", () => {
+  it("keeps the thinking live region mounted (empty) so the first disclosure is announced", () => {
     render(<ActivityLog />);
-    expect(screen.queryByLabelText("考えていること")).not.toBeInTheDocument();
+    // The aria-live region must already exist before content arrives (a11y), so it
+    // is always mounted — present but carrying no disclosure rows when idle.
+    const region = screen.getByLabelText("考えていること");
+    expect(region).toBeInTheDocument();
+    expect(region.querySelectorAll("li")).toHaveLength(0);
   });
 
   it("discloses what koe is about to do, with the verifiable tool (glass-box M1)", () => {

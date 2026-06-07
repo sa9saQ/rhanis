@@ -830,17 +830,22 @@ where
                     },
                     journal_drop_warned,
                 );
-            }
 
-            // Disclose the imminent action BEFORE the tool runs (glass-box M1,
-            // koe-sua.1). Emitted synchronously here — after the in-flight cap has
-            // admitted the call, but BEFORE the dispatch task is spawned — so the
-            // `thinking-event` always precedes this call's `tool-event` phase=start
-            // (which the dispatcher emits inside the spawned task) and lands inside
-            // the 300–700ms thinking window rather than after a silent pause. Built
-            // from the call_id + tool NAME only; the (still-unparsed) ARGUMENTS
-            // below are never passed in, so no PII / secret can reach the disclosure.
-            emit_thinking(&pending.call_id, &pending.name);
+                // Disclose the imminent action BEFORE the tool runs (glass-box M1,
+                // koe-sua.1) — gated on the SAME valid-name-length condition the
+                // journal and the dispatcher enforce: an over-long name is rejected
+                // by the dispatcher BEFORE it emits any tool-event, so a disclosure
+                // for it would be a dangling orphan (a thinking-event with no
+                // following tool-event start, which the store could never consume).
+                // Emitted synchronously here — after the in-flight cap admitted the
+                // call, but BEFORE the dispatch task is spawned — so this
+                // thinking-event always precedes the call's `tool-event` phase=start
+                // (emitted inside the spawned task) and lands inside the 300–700ms
+                // window rather than after a silent pause. Built from the call_id +
+                // tool NAME only; the (still-unparsed) ARGUMENTS below are never
+                // passed in, so no PII / secret can reach the disclosure.
+                emit_thinking(&pending.call_id, &pending.name);
+            }
 
             // Only now that the cap has admitted the call do we parse the
             // (already size-capped) arguments. Default to null so a malformed blob
@@ -1995,6 +2000,58 @@ mod tests {
                 "no argument value may reach the thinking closure"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_name_emits_no_thinking_event() {
+        // An over-long tool name is rejected by the dispatcher BEFORE it emits any
+        // tool-event ("tool name too long"), so a disclosure for it would be a
+        // dangling orphan (thinking-event with no following tool-event). emit_thinking
+        // is gated on the SAME valid-name-length condition as the journal, so an
+        // over-long name produces NO disclosure (R-B).
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_for_think = Arc::clone(&seen);
+        let emit_thinking = move |_call_id: &str, tool: &str| {
+            seen_for_think.lock().unwrap().push(tool.to_string());
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+        let huge_name = "x".repeat(MAX_TOOL_NAME_LEN + 1);
+        let frames = vec![serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_1",
+            "name": huge_name,
+            "arguments": "{}"
+        })];
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            emit_thinking,
+        )
+        .await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "an over-long tool name must NOT emit a (dangling) thinking-event"
+        );
     }
 
     #[test]

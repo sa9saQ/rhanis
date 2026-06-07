@@ -134,14 +134,15 @@ export function ActivityLog() {
 
       {/* Thinking window (glass-box M1, koe-sua.1): what koe is about to do,
           disclosed BEFORE the tool runs so a silent pause reads as deliberation.
-          Hidden when there is nothing to disclose. */}
-      {thinking.length > 0 && (
-        <ul className="koe-thinking" aria-label="考えていること" aria-live="polite">
-          {thinking.slice(0, THINKING_VISIBLE).map((t) => (
-            <ThinkingRow key={t.eventId} thought={t} />
-          ))}
-        </ul>
-      )}
+          The live region is ALWAYS mounted (empty when idle) — like koe-live
+          below — so assistive tech registers it first and reliably announces the
+          first disclosure (the most important one, in the 300-700ms window); a
+          region inserted together with its content is announced unreliably. */}
+      <ul className="koe-thinking" aria-label="考えていること" aria-live="polite">
+        {thinking.slice(0, THINKING_VISIBLE).map((t) => (
+          <ThinkingRow key={t.eventId} thought={t} />
+        ))}
+      </ul>
 
       <div className="koe-live" aria-live="polite">
         {active.length === 0 ? (

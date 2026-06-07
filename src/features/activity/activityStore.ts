@@ -189,11 +189,26 @@ export const useActivityStore = create<ActivityState>((set) => ({
         }
       }
 
+      // A disclosure's job ends the moment its action actually starts: once a
+      // tool-event for this `actionId` arrives, drop the "about to" disclosure so
+      // the thinking window stays EPHEMERAL (the pre-tool 300-700ms window) and
+      // never lingers next to the live action or after it completes (R-C). Only
+      // rebuild when something is actually removed, to avoid needless churn.
+      const hadThinking = state.thinking.some((t) => t.actionId === event.actionId);
+      const thinking = hadThinking
+        ? state.thinking.filter((t) => t.actionId !== event.actionId)
+        : state.thinking;
+      const seenThinkingIds = hadThinking
+        ? new Set(thinking.map((t) => t.eventId))
+        : state.seenThinkingIds;
+
       return {
         ...state,
         seenEventIds: retainedEventIds,
         events,
         actions,
+        thinking,
+        seenThinkingIds,
         lastSequence: Math.max(state.lastSequence, event.sequence),
       };
     }),
@@ -226,11 +241,16 @@ export const useActivityStore = create<ActivityState>((set) => ({
       if (status.sequence <= state.lastSessionSequence) {
         return state;
       }
+      // A stopped (idle) or failed (error) session has nothing "about to happen":
+      // drop stale pending disclosures so the present-tense thinking window never
+      // outlives its session (R-B/R-C). `connecting`/`connected` leave it intact.
+      const ended = status.state === "idle" || status.state === "error";
       return {
         ...state,
         connState: status.state,
         lastError: status.state === "error" ? (status.error ?? "unknown error") : null,
         lastSessionSequence: status.sequence,
+        ...(ended ? { thinking: [], seenThinkingIds: new Set<string>() } : {}),
       };
     }),
 
