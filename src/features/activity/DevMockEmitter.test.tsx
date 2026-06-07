@@ -1,11 +1,20 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DevMockEmitter } from "./DevMockEmitter";
 import { selectActiveActions, useActivityStore } from "./activityStore";
 
 beforeEach(() => {
+  // Fake timers so a click's DEFERRED store updates (the mock emitters use
+  // setTimeout for progress/done and the post-disclosure tool start) cannot fire
+  // during a LATER test and contaminate its state (CodeRabbit).
+  vi.useFakeTimers();
   useActivityStore.getState().reset();
+});
+
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
 });
 
 describe("DevMockEmitter", () => {

@@ -272,14 +272,15 @@ async fn finalize_session_slot<F>(
 /// `ThinkingEvent` in `src/features/activity/types.ts`.
 ///
 /// Verifiable-action-first redaction: EVERY field is derived from the tool NAME
-/// (a safe, bounded identifier) — never from the tool ARGUMENTS, the model's raw
-/// chain-of-thought, a path, or the BYOK key. `plan` / `source` come from a fixed
-/// tool→label table (the same redaction discipline as the dispatcher's
-/// tool-name-derived `displaySummary`); an unknown / oversized name falls back to
-/// a generic phrase and a length-bounded `tool`, so a hostile model cannot drive
-/// arguments, secrets, or an oversized string into the payload. The calibrated
-/// confidence label (koe-sua.2) is deliberately absent — the calibration layer
-/// that would earn it does not exist yet, so M1 never fabricates one.
+/// (a safe identifier) — never from the tool ARGUMENTS, the model's raw
+/// chain-of-thought, a path, or the BYOK key. `plan` / `source` / `tool` come from
+/// a fixed ALLOWLIST table (the same redaction discipline as the dispatcher's
+/// tool-name-derived `displaySummary`); an unknown / model-controlled name is NOT
+/// named (`tool` = None) and falls back to a generic phrase, so a hostile model
+/// cannot drive arguments, secrets, or an arbitrary string into the payload. The
+/// calibrated confidence label (koe-sua.2) is deliberately absent — the
+/// calibration layer that would earn it does not exist yet, so M1 never
+/// fabricates one.
 ///
 /// transaction N/A · idempotency_key N/A (display-only disclosure, not billing).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -306,15 +307,17 @@ impl ThinkingEvent {
     /// derived from that globally-unique sequence — uniqueness is all the
     /// display-only dedup needs (this id is never echoed back like an approval id).
     fn for_tool(call_id: &str, tool_name: &str, sequence: u64) -> Self {
-        let (plan, source) = disclosure_for_tool(tool_name);
-        // Bound the displayed tool name (char-wise so UTF-8 is never split) the same
-        // way the dispatcher/journal bound it, so a hostile oversized name cannot
-        // bloat the payload. Empty name → no `tool` field.
-        let tool = if tool_name.is_empty() {
-            None
-        } else {
-            Some(tool_name.chars().take(MAX_TOOL_NAME_LEN).collect::<String>())
+        // Only an ALLOWLISTED (known) tool yields a specific disclosure AND is named
+        // in the payload. An unknown, model-controlled name is NEVER echoed to the
+        // WebView (defense-in-depth: an arbitrary external string must not ride the
+        // payload — CodeRabbit); it falls back to a generic, name-less plan. Known
+        // names are short literals, so no length bound is needed.
+        let disclosure = disclosure_for_tool(tool_name);
+        let (plan, source) = match disclosure {
+            Some((p, s)) => (p.to_string(), s.map(str::to_string)),
+            None => ("ツールを使おうとしています".to_string(), None),
         };
+        let tool = disclosure.map(|_| tool_name.to_string());
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -332,26 +335,26 @@ impl ThinkingEvent {
     }
 }
 
-/// Maps a tool NAME to a redacted, human-safe disclosure: the action phrase the
-/// operator sees ("ウェブを検索しています") and the coarse source kind ("web"). This is
-/// the SAME redaction discipline as the dispatcher's tool-name-derived
-/// `displaySummary` — derived from the (safe, bounded) tool name, never the
-/// arguments. An unknown name falls back to a generic phrase with no source, so a
-/// new / hostile tool name still produces a safe, non-leaking disclosure.
-fn disclosure_for_tool(tool_name: &str) -> (String, Option<String>) {
-    let (plan, source): (&str, Option<&str>) = match tool_name {
-        "web_search" => ("ウェブを検索しています", Some("web")),
-        "read_file" => ("ファイルを読み込んでいます", Some("ファイル")),
-        "take_screenshot" => ("画面を確認しています", Some("画面")),
-        "write_note" => ("ノートに書き留めています", Some("ノート")),
-        "write_file" => ("ファイルに書き込もうとしています", Some("ファイル")),
-        "open_url" => ("リンクを開こうとしています", Some("web")),
-        "open_app" => ("アプリを起動しようとしています", None),
-        "run_command" => ("コマンドを実行しようとしています", None),
-        "delete_file" => ("ファイルを削除しようとしています", Some("ファイル")),
-        _ => ("ツールを使おうとしています", None),
-    };
-    (plan.to_string(), source.map(str::to_string))
+/// Maps an ALLOWLISTED tool NAME to a redacted, human-safe disclosure: the action
+/// phrase the operator sees ("ウェブを検索しています") and the coarse source kind
+/// ("web"). Returns `None` for any name NOT on the allowlist, so an unknown /
+/// model-controlled name is never surfaced (the caller shows a generic, name-less
+/// plan instead). This is the SAME redaction discipline as the dispatcher's
+/// tool-name-derived `displaySummary` — derived from the tool name, never the
+/// arguments, and only for names koe actually knows.
+fn disclosure_for_tool(tool_name: &str) -> Option<(&'static str, Option<&'static str>)> {
+    match tool_name {
+        "web_search" => Some(("ウェブを検索しています", Some("web"))),
+        "read_file" => Some(("ファイルを読み込んでいます", Some("ファイル"))),
+        "take_screenshot" => Some(("画面を確認しています", Some("画面"))),
+        "write_note" => Some(("ノートに書き留めています", Some("ノート"))),
+        "write_file" => Some(("ファイルに書き込もうとしています", Some("ファイル"))),
+        "open_url" => Some(("リンクを開こうとしています", Some("web"))),
+        "open_app" => Some(("アプリを起動しようとしています", None)),
+        "run_command" => Some(("コマンドを実行しようとしています", None)),
+        "delete_file" => Some(("ファイルを削除しようとしています", Some("ファイル"))),
+        _ => None,
+    }
 }
 
 /// The session read loop. Generic over the frame source `S` and an `emit`
@@ -2074,25 +2077,28 @@ mod tests {
     }
 
     #[test]
-    fn thinking_event_unknown_tool_falls_back_safely() {
-        // An unknown / new tool name still yields a safe, non-leaking disclosure: a
-        // generic plan, no source, and the (bounded) tool name — never a panic or a
-        // leak. `source` is omitted from the JSON when None.
+    fn thinking_event_unknown_tool_is_not_named() {
+        // An unknown / model-controlled tool name yields a safe, name-LESS disclosure:
+        // a generic plan, no source, and NO `tool` — the arbitrary external name is
+        // never echoed to the WebView (CodeRabbit). Both omitted fields drop from JSON.
         let e = ThinkingEvent::for_tool("c", "totally_new_tool", 1);
         assert_eq!(e.plan, "ツールを使おうとしています");
         assert_eq!(e.source, None);
-        assert_eq!(e.tool.as_deref(), Some("totally_new_tool"));
+        assert_eq!(e.tool, None);
         let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("tool").is_none(), "an unknown name must not appear in the payload");
         assert!(v.get("source").is_none(), "absent source is omitted, not null");
     }
 
     #[test]
-    fn thinking_event_oversized_tool_name_is_bounded() {
-        // A hostile oversized tool name cannot bloat the payload: the displayed
-        // name is char-bounded to MAX_TOOL_NAME_LEN.
+    fn thinking_event_oversized_tool_name_is_not_echoed() {
+        // A hostile oversized tool name is (by construction) not on the allowlist,
+        // so it is never echoed — `tool` is None, regardless of length. No arbitrary
+        // string can reach the payload.
         let huge = "x".repeat(MAX_TOOL_NAME_LEN * 4);
         let e = ThinkingEvent::for_tool("c", &huge, 1);
-        assert_eq!(e.tool.as_deref().map(str::chars).map(Iterator::count), Some(MAX_TOOL_NAME_LEN));
+        assert_eq!(e.tool, None);
+        assert_eq!(e.plan, "ツールを使おうとしています");
     }
 
     // ---- conversation log wiring (koe-emd) -----------------------------------
