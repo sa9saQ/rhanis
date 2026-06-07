@@ -31,3 +31,9 @@ dist-ssr
 # Local build/dev artifacts (not part of the repo)
 # WSL ALSA build workaround: libasound2-dev .deb extracted manually for cpal
 *.deb
+
+# Local-only koe presentation drafts (intro / roadmap pages). Kept on disk,
+# NOT published — sa9saQ/koe is a public repo and the roadmap is internal.
+# Promote to tracked docs/ when a public version is intentionally decided.
+/docs/koe-intro.html
+/docs/koe-roadmap.html
