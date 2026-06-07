@@ -1,11 +1,20 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DevMockEmitter } from "./DevMockEmitter";
 import { selectActiveActions, useActivityStore } from "./activityStore";
 
 beforeEach(() => {
+  // Fake timers so a click's DEFERRED store updates (the mock emitters use
+  // setTimeout for progress/done and the post-disclosure tool start) cannot fire
+  // during a LATER test and contaminate its state (CodeRabbit).
+  vi.useFakeTimers();
   useActivityStore.getState().reset();
+});
+
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
 });
 
 describe("DevMockEmitter", () => {
@@ -15,6 +24,20 @@ describe("DevMockEmitter", () => {
       fireEvent.click(screen.getByRole("button", { name: /tool 実行/ }));
     });
     expect(selectActiveActions(useActivityStore.getState()).length).toBeGreaterThan(0);
+  });
+
+  it("discloses thinking before the tool runs (glass-box M1)", () => {
+    render(<DevMockEmitter />);
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: /思考→tool/ }));
+    });
+    // The disclosure is emitted synchronously; the tool start is deferred, so at
+    // this instant only the thinking disclosure is present — i.e. think-before-act.
+    const thinking = useActivityStore.getState().thinking;
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].tool).toBe("web_search");
+    expect(thinking[0].plan).toBe("ウェブを検索しています");
+    expect(selectActiveActions(useActivityStore.getState())).toHaveLength(0);
   });
 
   it("enqueues a DANGER approval", () => {

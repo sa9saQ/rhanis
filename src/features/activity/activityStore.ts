@@ -20,11 +20,20 @@ import type {
   DisplayStatus,
   SessionConnState,
   SessionStatusEvent,
+  ThinkingEvent,
   ToolEvent,
 } from "./types";
 
 /** Max number of tool events retained in the visible log. */
 export const EVENT_CAP = 100;
+
+/**
+ * Max number of thinking disclosures retained in the visible trace (glass-box
+ * M1, koe-sua.1). Smaller than {@link EVENT_CAP}: the trace is a short "what koe
+ * is thinking right now" window, not a full audit log, and is bounded so a
+ * continuously-running session cannot grow it without limit.
+ */
+export const THINKING_CAP = 50;
 
 /**
  * Hard cap on the action map. Completed actions prune out via the event window,
@@ -47,12 +56,20 @@ interface ActivityState {
   actions: Map<string, ActionState>;
   /** Pending approvals, FIFO. The head is the one shown in the modal. */
   approvalQueue: ApprovalRequest[];
+  /**
+   * Live thinking trace, ordered ascending by `sequence`, capped at
+   * {@link THINKING_CAP} (glass-box M1, koe-sua.1).
+   */
+  thinking: ThinkingEvent[];
+  /** De-duplication set of seen thinking `eventId`s, bounded to the retained window. */
+  seenThinkingIds: Set<string>;
   /** Highest `sequence` seen across all tool events. */
   lastSequence: number;
   /** Highest `sequence` seen across session-status events (own counter space). */
   lastSessionSequence: number;
 
   ingestToolEvent: (event: ToolEvent) => void;
+  ingestThinkingEvent: (event: ThinkingEvent) => void;
   setSessionStatus: (status: SessionStatusEvent) => void;
   enqueueApproval: (request: ApprovalRequest) => void;
   dequeueApproval: (approvalId: string) => void;
@@ -75,6 +92,8 @@ function initialState() {
     seenEventIds: new Set<string>(),
     actions: new Map<string, ActionState>(),
     approvalQueue: [] as ApprovalRequest[],
+    thinking: [] as ThinkingEvent[],
+    seenThinkingIds: new Set<string>(),
     lastSequence: 0,
     // -1 so a backend whose status sequence starts at 0 is not ignored.
     lastSessionSequence: -1,
@@ -170,13 +189,64 @@ export const useActivityStore = create<ActivityState>((set) => ({
         }
       }
 
+      // A disclosure stays visible through its action's EXECUTION — a perceptible
+      // window for the operator to read it and decide whether to intervene — and
+      // clears when the action COMPLETES. Clearing on the terminal event (not on
+      // `start`) avoids two failure modes: a disclosure that lingers after the tool
+      // finishes (R-B / Codex Cloud), and a disclosure that collapses to a ~0ms
+      // flicker because the backend emits it immediately before dispatch, so `start`
+      // follows within ~ms (cr R-B.5). Only rebuild when something is removed.
+      const clearsThinking =
+        isTerminalPhase(event.phase) &&
+        state.thinking.some((t) => t.actionId === event.actionId);
+      const thinking = clearsThinking
+        ? state.thinking.filter((t) => t.actionId !== event.actionId)
+        : state.thinking;
+      const seenThinkingIds = clearsThinking
+        ? new Set(thinking.map((t) => t.eventId))
+        : state.seenThinkingIds;
+
       return {
         ...state,
         seenEventIds: retainedEventIds,
         events,
         actions,
+        thinking,
+        seenThinkingIds,
         lastSequence: Math.max(state.lastSequence, event.sequence),
       };
+    }),
+
+  // Fold a thinking disclosure (glass-box M1, koe-sua.1) into the live trace.
+  // A flat, append-and-sort trace — NOT folded per action like tool events —
+  // because a disclosure is a point-in-time "about to do X", not a lifecycle.
+  // Same dedup/order discipline as tool events: drop a duplicate `eventId`,
+  // order by `sequence`, cap, and bound the dedup set to the retained window so
+  // a continuously-running session cannot grow memory without limit.
+  ingestThinkingEvent: (event) =>
+    set((state) => {
+      if (state.seenThinkingIds.has(event.eventId)) {
+        return state; // duplicate — ignore
+      }
+      // A disclosure is valid until its action COMPLETES. If the action already
+      // exists AND is terminal (done/error) — a replay, or a disclosure delivered
+      // after its tool-event on the separate, unordered Tauri channel — the "about
+      // to" is stale, so drop it (Codex Cloud P2). An ACTIVE action keeps its
+      // disclosure: the intent is still accurate while the tool runs, and it clears
+      // on the terminal tool-event above.
+      const existingAction = state.actions.get(event.actionId);
+      if (existingAction && isTerminalPhase(existingAction.phase)) {
+        return state;
+      }
+      const thinking = [...state.thinking, event].sort((a, b) => a.sequence - b.sequence);
+      if (thinking.length > THINKING_CAP) {
+        thinking.splice(0, thinking.length - THINKING_CAP);
+      }
+      // Track only the retained window (bounded memory), matching the tool-event
+      // dedup discipline — a disclosure so old it was evicted may slip back in,
+      // which is harmless for a display-only trace.
+      const seenThinkingIds = new Set(thinking.map((e) => e.eventId));
+      return { ...state, thinking, seenThinkingIds };
     }),
 
   setSessionStatus: (status) =>
@@ -185,11 +255,16 @@ export const useActivityStore = create<ActivityState>((set) => ({
       if (status.sequence <= state.lastSessionSequence) {
         return state;
       }
+      // A stopped (idle) or failed (error) session has nothing "about to happen":
+      // drop stale pending disclosures so the present-tense thinking window never
+      // outlives its session (R-B/R-C). `connecting`/`connected` leave it intact.
+      const ended = status.state === "idle" || status.state === "error";
       return {
         ...state,
         connState: status.state,
         lastError: status.state === "error" ? (status.error ?? "unknown error") : null,
         lastSessionSequence: status.sequence,
+        ...(ended ? { thinking: [], seenThinkingIds: new Set<string>() } : {}),
       };
     }),
 
@@ -217,6 +292,15 @@ export function selectActiveActions(state: ActivityState): ActionState[] {
   return [...state.actions.values()]
     .filter((a) => isActivePhase(a.phase))
     .sort((a, b) => a.startedAt - b.startedAt);
+}
+
+/**
+ * Recent thinking disclosures, newest first — for the live "考えていること" trace
+ * (glass-box M1, koe-sua.1). The view slices the head to show only the freshest
+ * few; the store keeps the rest within {@link THINKING_CAP}.
+ */
+export function selectRecentThinking(state: ActivityState): ThinkingEvent[] {
+  return [...state.thinking].reverse();
 }
 
 /**

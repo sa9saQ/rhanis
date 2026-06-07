@@ -152,6 +152,52 @@
   border-radius: 6px;
 }
 
+/* --- THINKING (glass-box M1, koe-sua.1): the pre-tool disclosure window. --- */
+.koe-thinking {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.koe-thinking-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 11px;
+  /* Distinct radius from cards/log on purpose (anti-AI-smell). */
+  border-radius: 7px;
+  border-left: 3px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  font-size: 13px;
+  animation: koe-rise var(--dur-enter) var(--ease-decel);
+}
+.koe-thinking-glyph {
+  flex: none;
+}
+.koe-thinking-plan {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.koe-thinking-tool {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.koe-thinking-source {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
 /* --- LIVE --- */
 .koe-live {
   min-height: 44px;
@@ -298,7 +344,8 @@
   .koe-spinner,
   .koe-tone-connecting,
   .koe-tone-working,
-  .koe-live-action {
+  .koe-live-action,
+  .koe-thinking-row {
     animation: none;
   }
 }

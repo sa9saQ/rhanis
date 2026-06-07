@@ -64,4 +64,32 @@ describe("ActivityLog", () => {
     expect(screen.getByText("エラー")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("接続に失敗しました");
   });
+
+  it("keeps the thinking live region mounted (empty) so the first disclosure is announced", () => {
+    render(<ActivityLog />);
+    // The aria-live region must already exist before content arrives (a11y), so it
+    // is always mounted — present but carrying no disclosure rows when idle.
+    const region = screen.getByLabelText("考えていること");
+    expect(region).toBeInTheDocument();
+    expect(region.querySelectorAll("li")).toHaveLength(0);
+  });
+
+  it("discloses what koe is about to do, with the verifiable tool (glass-box M1)", () => {
+    render(<ActivityLog />);
+    act(() => {
+      useActivityStore.getState().ingestThinkingEvent({
+        eventId: "t1",
+        actionId: "a1",
+        sequence: 1,
+        phase: "deciding",
+        plan: "ウェブを検索しています",
+        tool: "web_search",
+        source: "web",
+        timestamp: 1000,
+      });
+    });
+    expect(screen.getByLabelText("考えていること")).toBeInTheDocument();
+    expect(screen.getByText("ウェブを検索しています")).toBeInTheDocument();
+    expect(screen.getByText("web_search")).toBeInTheDocument();
+  });
 });

@@ -16,13 +16,14 @@ function makeOn(key: string) {
 
 vi.mock("../../lib/tauri/ipc", () => ({
   onToolEvent: (h: (p: unknown) => void) => makeOn("tool")(h),
+  onThinkingEvent: (h: (p: unknown) => void) => makeOn("thinking")(h),
   onApprovalRequired: (h: (p: unknown) => void) => makeOn("approval")(h),
   onSessionStatus: (h: (p: unknown) => void) => makeOn("status")(h),
 }));
 
 import { useActivityStore } from "./activityStore";
 import { useActivityEvents } from "./useActivityEvents";
-import type { ApprovalRequest, ToolEvent } from "./types";
+import type { ApprovalRequest, ThinkingEvent, ToolEvent } from "./types";
 
 beforeEach(() => {
   for (const k of Object.keys(handlers)) delete handlers[k];
@@ -31,13 +32,31 @@ beforeEach(() => {
 });
 
 describe("useActivityEvents", () => {
-  it("subscribes to all three channels", async () => {
+  it("subscribes to all four channels", async () => {
     renderHook(() => useActivityEvents());
     await waitFor(() => {
       expect(handlers.tool).toBeTypeOf("function");
+      expect(handlers.thinking).toBeTypeOf("function");
       expect(handlers.approval).toBeTypeOf("function");
       expect(handlers.status).toBeTypeOf("function");
     });
+  });
+
+  it("routes thinking events into the store", async () => {
+    renderHook(() => useActivityEvents());
+    await waitFor(() => expect(handlers.thinking).toBeTypeOf("function"));
+    const event: ThinkingEvent = {
+      eventId: "t1",
+      actionId: "a1",
+      sequence: 1,
+      phase: "deciding",
+      plan: "ウェブを検索しています",
+      tool: "web_search",
+      source: "web",
+      timestamp: 1000,
+    };
+    act(() => handlers.thinking?.(event));
+    expect(useActivityStore.getState().thinking).toHaveLength(1);
   });
 
   it("routes tool events into the store", async () => {
@@ -73,7 +92,7 @@ describe("useActivityEvents", () => {
 
   it("unlistens every channel on unmount", async () => {
     const { unmount } = renderHook(() => useActivityEvents());
-    await waitFor(() => expect(unlistenSpies).toHaveLength(3));
+    await waitFor(() => expect(unlistenSpies).toHaveLength(4));
     unmount();
     await waitFor(() => {
       for (const spy of unlistenSpies) expect(spy).toHaveBeenCalledTimes(1);
