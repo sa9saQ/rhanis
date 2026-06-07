@@ -251,47 +251,54 @@ describe("ingestThinkingEvent — thinking trace (glass-box M1)", () => {
     expect(t.confidence).toBeUndefined();
   });
 
-  it("consumes a disclosure once its action starts (ephemeral window)", () => {
-    // The disclosure window is ephemeral: once the tool-event for the same
-    // actionId arrives, the "about to" disclosure is dropped so it never lingers
-    // beside the live action or after it completes. Before the start it is shown,
-    // and — since the backend mints it before dispatching — it is sequenced below
-    // the start it precedes.
+  it("keeps a disclosure visible through execution and clears it on completion", () => {
+    // The disclosure stays up while the tool runs (a perceptible window to read it
+    // and decide whether to intervene), then clears when the action COMPLETES — not
+    // the instant it starts, which would flicker for ~0ms since the backend emits
+    // the disclosure immediately before dispatch (cr R-B.5).
     const s = useActivityStore.getState();
     s.ingestThinkingEvent(think({ eventId: "t1", actionId: "shared", sequence: 1 }));
     const before = selectRecentThinking(useActivityStore.getState());
     expect(before).toHaveLength(1);
-    expect(before[0].sequence).toBeLessThan(2); // below the start it precedes
+    expect(before[0].sequence).toBeLessThan(2); // minted below the start it precedes
     s.ingestToolEvent(ev({ eventId: "e1", actionId: "shared", sequence: 2, phase: "start" }));
-    // Consumed: the action is now live, so the disclosure is gone.
+    // Still shown, beside the live action, while it runs.
+    expect(selectRecentThinking(useActivityStore.getState())).toHaveLength(1);
+    s.ingestToolEvent(ev({ eventId: "e2", actionId: "shared", sequence: 3, phase: "done" }));
+    // Cleared once the action completes.
     expect(selectRecentThinking(useActivityStore.getState())).toHaveLength(0);
     expect(useActivityStore.getState().actions.get("shared")?.actionId).toBe("shared");
   });
 
-  it("keeps disclosures for OTHER actions when one action starts", () => {
+  it("keeps OTHER actions' disclosures when one action completes", () => {
     const s = useActivityStore.getState();
     s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
     s.ingestThinkingEvent(think({ eventId: "t2", actionId: "a2", sequence: 2 }));
-    s.ingestToolEvent(ev({ eventId: "e1", actionId: "a1", sequence: 3, phase: "start" }));
-    // Only a1's disclosure is consumed; a2 is still pending.
+    s.ingestToolEvent(ev({ eventId: "e1", actionId: "a1", sequence: 3, phase: "done" }));
+    // Only a1's disclosure clears on completion; a2 is untouched.
     expect(selectRecentThinking(useActivityStore.getState()).map((t) => t.actionId)).toEqual([
       "a2",
     ]);
   });
 
-  it("drops a disclosure whose action already started (out-of-order / replay)", () => {
-    // The tool-event and thinking-event ride separate, unordered Tauri channels:
-    // a tool-event can reach the store BEFORE its thinking-event (or the disclosure
-    // is replayed after being consumed). The disclosure is then stale — its action
-    // is already live — so it must NOT appear beside/after the live action.
+  it("drops a stale disclosure for a COMPLETED action but allows one beside an ACTIVE action", () => {
+    // The tool-event and thinking-event ride separate, unordered Tauri channels, so
+    // a tool-event can reach the store before its thinking-event. If the action is
+    // already terminal the disclosure is stale (drop it, Codex Cloud P2); if it is
+    // merely active the disclosure is still accurate intent and rides alongside.
     const s = useActivityStore.getState();
-    s.ingestToolEvent(ev({ eventId: "e1", actionId: "x", sequence: 2, phase: "start" }));
-    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "x", sequence: 1 }));
-    expect(selectRecentThinking(useActivityStore.getState())).toHaveLength(0);
-    // A replay after consumption is likewise rejected while the action is retained.
-    s.ingestToolEvent(ev({ eventId: "e2", actionId: "y", sequence: 3, phase: "start" }));
-    s.ingestThinkingEvent(think({ eventId: "t2", actionId: "y", sequence: 4 }));
-    expect(selectRecentThinking(useActivityStore.getState())).toHaveLength(0);
+    // Already completed → stale → dropped.
+    s.ingestToolEvent(ev({ eventId: "e1", actionId: "done1", sequence: 2, phase: "done" }));
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "done1", sequence: 1 }));
+    expect(
+      selectRecentThinking(useActivityStore.getState()).some((t) => t.actionId === "done1"),
+    ).toBe(false);
+    // Active (started, not done) → accurate intent → shown beside the live action.
+    s.ingestToolEvent(ev({ eventId: "e2", actionId: "live1", sequence: 3, phase: "start" }));
+    s.ingestThinkingEvent(think({ eventId: "t2", actionId: "live1", sequence: 4 }));
+    expect(
+      selectRecentThinking(useActivityStore.getState()).some((t) => t.actionId === "live1"),
+    ).toBe(true);
   });
 
   it("clears pending disclosures when the session stops (idle) or errors", () => {

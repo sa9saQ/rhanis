@@ -189,16 +189,20 @@ export const useActivityStore = create<ActivityState>((set) => ({
         }
       }
 
-      // A disclosure's job ends the moment its action actually starts: once a
-      // tool-event for this `actionId` arrives, drop the "about to" disclosure so
-      // the thinking window stays EPHEMERAL (the pre-tool 300-700ms window) and
-      // never lingers next to the live action or after it completes (R-C). Only
-      // rebuild when something is actually removed, to avoid needless churn.
-      const hadThinking = state.thinking.some((t) => t.actionId === event.actionId);
-      const thinking = hadThinking
+      // A disclosure stays visible through its action's EXECUTION — a perceptible
+      // window for the operator to read it and decide whether to intervene — and
+      // clears when the action COMPLETES. Clearing on the terminal event (not on
+      // `start`) avoids two failure modes: a disclosure that lingers after the tool
+      // finishes (R-B / Codex Cloud), and a disclosure that collapses to a ~0ms
+      // flicker because the backend emits it immediately before dispatch, so `start`
+      // follows within ~ms (cr R-B.5). Only rebuild when something is removed.
+      const clearsThinking =
+        isTerminalPhase(event.phase) &&
+        state.thinking.some((t) => t.actionId === event.actionId);
+      const thinking = clearsThinking
         ? state.thinking.filter((t) => t.actionId !== event.actionId)
         : state.thinking;
-      const seenThinkingIds = hadThinking
+      const seenThinkingIds = clearsThinking
         ? new Set(thinking.map((t) => t.eventId))
         : state.seenThinkingIds;
 
@@ -224,14 +228,14 @@ export const useActivityStore = create<ActivityState>((set) => ({
       if (state.seenThinkingIds.has(event.eventId)) {
         return state; // duplicate — ignore
       }
-      // Order-independent ephemeral invariant: a disclosure is only valid BEFORE
-      // its action starts. The tool-event and thinking-event ride SEPARATE Tauri
-      // channels with no cross-channel ordering, so a tool-event can reach the
-      // store first; and a disclosure can be replayed after `ingestToolEvent`
-      // consumed it. In either case the action already exists, so the "about to"
-      // is stale — drop it rather than show a phantom row beside/after the live or
-      // finished action (Codex Cloud P2).
-      if (state.actions.has(event.actionId)) {
+      // A disclosure is valid until its action COMPLETES. If the action already
+      // exists AND is terminal (done/error) — a replay, or a disclosure delivered
+      // after its tool-event on the separate, unordered Tauri channel — the "about
+      // to" is stale, so drop it (Codex Cloud P2). An ACTIVE action keeps its
+      // disclosure: the intent is still accurate while the tool runs, and it clears
+      // on the terminal tool-event above.
+      const existingAction = state.actions.get(event.actionId);
+      if (existingAction && isTerminalPhase(existingAction.phase)) {
         return state;
       }
       const thinking = [...state.thinking, event].sort((a, b) => a.sequence - b.sequence);
