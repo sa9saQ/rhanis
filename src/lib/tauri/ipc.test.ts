@@ -25,6 +25,7 @@ import {
   onApprovalRequired,
   onCostUpdate,
   onSessionStatus,
+  onThinkingEvent,
   onToolEvent,
   resolveToolApproval,
   saveBudgetConfig,
@@ -38,6 +39,7 @@ import type {
   ApprovalRequest,
   CostSnapshot,
   SessionStatusEvent,
+  ThinkingEvent,
   ToolEvent,
 } from "../../features/activity/types";
 
@@ -59,6 +61,21 @@ describe("ipc event subscriptions", () => {
     expect(channel).toBe(EVENT.toolEvent);
 
     const payload = { eventId: "e1" } as ToolEvent;
+    cb({ payload });
+    expect(captured).toBe(payload);
+  });
+
+  it("onThinkingEvent listens on the thinking-event channel and unwraps the payload", async () => {
+    let captured: ThinkingEvent | undefined;
+    await onThinkingEvent((e) => {
+      captured = e;
+    });
+    const [channel, cb] = listen.mock.calls[0] as [
+      string,
+      (e: { payload: ThinkingEvent }) => void,
+    ];
+    expect(channel).toBe(EVENT.thinkingEvent);
+    const payload = { eventId: "t1" } as ThinkingEvent;
     cb({ payload });
     expect(captured).toBe(payload);
   });

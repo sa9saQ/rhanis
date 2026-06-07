@@ -267,6 +267,93 @@ async fn finalize_session_slot<F>(
     }
 }
 
+/// Live "what koe is about to do" disclosure emitted on the `thinking-event`
+/// channel (glass-box M1, koe-sua.1). Field names are camelCased to match
+/// `ThinkingEvent` in `src/features/activity/types.ts`.
+///
+/// Verifiable-action-first redaction: EVERY field is derived from the tool NAME
+/// (a safe, bounded identifier) — never from the tool ARGUMENTS, the model's raw
+/// chain-of-thought, a path, or the BYOK key. `plan` / `source` come from a fixed
+/// tool→label table (the same redaction discipline as the dispatcher's
+/// tool-name-derived `displaySummary`); an unknown / oversized name falls back to
+/// a generic phrase and a length-bounded `tool`, so a hostile model cannot drive
+/// arguments, secrets, or an oversized string into the payload. The calibrated
+/// confidence label (koe-sua.2) is deliberately absent — the calibration layer
+/// that would earn it does not exist yet, so M1 never fabricates one.
+///
+/// transaction N/A · idempotency_key N/A (display-only disclosure, not billing).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThinkingEvent {
+    event_id: String,
+    action_id: String,
+    sequence: u64,
+    /// M1 emits only `"deciding"` (the model chose an action and is about to act).
+    phase: String,
+    plan: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    timestamp: i64,
+}
+
+impl ThinkingEvent {
+    /// Builds a disclosure for an imminent tool call from its NAME only (never its
+    /// arguments). `sequence` shares the global counter, minted BEFORE the dispatch
+    /// is spawned, so a disclosure always sorts below the `tool-event` start it
+    /// precedes (the frontend's cross-stream ordering invariant). `event_id` is
+    /// derived from that globally-unique sequence — uniqueness is all the
+    /// display-only dedup needs (this id is never echoed back like an approval id).
+    fn for_tool(call_id: &str, tool_name: &str, sequence: u64) -> Self {
+        let (plan, source) = disclosure_for_tool(tool_name);
+        // Bound the displayed tool name (char-wise so UTF-8 is never split) the same
+        // way the dispatcher/journal bound it, so a hostile oversized name cannot
+        // bloat the payload. Empty name → no `tool` field.
+        let tool = if tool_name.is_empty() {
+            None
+        } else {
+            Some(tool_name.chars().take(MAX_TOOL_NAME_LEN).collect::<String>())
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        ThinkingEvent {
+            event_id: format!("think-{sequence}"),
+            action_id: call_id.to_string(),
+            sequence,
+            phase: "deciding".to_string(),
+            plan,
+            tool,
+            source,
+            timestamp,
+        }
+    }
+}
+
+/// Maps a tool NAME to a redacted, human-safe disclosure: the action phrase the
+/// operator sees ("ウェブを検索しています") and the coarse source kind ("web"). This is
+/// the SAME redaction discipline as the dispatcher's tool-name-derived
+/// `displaySummary` — derived from the (safe, bounded) tool name, never the
+/// arguments. An unknown name falls back to a generic phrase with no source, so a
+/// new / hostile tool name still produces a safe, non-leaking disclosure.
+fn disclosure_for_tool(tool_name: &str) -> (String, Option<String>) {
+    let (plan, source): (&str, Option<&str>) = match tool_name {
+        "web_search" => ("ウェブを検索しています", Some("web")),
+        "read_file" => ("ファイルを読み込んでいます", Some("ファイル")),
+        "take_screenshot" => ("画面を確認しています", Some("画面")),
+        "write_note" => ("ノートに書き留めています", Some("ノート")),
+        "write_file" => ("ファイルに書き込もうとしています", Some("ファイル")),
+        "open_url" => ("リンクを開こうとしています", Some("web")),
+        "open_app" => ("アプリを起動しようとしています", None),
+        "run_command" => ("コマンドを実行しようとしています", None),
+        "delete_file" => ("ファイルを削除しようとしています", Some("ファイル")),
+        _ => ("ツールを使おうとしています", None),
+    };
+    (plan.to_string(), source.map(str::to_string))
+}
+
 /// The session read loop. Generic over the frame source `S` and an `emit`
 /// closure `F` so it runs with no live socket and no `AppHandle` in tests.
 ///
@@ -303,7 +390,7 @@ async fn finalize_session_slot<F>(
 /// when its `AbortHandle::abort()` is called.  This meant already-queued PCM
 /// could still be flushed after an abnormal stop.
 #[allow(clippy::too_many_arguments)]
-async fn run_read_loop<S, F, EC, A, SA>(
+async fn run_read_loop<S, F, EC, ET, A, SA>(
     mut stream: S,
     provider: Arc<dyn RealtimeProvider>,
     write_tx: mpsc::Sender<Message>,
@@ -324,10 +411,18 @@ async fn run_read_loop<S, F, EC, A, SA>(
     // to the UI. Injected (not an `AppHandle`) so the loop stays unit-testable with a
     // no-op closure — the same AppHandle-free discipline as `emit` / `audio_handler`.
     emit_cost: EC,
+    // Pre-tool thinking disclosure emitter (glass-box M1, koe-sua.1): called with
+    // (call_id, tool_name) when a function call arrives, BEFORE the dispatch is
+    // spawned, so `start_session` can push a redacted `thinking-event` to the UI.
+    // Injected (not an `AppHandle`) for the same AppHandle-free unit-testability as
+    // `emit` / `emit_cost`. The tool ARGUMENTS are deliberately NOT passed — the
+    // closure derives a safe disclosure from the name alone (verifiable-action-first).
+    emit_thinking: ET,
 ) where
     S: Stream<Item = Result<Message, WsError>> + Unpin,
     F: Fn(&str, Option<&str>),
     EC: Fn(u32, u64, BudgetConfig),
+    ET: Fn(&str, &str),
     A: Fn(&serde_json::Value),
     SA: Fn(bool), // true = graceful (flush tail), false = immediate (discard tail)
 {
@@ -435,7 +530,7 @@ async fn run_read_loop<S, F, EC, A, SA>(
                             &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
                             &dispatcher, &mut dispatch_tasks, &mut save_failures,
                             &mut pending, &mut cap_warned, &mut journal_drop_warned,
-                            &emit_cost,
+                            &emit_cost, &emit_thinking,
                         ).await {
                             LoopAction::Continue => {}
                             // Carry the terminal error reason out to finalize so it
@@ -613,7 +708,7 @@ fn enqueue_record(
 /// transcript FIRST, so the turn is journalled before a `Usage` budget gate could
 /// stop the loop. The first `Stop` short-circuits the rest of the frame's events.
 #[allow(clippy::too_many_arguments)]
-async fn handle_text<EC>(
+async fn handle_text<EC, ET>(
     event: &Value,
     provider: &Arc<dyn RealtimeProvider>,
     write_tx: &mpsc::Sender<Message>,
@@ -627,9 +722,11 @@ async fn handle_text<EC>(
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
     emit_cost: &EC,
+    emit_thinking: &ET,
 ) -> LoopAction
 where
     EC: Fn(u32, u64, BudgetConfig),
+    ET: Fn(&str, &str),
 {
     for ev in provider.parse_frame(event) {
         if let LoopAction::Stop(reason) = handle_event(
@@ -645,6 +742,7 @@ where
             cap_warned,
             journal_drop_warned,
             emit_cost,
+            emit_thinking,
         )
         .await
         {
@@ -660,7 +758,7 @@ where
 /// logic; an ASR `Usage` flows through it identically, so there is no second cost
 /// path to keep in sync.)
 #[allow(clippy::too_many_arguments)]
-async fn handle_event<EC>(
+async fn handle_event<EC, ET>(
     ev: ProviderEvent,
     write_tx: &mpsc::Sender<Message>,
     cost: &Arc<TokioMutex<CostTracker>>,
@@ -673,9 +771,11 @@ async fn handle_event<EC>(
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
     emit_cost: &EC,
+    emit_thinking: &ET,
 ) -> LoopAction
 where
     EC: Fn(u32, u64, BudgetConfig),
+    ET: Fn(&str, &str),
 {
     match ev {
         ProviderEvent::FunctionCall(pending) => {
@@ -731,6 +831,16 @@ where
                     journal_drop_warned,
                 );
             }
+
+            // Disclose the imminent action BEFORE the tool runs (glass-box M1,
+            // koe-sua.1). Emitted synchronously here — after the in-flight cap has
+            // admitted the call, but BEFORE the dispatch task is spawned — so the
+            // `thinking-event` always precedes this call's `tool-event` phase=start
+            // (which the dispatcher emits inside the spawned task) and lands inside
+            // the 300–700ms thinking window rather than after a silent pause. Built
+            // from the call_id + tool NAME only; the (still-unparsed) ARGUMENTS
+            // below are never passed in, so no PII / secret can reach the disclosure.
+            emit_thinking(&pending.call_id, &pending.name);
 
             // Only now that the cap has admitted the call do we parse the
             // (already size-capped) arguments. Default to null so a malformed blob
@@ -1114,6 +1224,22 @@ pub async fn start_session(
         let _ = app_for_cost.emit("cost-update", snapshot);
     };
 
+    // Pre-tool thinking emitter (glass-box M1, koe-sua.1): when a function call
+    // arrives the read loop calls this with (call_id, tool_name) BEFORE it spawns
+    // the dispatch, so this `thinking-event` always precedes the dispatcher's
+    // `tool-event` phase=start (and shares the SAME `seq` counter, so a disclosure
+    // sequences below the start it precedes). The payload is built from the tool
+    // NAME only — `ThinkingEvent::for_tool` redacts/bounds it — so no key / path /
+    // PII / tool argument ever reaches the WebView. Owns its own `AppHandle` +
+    // sequence clones so the spawned loop stays `'static`.
+    let app_for_thinking = app.clone();
+    let seq_for_thinking = Arc::clone(&seq.0);
+    let emit_thinking = move |call_id: &str, tool_name: &str| {
+        use tauri::Emitter;
+        let payload = ThinkingEvent::for_tool(call_id, tool_name, seq_for_thinking.next());
+        let _ = app_for_thinking.emit("thinking-event", payload);
+    };
+
     // Detached: the loop clears the session slot + emits idle on its own exit;
     // stop_session signals it via shutdown_tx rather than holding its handle.
     // `generation` was minted above (right after the is_some check) and
@@ -1135,6 +1261,7 @@ pub async fn start_session(
         stop_audio,
         Some(writer_abort_handle),
         emit_cost,
+        emit_thinking,
     ));
 
     *guard = Some(ActiveSession {
@@ -1432,7 +1559,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_graceful: bool| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},));
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},));
 
         // Let A's loop reach its select and park on the pending stream.
         tokio::task::yield_now().await;
@@ -1495,7 +1623,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         assert_eq!(
@@ -1546,7 +1675,8 @@ mod tests {
             Arc::new(AtomicBool::new(false)), // mic NOT running → pre-loop early return
             |_| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         assert_eq!(
@@ -1600,7 +1730,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         assert_eq!(
@@ -1648,7 +1779,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         assert!(
@@ -1701,7 +1833,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         let emitted: Vec<_> = log.lock().unwrap().clone();
@@ -1745,6 +1878,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
 
@@ -1754,6 +1888,154 @@ mod tests {
         let f2 = write_rx.recv().await.expect("response.create frame");
         assert!(matches!(f1, Message::Text(_)));
         assert!(matches!(f2, Message::Text(_)));
+    }
+
+    // ---- thinking-event disclosure (glass-box M1, koe-sua.1) ------------------
+
+    #[tokio::test]
+    async fn thinking_event_emitted_before_tool_dispatch() {
+        // The glass-box M1 ordering invariant: when a function call arrives, the
+        // read loop discloses (`emit_thinking`) the imminent action BEFORE it
+        // dispatches the tool — i.e. before the dispatcher emits that call's
+        // `tool-event` phase=start. We prove the order with a SINGLE shared log:
+        // the thinking emitter appends "think:…" and a dispatcher double appends
+        // "dispatch:…" when it runs, so the recorded order IS the real order. The
+        // disclosure is built from the tool NAME only, so the request's "secret"
+        // argument must never reach what the closure sees (redaction).
+        let order: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        // A dispatcher double that records its run into the shared order log.
+        struct OrderDispatcher(Arc<StdMutex<Vec<String>>>);
+        impl DispatcherSeam for OrderDispatcher {
+            fn dispatch(
+                &self,
+                call: FunctionCall,
+            ) -> crate::realtime_types::BoxFuture<'static, crate::realtime_types::DispatchResult>
+            {
+                let log = Arc::clone(&self.0);
+                Box::pin(async move {
+                    log.lock().unwrap().push(format!("dispatch:{}", call.name));
+                    crate::realtime_types::function_call_output(&call.call_id, "{\"ok\":true}".into())
+                })
+            }
+            fn tool_schemas(&self) -> Vec<crate::realtime_types::ToolSchema> {
+                Vec::new()
+            }
+        }
+
+        let disp = Arc::new(OrderDispatcher(Arc::clone(&order)));
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        // Recording emit_thinking: append "think:<call_id>:<tool>" to the SAME
+        // order log, and stash the raw (call_id, tool) the closure received so we
+        // can assert no argument leaked into what the disclosure is built from.
+        let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let order_for_think = Arc::clone(&order);
+        let seen_for_think = Arc::clone(&seen);
+        let emit_thinking = move |call_id: &str, tool: &str| {
+            order_for_think
+                .lock()
+                .unwrap()
+                .push(format!("think:{call_id}:{tool}"));
+            seen_for_think
+                .lock()
+                .unwrap()
+                .push((call_id.to_string(), tool.to_string()));
+        };
+
+        let frames = vec![serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_1",
+            "name": "web_search",
+            "arguments": "{\"query\":\"secret\"}"
+        })];
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            disp.clone() as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            emit_thinking,
+        )
+        .await;
+
+        let log = order.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "think:call_1:web_search".to_string(),
+                "dispatch:web_search".to_string(),
+            ],
+            "the thinking disclosure must be emitted BEFORE the tool is dispatched"
+        );
+        // The closure is handed the tool NAME only — never the arguments — so the
+        // request's "secret" query cannot reach the disclosure it builds.
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![("call_1".to_string(), "web_search".to_string())]);
+        for (call_id, tool) in &seen {
+            assert!(
+                !call_id.contains("secret") && !tool.contains("secret"),
+                "no argument value may reach the thinking closure"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_event_payload_is_redacted_and_camelcased() {
+        // The serialized payload matches `ThinkingEvent` in
+        // src/features/activity/types.ts (camelCase) and carries only redacted,
+        // tool-NAME-derived fields — never a raw-CoT or args field.
+        let e = ThinkingEvent::for_tool("call_42", "web_search", 7);
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["eventId"], "think-7");
+        assert_eq!(v["actionId"], "call_42");
+        assert_eq!(v["sequence"], 7);
+        assert_eq!(v["phase"], "deciding");
+        assert_eq!(v["plan"], "ウェブを検索しています");
+        assert_eq!(v["tool"], "web_search");
+        assert_eq!(v["source"], "web");
+        // The calibration label (koe-sua.2) is never fabricated in M1.
+        assert!(v.get("confidence").is_none());
+        assert!(v["timestamp"].is_i64());
+    }
+
+    #[test]
+    fn thinking_event_unknown_tool_falls_back_safely() {
+        // An unknown / new tool name still yields a safe, non-leaking disclosure: a
+        // generic plan, no source, and the (bounded) tool name — never a panic or a
+        // leak. `source` is omitted from the JSON when None.
+        let e = ThinkingEvent::for_tool("c", "totally_new_tool", 1);
+        assert_eq!(e.plan, "ツールを使おうとしています");
+        assert_eq!(e.source, None);
+        assert_eq!(e.tool.as_deref(), Some("totally_new_tool"));
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("source").is_none(), "absent source is omitted, not null");
+    }
+
+    #[test]
+    fn thinking_event_oversized_tool_name_is_bounded() {
+        // A hostile oversized tool name cannot bloat the payload: the displayed
+        // name is char-bounded to MAX_TOOL_NAME_LEN.
+        let huge = "x".repeat(MAX_TOOL_NAME_LEN * 4);
+        let e = ThinkingEvent::for_tool("c", &huge, 1);
+        assert_eq!(e.tool.as_deref().map(str::chars).map(Iterator::count), Some(MAX_TOOL_NAME_LEN));
     }
 
     // ---- conversation log wiring (koe-emd) -----------------------------------
@@ -1822,7 +2104,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         let recorded = events.lock().unwrap();
@@ -1901,6 +2184,7 @@ mod tests {
             |_| {},
             None,
             move |m: u32, u: u64, b: BudgetConfig| sink.lock().unwrap().push((m, u, b)),
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
 
@@ -1985,6 +2269,7 @@ mod tests {
             |_| {},
             None,
             move |m: u32, u: u64, b: BudgetConfig| sink.lock().unwrap().push((m, u, b)),
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
 
@@ -2072,6 +2357,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
 
@@ -2125,6 +2411,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
 
@@ -2218,7 +2505,8 @@ mod tests {
             &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
-        &|_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
+        &|_ci: &str, _tn: &str| {},)
         .await
     }
 
@@ -2492,7 +2780,8 @@ mod tests {
             &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
-        &|_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
+        &|_ci: &str, _tn: &str| {},)
         .await;
         assert!(
             matches!(r1, LoopAction::Continue),
@@ -2520,7 +2809,8 @@ mod tests {
             &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
-        &|_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
+        &|_ci: &str, _tn: &str| {},)
         .await;
         assert!(
             matches!(r2, LoopAction::Stop("monthly budget exceeded")),
@@ -2584,7 +2874,8 @@ mod tests {
             &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
-        &|_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
+        &|_ci: &str, _tn: &str| {},)
         .await;
         assert!(
             matches!(result, LoopAction::Continue),
@@ -2680,6 +2971,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
         assert!(log.lock().unwrap().iter().any(|(s, _)| s == "idle"));
@@ -2801,7 +3093,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         // Both journal writes (the transcript + the tool turn) were actually
@@ -2864,7 +3157,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         assert!(
@@ -2916,7 +3210,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             |_| {},
             None,
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         // The abnormal exit emitted the terminal error...
@@ -2958,6 +3253,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
         let events = log.lock().unwrap();
@@ -3006,6 +3302,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
         assert_eq!(disp.calls.lock().unwrap().as_slice(), ["write_note"]);
@@ -3045,6 +3342,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
         assert!(log
@@ -3092,6 +3390,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
         // The unparseable frame was skipped and the following valid call dispatched.
@@ -3156,6 +3455,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
 
@@ -3202,6 +3502,7 @@ mod tests {
             move |_| { sac.store(true, Ordering::SeqCst); },
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
         let events = log.lock().unwrap();
@@ -3251,6 +3552,7 @@ mod tests {
             move |_| { sc.store(true, Ordering::SeqCst); },
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
         let events = log.lock().unwrap();
@@ -3304,6 +3606,7 @@ mod tests {
             |_| {},
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
         // The oversized frame was dropped but the following valid dispatch fired.
@@ -3352,6 +3655,7 @@ mod tests {
             |_| {},
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
         // Oversized args must be dropped — the tool must NOT be dispatched.
@@ -3417,7 +3721,8 @@ mod tests {
             Arc::new(AtomicBool::new(false)), // mic already lost → abnormal exit
             move |_| { sc.store(true, Ordering::SeqCst); },
             Some(abort_handle),
-        |_month: u32, _used: u64, _budget: BudgetConfig| {},)
+        |_month: u32, _used: u64, _budget: BudgetConfig| {},
+        |_call_id: &str, _tool: &str| {},)
         .await;
 
         // Verify the emitted events show an abnormal exit.
@@ -3503,6 +3808,7 @@ mod tests {
             |_| {},
             None, // normal close: don't pass AbortHandle so writer runs to completion
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
         )
         .await;
 
@@ -3598,7 +3904,8 @@ mod tests {
             &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
-            &move |m: u32, u: u64, b: BudgetConfig| sink.lock().unwrap().push((m, u, b)),
+            &move |mo: u32, us: u64, bg: BudgetConfig| sink.lock().unwrap().push((mo, us, bg)),
+            &|_call_id: &str, _tool: &str| {},
         )
         .await;
         (action, emits)

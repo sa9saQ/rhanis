@@ -3,11 +3,13 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   EVENT_CAP,
   MAX_ACTIONS,
+  THINKING_CAP,
   selectActiveActions,
   selectDisplayStatus,
+  selectRecentThinking,
   useActivityStore,
 } from "./activityStore";
-import type { ApprovalRequest, ToolEvent, ToolPhase } from "./types";
+import type { ApprovalRequest, ThinkingEvent, ToolEvent, ToolPhase } from "./types";
 
 function ev(
   partial: Pick<ToolEvent, "eventId" | "actionId" | "sequence" | "phase"> & Partial<ToolEvent>,
@@ -16,6 +18,19 @@ function ev(
     tool: "web_search",
     timestamp: partial.sequence * 1000,
     displaySummary: "searching the web",
+    ...partial,
+  };
+}
+
+function think(
+  partial: Pick<ThinkingEvent, "eventId" | "actionId" | "sequence"> & Partial<ThinkingEvent>,
+): ThinkingEvent {
+  return {
+    phase: "deciding",
+    plan: "ウェブを検索しています",
+    tool: "web_search",
+    source: "web",
+    timestamp: partial.sequence * 1000,
     ...partial,
   };
 }
@@ -175,6 +190,91 @@ describe("ingestToolEvent — action folding", () => {
     // The most recent action survives; the oldest is evicted.
     expect(actions.has(`a${total}`)).toBe(true);
     expect(actions.has("a1")).toBe(false);
+  });
+});
+
+describe("ingestThinkingEvent — thinking trace (glass-box M1)", () => {
+  it("folds a disclosure into the live trace", () => {
+    const s = useActivityStore.getState();
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
+    expect(useActivityStore.getState().thinking).toHaveLength(1);
+    expect(selectRecentThinking(useActivityStore.getState())[0].eventId).toBe("t1");
+  });
+
+  it("ignores a duplicate eventId", () => {
+    const s = useActivityStore.getState();
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
+    expect(useActivityStore.getState().thinking).toHaveLength(1);
+  });
+
+  it("orders the trace by sequence regardless of arrival order", () => {
+    const s = useActivityStore.getState();
+    s.ingestThinkingEvent(think({ eventId: "t3", actionId: "a3", sequence: 3 }));
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
+    s.ingestThinkingEvent(think({ eventId: "t2", actionId: "a2", sequence: 2 }));
+    expect(useActivityStore.getState().thinking.map((t) => t.sequence)).toEqual([1, 2, 3]);
+  });
+
+  it("exposes the newest disclosure first to the view", () => {
+    const s = useActivityStore.getState();
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
+    s.ingestThinkingEvent(think({ eventId: "t2", actionId: "a2", sequence: 2 }));
+    expect(selectRecentThinking(useActivityStore.getState()).map((t) => t.eventId)).toEqual([
+      "t2",
+      "t1",
+    ]);
+  });
+
+  it("caps the trace at THINKING_CAP, keeping the highest sequences", () => {
+    const s = useActivityStore.getState();
+    for (let i = 1; i <= THINKING_CAP + 10; i++) {
+      s.ingestThinkingEvent(think({ eventId: `t${i}`, actionId: `a${i}`, sequence: i }));
+    }
+    const { thinking, seenThinkingIds } = useActivityStore.getState();
+    expect(thinking).toHaveLength(THINKING_CAP);
+    expect(thinking[0].sequence).toBe(11);
+    expect(thinking[thinking.length - 1].sequence).toBe(THINKING_CAP + 10);
+    expect(seenThinkingIds.size).toBeLessThanOrEqual(THINKING_CAP);
+  });
+
+  it("carries a redacted plan + verifiable act, never a raw-CoT field", () => {
+    // The shape itself enforces verifiable-action-first: a ThinkingEvent has no
+    // free-text reasoning field. Assert the disclosure is exactly plan + tool /
+    // source, and that the calibration label (koe-sua.2) stays unset in M1.
+    const s = useActivityStore.getState();
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
+    const t = selectRecentThinking(useActivityStore.getState())[0];
+    expect(t.plan).toBe("ウェブを検索しています");
+    expect(t.tool).toBe("web_search");
+    expect(t.source).toBe("web");
+    expect(t.confidence).toBeUndefined();
+  });
+
+  it("a disclosure precedes (lower sequence) the tool it describes, sharing actionId", () => {
+    // The backend mints the disclosure's sequence BEFORE it dispatches, so a
+    // disclosure's sequence is below the `start` of the action it describes; both
+    // live in their own stream but relate through actionId.
+    const s = useActivityStore.getState();
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "shared", sequence: 1 }));
+    s.ingestToolEvent(ev({ eventId: "e1", actionId: "shared", sequence: 2, phase: "start" }));
+    const state = useActivityStore.getState();
+    const disclosure = selectRecentThinking(state)[0];
+    const toolStart = state.events.find((e) => e.phase === "start");
+    expect(disclosure.actionId).toBe("shared");
+    expect(state.actions.get("shared")?.actionId).toBe("shared");
+    expect(toolStart).toBeDefined();
+    if (toolStart) {
+      expect(disclosure.sequence).toBeLessThan(toolStart.sequence);
+    }
+  });
+
+  it("reset clears the thinking trace", () => {
+    const s = useActivityStore.getState();
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
+    s.reset();
+    expect(useActivityStore.getState().thinking).toHaveLength(0);
+    expect(useActivityStore.getState().seenThinkingIds.size).toBe(0);
   });
 });
 

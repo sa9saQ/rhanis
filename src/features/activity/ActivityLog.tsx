@@ -5,10 +5,18 @@
 import { useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 
-import { selectActiveActions, selectDisplayStatus, useActivityStore } from "./activityStore";
+import {
+  selectActiveActions,
+  selectDisplayStatus,
+  selectRecentThinking,
+  useActivityStore,
+} from "./activityStore";
 import { CostHeader } from "./CostHeader";
-import type { ActionState, DisplayStatus, ToolEvent } from "./types";
+import type { ActionState, DisplayStatus, ThinkingEvent, ToolEvent } from "./types";
 import "./ActivityLog.css";
+
+/** How many recent disclosures the thinking trace shows at once. */
+const THINKING_VISIBLE = 3;
 
 /** Japanese label + dot tone for each derived status. */
 const STATUS_META: Record<DisplayStatus, { label: string; tone: string }> = {
@@ -53,6 +61,24 @@ function LiveAction({ action, now }: { action: ActionState; now: number }) {
   );
 }
 
+/**
+ * One thinking disclosure (glass-box M1, koe-sua.1): what koe is about to do and
+ * the verifiable act (tool / source). Shows the redacted `plan` + the checkable
+ * tool/source — never raw chain-of-thought, which the backend does not send.
+ */
+function ThinkingRow({ thought }: { thought: ThinkingEvent }) {
+  return (
+    <li className="koe-thinking-row">
+      <span className="koe-thinking-glyph" aria-hidden>
+        💭
+      </span>
+      <span className="koe-thinking-plan">{thought.plan}</span>
+      {thought.tool && <span className="koe-thinking-tool">{thought.tool}</span>}
+      {thought.source && <span className="koe-thinking-source">{thought.source}</span>}
+    </li>
+  );
+}
+
 const PHASE_GLYPH: Record<ToolEvent["phase"], string> = {
   start: "▶",
   progress: "…",
@@ -77,6 +103,7 @@ export function ActivityLog() {
   // `selectActiveActions` builds a fresh array; `useShallow` compares its
   // contents so the component doesn't re-render (and loop) every tick.
   const active = useActivityStore(useShallow(selectActiveActions));
+  const thinking = useActivityStore(useShallow(selectRecentThinking));
   const events = useActivityStore((s) => s.events);
   const pendingApprovals = useActivityStore((s) => s.approvalQueue.length);
   const lastError = useActivityStore((s) => s.lastError);
@@ -103,6 +130,17 @@ export function ActivityLog() {
         <p className="koe-error-line" role="alert">
           {lastError}
         </p>
+      )}
+
+      {/* Thinking window (glass-box M1, koe-sua.1): what koe is about to do,
+          disclosed BEFORE the tool runs so a silent pause reads as deliberation.
+          Hidden when there is nothing to disclose. */}
+      {thinking.length > 0 && (
+        <ul className="koe-thinking" aria-label="考えていること" aria-live="polite">
+          {thinking.slice(0, THINKING_VISIBLE).map((t) => (
+            <ThinkingRow key={t.eventId} thought={t} />
+          ))}
+        </ul>
       )}
 
       <div className="koe-live" aria-live="polite">

@@ -9,6 +9,8 @@ const getAppSettings = vi.fn();
 // — those must be in the mock to avoid "not a function" errors.
 vi.mock("./lib/tauri/ipc", () => ({
   onToolEvent: vi.fn().mockResolvedValue(() => {}),
+  // Thinking-event wiring (glass-box M1, koe-sua.1) — useActivityEvents subscribes.
+  onThinkingEvent: vi.fn().mockResolvedValue(() => {}),
   onApprovalRequired: vi.fn().mockResolvedValue(() => {}),
   onSessionStatus: vi.fn().mockResolvedValue(() => {}),
   // Cost snapshot wiring (koe-9xi) — useCostEvents subscribes + pulls on mount.

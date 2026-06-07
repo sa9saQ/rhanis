@@ -38,6 +38,73 @@ export interface ToolEvent {
 }
 
 /**
+ * Phase of a `thinking-event` disclosure. M1 (koe-sua.1) emits only `"deciding"`
+ * — the model has chosen its next verifiable action and is about to take it. The
+ * union is intentionally narrow: it carries exactly what the backend emits today,
+ * so a future milestone (e.g. a post-action `"reflecting"`) extends it explicitly
+ * rather than leaving an unimplemented value documented as live.
+ */
+export type ThinkingPhase = "deciding";
+
+/**
+ * Emitted by the backend on the `thinking-event` channel in the 300–700ms
+ * "thinking window" just BEFORE a tool runs — and, by construction, before that
+ * tool's `tool-event` phase=start: the backend emits this synchronously in the
+ * read loop before it spawns the dispatch that produces the tool-event, so a
+ * disclosure always precedes the action it describes. This is koe's glass-box M1
+ * (koe-sua.1): the operator sees *what koe is about to do and why* instead of a
+ * silent pause.
+ *
+ * Verifiable-action-first: `plan` is a redacted, tool-derived one-line of the
+ * NEXT action ("ウェブを検索しています"); `tool` / `source` are the verifiable act
+ * (which tool, what kind of source). The model's raw chain-of-thought is NEVER
+ * included — disclosed CoT can be up to 36% unfaithful (Turpin et al. 2305.04388),
+ * so koe discloses checkable behaviour, not narration. Payloads are pre-redacted
+ * by the backend (no API key / absolute path / PII / tool arguments — see
+ * CLAUDE.md).
+ *
+ * Same ordering/dedup discipline as {@link ToolEvent}: `eventId` de-duplicates,
+ * `sequence` (the SAME globally-monotonic counter ToolEvent uses) orders, and
+ * `actionId` ties a disclosure to the tool call it precedes.
+ */
+export interface ThinkingEvent {
+  /** Unique per emit. Primary de-duplication key. */
+  eventId: string;
+  /**
+   * Ties this disclosure to the tool call it precedes (= the upcoming
+   * ToolEvent.actionId / Realtime call_id).
+   */
+  actionId: string;
+  /**
+   * Globally monotonic counter, shared with ToolEvent.sequence. Because the
+   * backend mints this BEFORE it dispatches, a disclosure's sequence is always
+   * below the `start` of the tool it precedes. Used only for display ordering.
+   */
+  sequence: number;
+  phase: ThinkingPhase;
+  /** Redacted, human-safe one-line of the NEXT action. Never raw chain-of-thought. */
+  plan: string;
+  /**
+   * The verifiable tool about to run, e.g. "web_search". Absent for a disclosure
+   * with no concrete tool.
+   */
+  tool?: string;
+  /**
+   * Coarse, redacted kind of source consulted/produced, e.g. "web" / "ファイル".
+   * Absent when the action consults no external source.
+   */
+  source?: string;
+  /**
+   * Reserved for the calibrated discrete confidence label (koe-sua.2). Always
+   * unset in M1 — the calibration layer that would earn a trustworthy label does
+   * not exist yet, so the backend never fabricates one here.
+   */
+  confidence?: string;
+  /** Backend epoch milliseconds. */
+  timestamp: number;
+}
+
+/**
  * Risk tier of an operation (see CLAUDE.md safety gate). This union is a
  * forward-looking superset: in M1 the backend only ever emits an
  * `ApprovalRequest` for **DANGER** (the 30s human gate). CAUTION is

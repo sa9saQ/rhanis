@@ -12,6 +12,7 @@ import type {
   ApprovalRequest,
   CostSnapshot,
   SessionStatusEvent,
+  ThinkingEvent,
   ToolEvent,
 } from "../../features/activity/types";
 import type { AppSettings, PermissionPolicy } from "../../features/settings/types";
@@ -29,6 +30,8 @@ export type Provider = VoiceProvider | ToolProvider;
 /** Backend event channels. */
 export const EVENT = {
   toolEvent: "tool-event",
+  // Pre-tool thinking disclosure pushed just before a tool runs (glass-box M1, koe-sua.1).
+  thinkingEvent: "thinking-event",
   approvalRequired: "tool-approval-required",
   sessionStatus: "session-status",
   // Live monthly cost snapshot pushed on each usage frame (koe-9xi).
@@ -68,6 +71,16 @@ export const COMMAND = {
 /** Subscribe to live tool events. Returns an unlisten function. */
 export function onToolEvent(handler: (event: ToolEvent) => void): Promise<UnlistenFn> {
   return listen<ToolEvent>(EVENT.toolEvent, (e) => handler(e.payload));
+}
+
+/**
+ * Subscribe to live thinking disclosures (glass-box M1, koe-sua.1). The backend
+ * pushes one just before a tool runs — before that tool's `tool-event` — so the
+ * UI can show what koe is about to do inside the 300–700ms thinking window.
+ * Returns an unlisten function.
+ */
+export function onThinkingEvent(handler: (event: ThinkingEvent) => void): Promise<UnlistenFn> {
+  return listen<ThinkingEvent>(EVENT.thinkingEvent, (e) => handler(e.payload));
 }
 
 /** Subscribe to approval requests. Returns an unlisten function. */

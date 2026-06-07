@@ -6,7 +6,12 @@
 import { useEffect } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
-import { onApprovalRequired, onSessionStatus, onToolEvent } from "../../lib/tauri/ipc";
+import {
+  onApprovalRequired,
+  onSessionStatus,
+  onThinkingEvent,
+  onToolEvent,
+} from "../../lib/tauri/ipc";
 import { useActivityStore } from "./activityStore";
 
 export function useActivityEvents(): void {
@@ -37,6 +42,7 @@ export function useActivityEvents(): void {
     };
 
     subscribe(onToolEvent, (event) => store.ingestToolEvent(event));
+    subscribe(onThinkingEvent, (event) => store.ingestThinkingEvent(event));
     subscribe(onApprovalRequired, (request) => store.enqueueApproval(request));
     subscribe(onSessionStatus, (status) => store.setSessionStatus(status));
 

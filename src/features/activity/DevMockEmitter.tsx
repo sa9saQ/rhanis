@@ -47,6 +47,50 @@ function emitMockToolRun(): void {
   }, 2600);
 }
 
+/**
+ * Demonstrates the glass-box M1 disclosure (koe-sua.1): a thinking-event is
+ * pushed FIRST, then ~400ms later (inside the 300–700ms thinking window) the
+ * tool goes live — mirroring the backend's "disclose before you act" ordering so
+ * the operator console can be exercised on Windows before a live session exists.
+ */
+function emitMockThinkingThenTool(): void {
+  const actionId = `mock-${nextSeq()}`;
+
+  // 1) The disclosure — emitted before the tool, lower sequence than its start.
+  useActivityStore.getState().ingestThinkingEvent({
+    eventId: `${actionId}-think`,
+    actionId,
+    sequence: nextSeq(),
+    phase: "deciding",
+    plan: "ウェブを検索しています",
+    tool: "web_search",
+    source: "web",
+    timestamp: Date.now(),
+  });
+
+  // 2) ~400ms later the tool starts, then completes — the action the disclosure
+  //    promised. Same actionId, so a disclosure lines up with its tool call.
+  const base = { actionId, tool: "web_search", timestamp: Date.now() };
+  setTimeout(() => {
+    useActivityStore.getState().ingestToolEvent({
+      ...base,
+      eventId: `${actionId}-start`,
+      sequence: nextSeq(),
+      phase: "start",
+      displaySummary: "「東京の天気」を検索中",
+    });
+  }, 400);
+  setTimeout(() => {
+    useActivityStore.getState().ingestToolEvent({
+      ...base,
+      eventId: `${actionId}-done`,
+      sequence: nextSeq(),
+      phase: "done",
+      displaySummary: "検索完了",
+    });
+  }, 1600);
+}
+
 /** Enqueues a fake approval with a 30s deadline. */
 function emitMockApproval(risk: ApprovalRisk): void {
   const id = `mock-approval-${nextSeq()}`;
@@ -77,6 +121,9 @@ export function DevMockEmitter() {
       <span className="koe-devmock-label">dev mock</span>
       <button type="button" onClick={emitMockToolRun}>
         tool 実行
+      </button>
+      <button type="button" onClick={emitMockThinkingThenTool}>
+        思考→tool
       </button>
       <button type="button" onClick={() => emitMockApproval("DANGER")}>
         承認要求 (DANGER)

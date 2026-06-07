@@ -20,11 +20,20 @@ import type {
   DisplayStatus,
   SessionConnState,
   SessionStatusEvent,
+  ThinkingEvent,
   ToolEvent,
 } from "./types";
 
 /** Max number of tool events retained in the visible log. */
 export const EVENT_CAP = 100;
+
+/**
+ * Max number of thinking disclosures retained in the visible trace (glass-box
+ * M1, koe-sua.1). Smaller than {@link EVENT_CAP}: the trace is a short "what koe
+ * is thinking right now" window, not a full audit log, and is bounded so a
+ * continuously-running session cannot grow it without limit.
+ */
+export const THINKING_CAP = 50;
 
 /**
  * Hard cap on the action map. Completed actions prune out via the event window,
@@ -47,12 +56,20 @@ interface ActivityState {
   actions: Map<string, ActionState>;
   /** Pending approvals, FIFO. The head is the one shown in the modal. */
   approvalQueue: ApprovalRequest[];
+  /**
+   * Live thinking trace, ordered ascending by `sequence`, capped at
+   * {@link THINKING_CAP} (glass-box M1, koe-sua.1).
+   */
+  thinking: ThinkingEvent[];
+  /** De-duplication set of seen thinking `eventId`s, bounded to the retained window. */
+  seenThinkingIds: Set<string>;
   /** Highest `sequence` seen across all tool events. */
   lastSequence: number;
   /** Highest `sequence` seen across session-status events (own counter space). */
   lastSessionSequence: number;
 
   ingestToolEvent: (event: ToolEvent) => void;
+  ingestThinkingEvent: (event: ThinkingEvent) => void;
   setSessionStatus: (status: SessionStatusEvent) => void;
   enqueueApproval: (request: ApprovalRequest) => void;
   dequeueApproval: (approvalId: string) => void;
@@ -75,6 +92,8 @@ function initialState() {
     seenEventIds: new Set<string>(),
     actions: new Map<string, ActionState>(),
     approvalQueue: [] as ApprovalRequest[],
+    thinking: [] as ThinkingEvent[],
+    seenThinkingIds: new Set<string>(),
     lastSequence: 0,
     // -1 so a backend whose status sequence starts at 0 is not ignored.
     lastSessionSequence: -1,
@@ -179,6 +198,28 @@ export const useActivityStore = create<ActivityState>((set) => ({
       };
     }),
 
+  // Fold a thinking disclosure (glass-box M1, koe-sua.1) into the live trace.
+  // A flat, append-and-sort trace — NOT folded per action like tool events —
+  // because a disclosure is a point-in-time "about to do X", not a lifecycle.
+  // Same dedup/order discipline as tool events: drop a duplicate `eventId`,
+  // order by `sequence`, cap, and bound the dedup set to the retained window so
+  // a continuously-running session cannot grow memory without limit.
+  ingestThinkingEvent: (event) =>
+    set((state) => {
+      if (state.seenThinkingIds.has(event.eventId)) {
+        return state; // duplicate — ignore
+      }
+      const thinking = [...state.thinking, event].sort((a, b) => a.sequence - b.sequence);
+      if (thinking.length > THINKING_CAP) {
+        thinking.splice(0, thinking.length - THINKING_CAP);
+      }
+      // Track only the retained window (bounded memory), matching the tool-event
+      // dedup discipline — a disclosure so old it was evicted may slip back in,
+      // which is harmless for a display-only trace.
+      const seenThinkingIds = new Set(thinking.map((e) => e.eventId));
+      return { ...state, thinking, seenThinkingIds };
+    }),
+
   setSessionStatus: (status) =>
     set((state) => {
       // Ignore stale status: a late `connected` must not clear a newer `error`.
@@ -217,6 +258,15 @@ export function selectActiveActions(state: ActivityState): ActionState[] {
   return [...state.actions.values()]
     .filter((a) => isActivePhase(a.phase))
     .sort((a, b) => a.startedAt - b.startedAt);
+}
+
+/**
+ * Recent thinking disclosures, newest first — for the live "考えていること" trace
+ * (glass-box M1, koe-sua.1). The view slices the head to show only the freshest
+ * few; the store keeps the rest within {@link THINKING_CAP}.
+ */
+export function selectRecentThinking(state: ActivityState): ThinkingEvent[] {
+  return [...state.thinking].reverse();
 }
 
 /**

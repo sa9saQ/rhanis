@@ -64,4 +64,28 @@ describe("ActivityLog", () => {
     expect(screen.getByText("エラー")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("接続に失敗しました");
   });
+
+  it("hides the thinking trace when there is nothing to disclose", () => {
+    render(<ActivityLog />);
+    expect(screen.queryByLabelText("考えていること")).not.toBeInTheDocument();
+  });
+
+  it("discloses what koe is about to do, with the verifiable tool (glass-box M1)", () => {
+    render(<ActivityLog />);
+    act(() => {
+      useActivityStore.getState().ingestThinkingEvent({
+        eventId: "t1",
+        actionId: "a1",
+        sequence: 1,
+        phase: "deciding",
+        plan: "ウェブを検索しています",
+        tool: "web_search",
+        source: "web",
+        timestamp: 1000,
+      });
+    });
+    expect(screen.getByLabelText("考えていること")).toBeInTheDocument();
+    expect(screen.getByText("ウェブを検索しています")).toBeInTheDocument();
+    expect(screen.getByText("web_search")).toBeInTheDocument();
+  });
 });
