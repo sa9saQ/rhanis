@@ -279,6 +279,21 @@ describe("ingestThinkingEvent — thinking trace (glass-box M1)", () => {
     ]);
   });
 
+  it("drops a disclosure whose action already started (out-of-order / replay)", () => {
+    // The tool-event and thinking-event ride separate, unordered Tauri channels:
+    // a tool-event can reach the store BEFORE its thinking-event (or the disclosure
+    // is replayed after being consumed). The disclosure is then stale — its action
+    // is already live — so it must NOT appear beside/after the live action.
+    const s = useActivityStore.getState();
+    s.ingestToolEvent(ev({ eventId: "e1", actionId: "x", sequence: 2, phase: "start" }));
+    s.ingestThinkingEvent(think({ eventId: "t1", actionId: "x", sequence: 1 }));
+    expect(selectRecentThinking(useActivityStore.getState())).toHaveLength(0);
+    // A replay after consumption is likewise rejected while the action is retained.
+    s.ingestToolEvent(ev({ eventId: "e2", actionId: "y", sequence: 3, phase: "start" }));
+    s.ingestThinkingEvent(think({ eventId: "t2", actionId: "y", sequence: 4 }));
+    expect(selectRecentThinking(useActivityStore.getState())).toHaveLength(0);
+  });
+
   it("clears pending disclosures when the session stops (idle) or errors", () => {
     const s = useActivityStore.getState();
     s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));

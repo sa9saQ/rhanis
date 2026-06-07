@@ -224,6 +224,16 @@ export const useActivityStore = create<ActivityState>((set) => ({
       if (state.seenThinkingIds.has(event.eventId)) {
         return state; // duplicate — ignore
       }
+      // Order-independent ephemeral invariant: a disclosure is only valid BEFORE
+      // its action starts. The tool-event and thinking-event ride SEPARATE Tauri
+      // channels with no cross-channel ordering, so a tool-event can reach the
+      // store first; and a disclosure can be replayed after `ingestToolEvent`
+      // consumed it. In either case the action already exists, so the "about to"
+      // is stale — drop it rather than show a phantom row beside/after the live or
+      // finished action (Codex Cloud P2).
+      if (state.actions.has(event.actionId)) {
+        return state;
+      }
       const thinking = [...state.thinking, event].sort((a, b) => a.sequence - b.sequence);
       if (thinking.length > THINKING_CAP) {
         thinking.splice(0, thinking.length - THINKING_CAP);
