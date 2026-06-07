@@ -1,0 +1,101 @@
+name: ci
+
+# Real CI is koe's Definition of Done: local "cargo test" / "pnpm test" being
+# green is not enough (CLAUDE.md, ci-status-gate). This runs the pure-logic
+# suites on a clean Linux runner. Audio capture / WebSocket E2E are NOT here —
+# they need a real microphone and a native Windows host (see CLAUDE.md Testing).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: CI only reads the repository. No write / PR / issue scopes.
+permissions:
+  contents: read
+
+# Drop superseded runs on the same ref so rapid pushes don't pile up minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (cargo test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # CI never pushes; drop the persisted GITHUB_TOKEN from .git/config so
+          # later steps / third-party actions get no ambient git credential.
+          persist-credentials: false
+
+      # System libraries needed to COMPILE the Tauri 2 crate graph on Linux.
+      # `cargo test` builds the whole lib, so the full webview + audio + screenshot
+      # dev stack must be present even though the headless runner opens no window:
+      #   - webkit2gtk-4.1 / soup-3.0 / gtk-3 / rsvg / appindicator  -> tauri + wry
+      #   - libasound2-dev                                           -> cpal (mic/audio)
+      #   - libdbus-1-dev                                            -> dbus-secret-service
+      #   - libxcb*-dev                                              -> xcb (xcap screenshot)
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libasound2-dev \
+            libdbus-1-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            pkg-config \
+            build-essential
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Cargo.lock is committed and verified current (cargo metadata --locked),
+      # so --locked keeps the runner reproducible and fails loud on lock drift.
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+  frontend:
+    name: Frontend (vitest + typecheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # CI never pushes; drop the persisted GITHUB_TOKEN from .git/config so
+          # later steps / third-party actions get no ambient git credential.
+          persist-credentials: false
+
+      # pnpm version comes from the "packageManager" field in package.json, so the
+      # runner uses the exact same pnpm as local development (single source).
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # --frozen-lockfile makes the install fail (instead of silently mutating the
+      # lockfile) if pnpm-lock.yaml and package.json ever drift apart.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+
+      - name: Run tests
+        run: pnpm test
