@@ -99,3 +99,48 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+
+  # koe-ef8 Step A: prove the Tauri debug build BOOTS on a native Windows host
+  # (WebView2) via tauri-driver + WebdriverIO. Smoke only — reaches the
+  # onboarding screen without opening the mic or any real API (the audio bridge
+  # is idle until a session starts, lib.rs koe-flu). The Linux jobs above cannot
+  # cover this: a WSL/Linux build links WebKitGTK, not the Windows WebView2 that
+  # ships in production. Audio + real Realtime API stay a native-Windows manual
+  # check (koe-ef8 full). Rationale: ~/research/wsl-vs-windows-ai-e2e-2026.
+  windows-e2e:
+    name: E2E smoke (Windows, tauri-driver)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # windows-latest ships Edge + a matching msedgedriver on PATH; tauri-driver
+      # forwards WebDriver to it. If WebView2 / msedgedriver versions drift the
+      # run fails loudly (documented Tauri gotcha) — add a pinned
+      # setup-msedgedriver step here if that happens.
+      - name: E2E smoke (tauri-driver + WebdriverIO)
+        run: pnpm e2e:smoke
