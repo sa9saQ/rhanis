@@ -576,7 +576,19 @@ fn build_budget_config(enabled: bool, monthly_limit_usd: Option<f64>) -> Result<
         if !(usd > 0.0 && usd <= MAX_MONTHLY_LIMIT_USD) {
             return Err("invalid budget amount".to_string());
         }
-        usd_to_nanodollars(usd).ok_or("invalid budget amount")?
+        let nano = usd_to_nanodollars(usd).ok_or("invalid budget amount")?;
+        // A positive USD below 0.5 nanodollars (< 5e-10 USD) rounds to 0 (koe-he8).
+        // Persisting `enabled` + `limit = 0` is a degenerate cap: `is_over` returns
+        // true for any total (blocks everything immediately), and the load-time
+        // validator (`validate_app_settings`) rejects `enabled` + zero limit as
+        // Corrupt. Reject it here too so the write path and the load validator
+        // enforce the SAME `0 < limit` invariant (builder/validator parity; git.md
+        // dual-validator drift). The `usd > 0.0` check above is necessary but not
+        // sufficient because rounding can still collapse a positive USD to zero.
+        if nano == 0 {
+            return Err("invalid budget amount".to_string());
+        }
+        nano
     } else {
         0
     };
@@ -842,6 +854,27 @@ mod tests {
         // is rejected; the UI requires > 0 too.
         assert!(build_budget_config(true, Some(0.0)).is_err());
         assert!(build_budget_config(true, Some(-5.0)).is_err());
+    }
+
+    #[test]
+    fn budget_enabled_tiny_positive_rounding_to_zero_is_err() {
+        // koe-he8: a positive USD below 0.5 nanodollars (< 5e-10 USD) rounds to 0.
+        // It passes `usd > 0.0` but would persist enabled + limit=0 — a degenerate
+        // "always over budget" cap that the load validator rejects as Corrupt. The
+        // write path must reject it too (builder/validator parity).
+        assert!(build_budget_config(true, Some(1.0e-10)).is_err());
+        assert!(build_budget_config(true, Some(4.0e-10)).is_err());
+        assert!(build_budget_config(true, Some(f64::MIN_POSITIVE)).is_err());
+    }
+
+    #[test]
+    fn budget_enabled_smallest_nonzero_nanodollar_is_ok() {
+        // The flip side of the koe-he8 guard: a USD that rounds to >= 1 nanodollar
+        // is still accepted, so the fix rejects only the rounds-to-zero case and
+        // does not over-restrict legitimate (if tiny) caps.
+        let cfg = build_budget_config(true, Some(1.0e-6)).expect("1e-6 USD = 1000 nano");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.monthly_limit_nanodollars, 1_000);
     }
 
     #[test]
