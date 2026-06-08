@@ -28,6 +28,13 @@ const application = path.resolve(
 let tauriDriver;
 
 export const config = {
+  // tauri-driver runs a WebDriver server on 127.0.0.1:4444 (its default port).
+  // wdio MUST be pointed at it as a remote driver — without hostname/port it
+  // errors "No browserName defined nor hostname or port found" (it would try to
+  // launch a local browser). browserName is NOT needed: tauri:options.application
+  // tells tauri-driver which binary to spawn. (Tauri 2 official wdio example.)
+  hostname: "127.0.0.1",
+  port: 4444,
   runner: "local",
   specs: ["./e2e/**/*.e2e.js"],
   maxInstances: 1,
@@ -58,11 +65,17 @@ export const config = {
   // tauri-driver bridges WebDriver <-> the platform WebView server
   // (msedgedriver on Windows). Installed in CI via `cargo install tauri-driver`.
   beforeSession: () => {
-    tauriDriver = spawn(
-      path.resolve(os.homedir(), ".cargo", "bin", "tauri-driver"),
-      [],
-      { stdio: [null, process.stdout, process.stderr] },
+    // Windows: `cargo install tauri-driver` produces tauri-driver.exe; spawn
+    // needs the extension or it ENOENTs. tauri-driver then listens on :4444.
+    const driverBin = path.resolve(
+      os.homedir(),
+      ".cargo",
+      "bin",
+      process.platform === "win32" ? "tauri-driver.exe" : "tauri-driver",
     );
+    tauriDriver = spawn(driverBin, [], {
+      stdio: [null, process.stdout, process.stderr],
+    });
   },
 
   afterSession: () => {
