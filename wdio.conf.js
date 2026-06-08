@@ -76,6 +76,31 @@ export const config = {
     tauriDriver = spawn(driverBin, [], {
       stdio: [null, process.stdout, process.stderr],
     });
+    // spawn() returns immediately, but tauri-driver needs a moment to bind
+    // 127.0.0.1:4444. Opening a wdio session before it listens is a race
+    // (flaky in CI). Poll the WebDriver /status endpoint until it answers;
+    // fail loud after 30s instead of letting wdio hit a connection refused.
+    return new Promise((resolve, reject) => {
+      const startTime = Date.now();
+      const checkReady = async () => {
+        try {
+          const response = await fetch("http://127.0.0.1:4444/status");
+          if (response.ok) {
+            resolve();
+          } else {
+            throw new Error("not ready");
+          }
+        } catch {
+          if (Date.now() - startTime > 30000) {
+            tauriDriver?.kill();
+            reject(new Error("tauri-driver did not become ready within 30s"));
+          } else {
+            setTimeout(checkReady, 500);
+          }
+        }
+      };
+      setTimeout(checkReady, 1000);
+    });
   },
 
   afterSession: () => {
