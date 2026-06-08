@@ -1007,6 +1007,60 @@ async fn run_session_supervised<C, Fut, F, EC, ET, J>(
     emit("connecting", None);
 
     loop {
+        // Re-validate the budget against the AUTHORITATIVE shared ledger BEFORE every
+        // (re)connect (CR R-B.5 Major / AGENTS.md: validate cost state before a
+        // session). `start_session` checks this for the FIRST connect, but a reconnect
+        // must NOT open a billable WS if the monthly cap was reached DURING the
+        // disconnect — a sibling session's spend, or this session's carried-unpersisted
+        // amount, pushing the shared ledger over. Without this we would open a fresh
+        // connection and only stop on the NEXT usage frame = one reconnect of fail-open
+        // spend. Gate on persisted ledger + the (month-scoped) carried amount — the
+        // same fail-closed lower bound the read loop's budget gate uses. Only when a cap
+        // is enabled (an unlimited session skips the read). An unknown balance (read
+        // error) is fail-closed (koe rule: unknown/error reject).
+        {
+            let month = current_yyyymm();
+            let (budget, carried) = {
+                let c = cost.lock().await;
+                let carried = if c.pending_month == month {
+                    c.pending_nanodollars
+                } else {
+                    0
+                };
+                (c.config, carried)
+            };
+            if budget.enabled {
+                let rec = Arc::clone(&recorder);
+                let persisted =
+                    tokio::task::spawn_blocking(move || rec.load_cost_snapshot(month)).await;
+                let total = match persisted {
+                    Ok(Ok(p)) => p.unwrap_or(0).saturating_add(carried),
+                    _ => {
+                        finalize_session_slot(
+                            &session,
+                            generation,
+                            &latest_generation,
+                            Some("cost tracking unavailable"),
+                            &emit,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                if budget.is_over(total) {
+                    finalize_session_slot(
+                        &session,
+                        generation,
+                        &latest_generation,
+                        Some("monthly budget exceeded"),
+                        &emit,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
         // Race connect against the master stop so a user `stop_session` is responsive
         // even while a (re)connect is hanging (no per-attempt timeout; OS TCP timeout
         // bounds the worst case). If the user stops mid-connect, abandon the attempt
@@ -5004,6 +5058,65 @@ mod tests {
         assert!(
             e.iter().any(|(s, err)| s == "error" && err.as_deref() == Some("reconnect failed")),
             "absolute reconnect ceiling must fail closed: {e:?}"
+        );
+        assert!(slot.lock().await.is_none(), "slot cleared on fail-closed");
+    }
+
+    #[tokio::test]
+    async fn supervisor_rechecks_budget_before_connect_fails_closed_when_over_cap() {
+        // CR R-B.5 Major: a (re)connect must NOT open a billable connection if the
+        // SHARED ledger already exceeded the cap (e.g. during a disconnect). With an
+        // over-cap ledger the supervisor fails closed BEFORE connect() — connect is
+        // never called and no new WS is opened.
+        let month = current_yyyymm();
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 10 * NANODOLLARS_PER_USD,
+        };
+        let (rec, _persisted) = SharedSnapshotRecorder::new();
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(rec);
+        recorder.add_month_cost(month, 20 * NANODOLLARS_PER_USD).unwrap(); // ledger $20 > $10 cap
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(budget, month)));
+        const GEN: u64 = 31;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<Connection, ConnectError>(mock_conn(vec![])) }
+        };
+        let (log, emit) = collect_emit();
+        let (master_tx, master_rx) = oneshot::channel();
+        run_session_supervised(
+            connect,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            cost,
+            recorder,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            master_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            |_m: u32, _u: u64, _b: BudgetConfig| {},
+            |_c: &str, _t: &str| {},
+            fast_reconnect_cfg(5),
+            || 0.0_f64,
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "over-budget must fail closed BEFORE opening a (billable) connection"
+        );
+        let e = log.lock().unwrap();
+        assert!(
+            e.iter().any(|(s, err)| s == "error" && err.as_deref() == Some("monthly budget exceeded")),
+            "pre-connect budget gate must surface the fail-closed error: {e:?}"
         );
         assert!(slot.lock().await.is_none(), "slot cleared on fail-closed");
     }
