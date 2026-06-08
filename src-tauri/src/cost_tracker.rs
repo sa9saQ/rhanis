@@ -159,6 +159,25 @@ pub struct CostTracker {
     pub config: BudgetConfig,
     pub current_month: u32,
     pub month_total_nanodollars: u64,
+    /// Carry state for spend not yet durably persisted to the additive ledger after a
+    /// transient `add_month_cost` failure (koe-ixt). Held HERE — in the cross-session
+    /// `CostTracker` shared by every connection — rather than in `run_read_loop`'s
+    /// locals, so a WebSocket reconnect (koe-byf) does NOT drop the unpersisted spend:
+    /// dropping it would undercount the ledger across the reconnect = fail-open (the
+    /// user could spend past their cap by the lost amount). The next usage frame (this
+    /// or the next connection) retries the WHOLE carried amount and the budget gate
+    /// keeps counting it until an add succeeds. `pending_month` SCOPES the carry: a
+    /// month rollover with unpersisted spend resets it rather than folding a past
+    /// month's spend into the new month's row. Both reset to 0 once an add succeeds.
+    #[serde(default)]
+    pub pending_month: u32,
+    #[serde(default)]
+    pub pending_nanodollars: u64,
+    /// Consecutive `add_month_cost` failures (koe-ixt fail-closed backstop). Also held
+    /// here so the "N failures → stop" guard survives reconnects rather than resetting
+    /// per connection (koe-byf).
+    #[serde(default)]
+    pub save_failures: u32,
 }
 
 impl CostTracker {
@@ -167,6 +186,9 @@ impl CostTracker {
             config,
             current_month,
             month_total_nanodollars: 0,
+            pending_month: 0,
+            pending_nanodollars: 0,
+            save_failures: 0,
         }
     }
 

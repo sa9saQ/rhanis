@@ -79,20 +79,6 @@ const MAX_INFLIGHT_DISPATCHES: usize = 64;
 /// (a persistent failure means a restart could lose the running total).
 const MAX_SNAPSHOT_SAVE_FAILURES: u32 = 3;
 
-/// Spend (nanodollars) counted into the budget gate but not yet durably written to
-/// the additive ledger because an `add_month_cost` failed transiently, tagged with
-/// the month it belongs to. Carried across frames so the next add retries the WHOLE
-/// unpersisted amount (and the gate keeps counting it); a failed add must never
-/// silently drop spend (that would undercount / fail-open). Reset to 0 once an add
-/// succeeds. The `month` SCOPES the carry: if the month rolls over while spend is
-/// still unpersisted, the loop fails closed rather than fold a past month's spend
-/// into the new month's row (koe-ixt). (koe-ixt R-C / Codex P2)
-#[derive(Default)]
-struct PendingCost {
-    month: u32,
-    nanodollars: u64,
-}
-
 /// WebSocket frame/message size limits (DoS guard).
 /// Max message: 512 KiB — comfortably above the largest legitimate Realtime
 /// frame (audio deltas are ~256 KiB max; control frames are much smaller).
@@ -611,11 +597,9 @@ where
     // Tracks in-flight tool dispatches so a budget trip / stop aborts them too
     // (rather than letting them complete and spend more).
     let mut dispatch_tasks = tokio::task::JoinSet::new();
-    let mut save_failures: u32 = 0;
-    // Unpersisted spend carried across frames after a transient ledger-add failure
-    // (see [`PendingCost`]). Month-scoped so a rollover with unpersisted spend fails
-    // closed instead of mis-attributing it (koe-ixt R-C).
-    let mut pending = PendingCost::default();
+    // The unpersisted-spend carry + consecutive-failure count now live in the SHARED
+    // `CostTracker` (cost.pending_* / cost.save_failures) so they survive a reconnect
+    // (koe-byf) instead of being dropped with this loop's locals — see handle_event.
     // Latch so the in-flight dispatch cap logs once per saturation episode, not
     // once per dropped frame — a sustained flood must not turn the fail-soft drop
     // into a stderr-backpressure DoS (koe-wj2 R-C / Codex).
@@ -715,9 +699,8 @@ where
                         audio_handler(&event);
                         match handle_text(
                             &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
-                            &dispatcher, &mut dispatch_tasks, &mut save_failures,
-                            &mut pending, &mut cap_warned, &mut journal_drop_warned,
-                            &emit_cost, &emit_thinking,
+                            &dispatcher, &mut dispatch_tasks, &mut cap_warned,
+                            &mut journal_drop_warned, &emit_cost, &emit_thinking,
                         ).await {
                             LoopAction::Continue => {}
                             // Carry the terminal error reason out to finalize so it
@@ -1323,8 +1306,6 @@ async fn handle_text<EC, ET>(
     rec_tx: &mpsc::Sender<ConversationRecord>,
     dispatcher: &Arc<dyn DispatcherSeam>,
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
-    save_failures: &mut u32,
-    pending: &mut PendingCost,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
     emit_cost: &EC,
@@ -1343,8 +1324,6 @@ where
             rec_tx,
             dispatcher,
             dispatch_tasks,
-            save_failures,
-            pending,
             cap_warned,
             journal_drop_warned,
             emit_cost,
@@ -1372,8 +1351,6 @@ async fn handle_event<EC, ET>(
     rec_tx: &mpsc::Sender<ConversationRecord>,
     dispatcher: &Arc<dyn DispatcherSeam>,
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
-    save_failures: &mut u32,
-    pending: &mut PendingCost,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
     emit_cost: &EC,
@@ -1501,29 +1478,32 @@ where
             // an already-over-cap current month (fail-open) across a month boundary.
             let delta = usage.cost_nanodollars();
             let observed_month = current_yyyymm();
-            let (effective_month, budget) = {
+            // The amount to add includes any earlier spend that FAILED to persist
+            // (carried in the SHARED `CostTracker.pending_*`, so it survives a
+            // reconnect — koe-byf), so a transient ledger failure never silently drops
+            // spend: we retry the whole unpersisted amount and the gate keeps counting
+            // it until an add succeeds. The carry is MONTH-SCOPED: if it belongs to a
+            // PAST month (a rollover happened while spend was still unpersisted), the
+            // stale carry is DROPPED rather than folded into the new month's row (which
+            // would over-count the new month). Dropping it is sound because the old
+            // month's cap was already enforced live, frame by frame, and its persisted
+            // total is never read again once it is no longer the current month
+            // (`load_cost_snapshot` is only called for the current month at session
+            // start). We then proceed normally so THIS frame's spend IS still recorded
+            // in — and gated against — the NEW month, instead of being lost to an early
+            // stop (koe-ixt R-C / Codex P2). Computed under the first lock so the carry
+            // read + the add_usage advance + the month-scope reset are atomic.
+            let (effective_month, budget, to_add) = {
                 let mut c = cost.lock().await;
                 c.add_usage(&usage, observed_month);
-                (c.current_month, c.config)
+                let effective_month = c.current_month;
+                if c.pending_month != effective_month {
+                    c.pending_nanodollars = 0;
+                    c.pending_month = effective_month;
+                }
+                let to_add = c.pending_nanodollars.saturating_add(delta);
+                (effective_month, c.config, to_add)
             };
-            // The amount to add includes any earlier spend that FAILED to persist
-            // (carried in `pending`), so a transient ledger failure never silently
-            // drops spend: we retry the whole unpersisted amount and the gate keeps
-            // counting it until an add succeeds. The carry is MONTH-SCOPED: if it
-            // belongs to a PAST month (a rollover happened while spend was still
-            // unpersisted), the stale carry is DROPPED rather than folded into the
-            // new month's row (which would over-count the new month). Dropping it is
-            // sound because the old month's cap was already enforced live, frame by
-            // frame, and its persisted total is never read again once it is no longer
-            // the current month (`load_cost_snapshot` is only called for the current
-            // month at session start). We then proceed normally so THIS frame's spend
-            // IS still recorded in — and gated against — the NEW month, instead of
-            // being lost to an early stop (koe-ixt R-C / Codex P2).
-            if pending.month != effective_month {
-                pending.nanodollars = 0;
-                pending.month = effective_month;
-            }
-            let to_add = pending.nanodollars.saturating_add(delta);
             // Add to the SHARED monthly ledger and read back the new authoritative
             // cross-session total (koe-ixt). Additive accounting is the single source
             // of truth: it SUMS every session's spend, so a stop->start handover
@@ -1543,19 +1523,24 @@ where
             let (authoritative_total, durable) = match added {
                 Ok(Ok(new_total)) => {
                     // The whole unpersisted amount is now durably in the ledger.
-                    *save_failures = 0;
-                    pending.nanodollars = 0;
+                    let mut c = cost.lock().await;
+                    c.save_failures = 0;
+                    c.pending_nanodollars = 0;
                     (new_total, true)
                 }
                 _ => {
-                    *save_failures += 1;
-                    // Carry the unpersisted amount forward (tagged with its month) so
-                    // the NEXT add retries it (and the gate below keeps counting it) —
-                    // a failed add must never drop spend from the ledger (undercount
-                    // / fail-open).
-                    pending.nanodollars = to_add;
-                    pending.month = effective_month;
-                    if *save_failures >= MAX_SNAPSHOT_SAVE_FAILURES {
+                    // Carry the unpersisted amount forward (tagged with its month) in
+                    // the SHARED tracker so the NEXT add — even after a reconnect —
+                    // retries it (and the gate below keeps counting it): a failed add
+                    // must never drop spend from the ledger (undercount / fail-open).
+                    let failures = {
+                        let mut c = cost.lock().await;
+                        c.save_failures += 1;
+                        c.pending_nanodollars = to_add;
+                        c.pending_month = effective_month;
+                        c.save_failures
+                    };
+                    if failures >= MAX_SNAPSHOT_SAVE_FAILURES {
                         // Can't durably track spend → stop rather than risk a restart
                         // resetting the monthly total (fail-closed). Terminal error
                         // emitted by finalize_session_slot under the slot lock
@@ -3078,8 +3063,6 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let mut save_failures = 0u32;
-        let mut pending = PendingCost::default();
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
         handle_text(
             usage,
@@ -3090,8 +3073,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
@@ -3349,10 +3330,8 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        // Persistent state across both frames (run_read_loop owns these for the
-        // whole session, so the carry survives between frames).
-        let mut save_failures = 0u32;
-        let mut pending = PendingCost::default();
+        // The carry + failure count now live in the SHARED `cost` tracker (so they
+        // survive between frames AND across a reconnect — koe-byf), not in locals.
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
 
         // Frame 1: add fails; the $10 is carried, gate sees only $10 (< $15 cap).
@@ -3365,8 +3344,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
@@ -3377,9 +3354,9 @@ mod tests {
             "the first $10 (< $15 cap) must continue"
         );
         assert_eq!(
-            pending.nanodollars,
+            cost.lock().await.pending_nanodollars,
             10 * NANODOLLARS_PER_USD,
-            "the failed $10 add must be carried forward, not dropped from the ledger"
+            "the failed $10 add must be carried forward (in the shared tracker), not dropped"
         );
 
         // Frame 2: add fails again; gate sees carried $10 + new $10 = $20 (>= $15) →
@@ -3394,8 +3371,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
@@ -3442,13 +3417,15 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let mut save_failures = 0u32;
-        // Unpersisted $5 left over from an EARLIER month (tracker_month - 1).
-        let mut pending = PendingCost {
-            month: tracker_month - 1,
-            nanodollars: 5 * NANODOLLARS_PER_USD,
-        };
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
+        // Pre-seed the SHARED tracker's carry with unpersisted $5 left over from an
+        // EARLIER month (tracker_month - 1). koe-byf moved the carry into CostTracker
+        // so it survives reconnects; tests seed/assert it there instead of a local.
+        {
+            let mut c = cost.lock().await;
+            c.pending_month = tracker_month - 1;
+            c.pending_nanodollars = 5 * NANODOLLARS_PER_USD;
+        }
 
         let result = handle_text(
             &ten_dollars,
@@ -3459,8 +3436,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
@@ -3483,8 +3458,9 @@ mod tests {
             "the dropped old-month pending must not be written anywhere"
         );
         // After a successful add the carry is reset and re-scoped to the new month.
-        assert_eq!(pending.nanodollars, 0, "carry is cleared after a successful add");
-        assert_eq!(pending.month, tracker_month, "carry is re-scoped to the current month");
+        let c = cost.lock().await;
+        assert_eq!(c.pending_nanodollars, 0, "carry is cleared after a successful add");
+        assert_eq!(c.pending_month, tracker_month, "carry is re-scoped to the current month");
     }
 
     #[tokio::test]
@@ -3867,6 +3843,66 @@ mod tests {
             Some(TEST_GENERATION),
             "a recoverable disconnect must not clear the slot"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_cost_carry_survives_a_recoverable_disconnect() {
+        // koe-byf (Codex Cloud P1): unpersisted spend (the koe-ixt carry) must live in
+        // the SHARED CostTracker, not run_read_loop's locals, so a recoverable
+        // disconnect does NOT drop it (dropping = undercount across the reconnect =
+        // fail-open). A usage frame whose ledger add FAILS leaves $10 carried; a
+        // following WS error returns Reconnect — and the $10 must still be in the
+        // shared tracker for the next connection to retry.
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        // FailingRecorder: add_month_cost -> Err (so $10 is carried, not persisted),
+        // load_cost_snapshot -> Ok(None) (gate sees 0 + carry; budget disabled here).
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(FailingRecorder);
+        // $10 = 312_500 audio-input tokens * 32_000 nanodollars.
+        let ten_dollars = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 312_500u64 } } }
+        });
+        let (write_tx, _rx) = mpsc::channel::<Message>(8);
+        let (_sd, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+        // usage (add fails → carry) then a recoverable WS error (→ Reconnect).
+        let stream = futures_util::stream::iter(vec![
+            Ok(Message::Text(ten_dollars.to_string().into())),
+            Err(WsError::ConnectionClosed),
+        ]);
+        let outcome = run_read_loop(
+            stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            Arc::clone(&cost),
+            recorder,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+            |_m: u32, _u: u64, _b: BudgetConfig| {},
+            |_c: &str, _t: &str| {},
+        )
+        .await;
+        assert_eq!(outcome, ConnectionOutcome::Reconnect);
+        // The unpersisted $10 survives in the SHARED tracker (would have been dropped
+        // with run_read_loop's old local `pending`).
+        let c = cost.lock().await;
+        assert_eq!(
+            c.pending_nanodollars,
+            10 * NANODOLLARS_PER_USD,
+            "the unpersisted carry must survive a recoverable disconnect for the next connection to retry"
+        );
+        assert_eq!(c.save_failures, 1, "the failure count also survives in the shared tracker");
     }
 
     #[tokio::test]
@@ -4495,8 +4531,6 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let mut save_failures = 0u32;
-        let mut pending = PendingCost::default();
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
         let action = handle_text(
             frame,
@@ -4507,8 +4541,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
             &move |mo: u32, us: u64, bg: BudgetConfig| sink.lock().unwrap().push((mo, us, bg)),
