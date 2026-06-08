@@ -357,6 +357,30 @@ mod tests {
     }
 
     #[test]
+    fn new_tracker_starts_with_empty_reconnect_carry() {
+        // koe-byf: the reconnect-survival carry (unpersisted spend + failure count) is
+        // empty on a fresh tracker and is independent of the running total. Its
+        // retry-whole-amount / month-scope / fail-closed LOGIC lives in
+        // session_manager's handle_event (tested there); CostTracker only HOLDS this
+        // cross-session state so it survives a WebSocket reconnect.
+        let mut t = CostTracker::new(BudgetConfig::default(), 202605);
+        assert_eq!(t.pending_month, 0);
+        assert_eq!(t.pending_nanodollars, 0);
+        assert_eq!(t.save_failures, 0);
+        // Metering the running total must not disturb the carry fields.
+        t.add_usage(
+            &Usage {
+                audio_input_tokens: 1_000_000,
+                ..Default::default()
+            },
+            202605,
+        );
+        assert_eq!(t.month_total_nanodollars, 32 * USD);
+        assert_eq!(t.pending_nanodollars, 0, "add_usage must not touch the carry");
+        assert_eq!(t.save_failures, 0, "add_usage must not touch the failure count");
+    }
+
+    #[test]
     fn empty_usage_is_free() {
         assert_eq!(Usage::default().cost_nanodollars(), 0);
     }
