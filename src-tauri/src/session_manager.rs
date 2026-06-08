@@ -2781,6 +2781,157 @@ mod tests {
         );
     }
 
+    /// Recorder double whose `log_conversation_event` blocks on a gate until a test
+    /// releases it, wedging the single journal writer on its first record so the
+    /// bounded channel saturates. `count` records how many writes actually landed
+    /// (so a test can prove overflow records were dropped, not just delayed). Cost
+    /// + note methods mirror `OkRecorder` (succeed / unused) so only the journal
+    /// path is under test. (koe-a4f)
+    struct BlockingRecorder {
+        gate: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+        count: Arc<AtomicUsize>,
+    }
+    impl RecorderAdapter for BlockingRecorder {
+        fn save_note(&self, _t: &str) -> Result<i64, RecorderError> {
+            unimplemented!()
+        }
+        fn list_recent_notes(&self, _l: u32) -> Result<Vec<Note>, RecorderError> {
+            unimplemented!()
+        }
+        fn log_conversation_event(&self, _r: &str, _k: &str, _s: &str) -> Result<i64, RecorderError> {
+            // Block until released. The writer takes record 1 and parks here, so the
+            // 256-slot channel fills and later try_sends drop fail-soft. Once the
+            // test releases the gate, this and every later (already-buffered) record
+            // returns immediately, draining the tail.
+            let (lock, cvar) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cvar.wait(released).unwrap();
+            }
+            drop(released);
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+        fn list_recent_events(&self, _l: u32) -> Result<Vec<ConversationEvent>, RecorderError> {
+            unimplemented!()
+        }
+        fn add_month_cost(&self, _m: u32, n: u64) -> Result<u64, RecorderError> {
+            Ok(n)
+        }
+        fn load_cost_snapshot(&self, _m: u32) -> Result<Option<u64>, RecorderError> {
+            Ok(None)
+        }
+        fn health_check(&self) -> Result<(), RecorderError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_overflow_drops_fail_soft_and_loop_keeps_dispatching() {
+        // koe-a4f / koe-emd R-B F6: the CONVERSATION_LOG_CAP bounded-channel
+        // try_send drop-on-full path is the invariant-4 non-blocking backstop in the
+        // read loop. Wedge the single writer on its first record so the channel
+        // saturates, feed >CAP transcript frames (each one journal record, NO
+        // dispatch) to force overflow drops, then a final tool frame that MUST still
+        // dispatch — proving the read loop dropped the overflow fail-soft and never
+        // blocked on the full channel. Deterministic (no timing sleep gates the
+        // assertion): a releaser task releases the wedged writer the moment the final
+        // dispatch is observed, so run_read_loop's tail drain can finish.
+        let gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let rec = BlockingRecorder {
+            gate: Arc::clone(&gate),
+            count: Arc::clone(&count),
+        };
+        let disp = Arc::new(RecordingDispatcher {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        // CAP+44 transcript records (overflow guaranteed) + a final dispatchable tool.
+        let total_transcripts = CONVERSATION_LOG_CAP as u32 + 44;
+        let mut frames = Vec::with_capacity(total_transcripts as usize + 1);
+        for i in 0..total_transcripts {
+            frames.push(serde_json::json!({
+                "type": "response.output_audio_transcript.done",
+                "transcript": format!("turn {i}")
+            }));
+        }
+        frames.push(serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "call_id": "final_call",
+            "name": "web_search",
+            "arguments": "{\"q\":\"x\"}"
+        }));
+
+        // Release the wedged writer the moment the final tool dispatches. Bounded
+        // poll so a regression (loop blocked → never dispatches) FAILS, not hangs.
+        let disp_probe = Arc::clone(&disp);
+        let gate_release = Arc::clone(&gate);
+        let releaser = tokio::spawn(async move {
+            let mut dispatched = false;
+            for _ in 0..500 {
+                if disp_probe.calls.lock().unwrap().iter().any(|n| n == "web_search") {
+                    dispatched = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let (lock, cvar) = &*gate_release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+            dispatched
+        });
+
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(rec) as Arc<dyn RecorderAdapter>,
+            Arc::clone(&disp) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
+        )
+        .await;
+
+        let dispatched = releaser.await.unwrap();
+        assert!(
+            dispatched,
+            "the read loop must keep dispatching: the final tool call had to be \
+             dispatched despite the wedged/saturated journal channel"
+        );
+        assert!(
+            disp.calls.lock().unwrap().iter().any(|n| n == "web_search"),
+            "the final tool call must have reached the dispatcher"
+        );
+        // Overflow records were dropped, not buffered without bound: at most the
+        // in-flight write (1) plus the channel capacity can land; the rest of the
+        // CAP+45 enqueue attempts were dropped fail-soft.
+        let recorded = count.load(Ordering::SeqCst);
+        assert!(
+            recorded <= CONVERSATION_LOG_CAP + 1,
+            "overflow must be dropped: recorded {recorded} exceeds CAP+1 ({})",
+            CONVERSATION_LOG_CAP + 1
+        );
+        assert!(recorded >= 1, "the wedged first record must have been accepted");
+    }
+
     #[tokio::test]
     async fn asr_completed_records_user_turn_once_and_meters_asr_once() {
         // koe-pbe end to end: enabling input_audio_transcription makes the server
