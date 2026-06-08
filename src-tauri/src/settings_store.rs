@@ -8,9 +8,11 @@
 //! - `load` when the file is absent → [`AppSettings::default()`] (first run).
 //! - `load` when the file is present but corrupt → **Err (fail-closed)**.
 //!   Silently resetting to default would erase a user's budget cap.
-//! - `save` is **atomic**: write to `<path>.tmp`, then `fs::rename` over the
-//!   target (rename is atomic on the same filesystem; partial writes never replace
-//!   the live file).
+//! - `save` is **atomic + content-durable**: write to `<path>.tmp`, `fsync` it,
+//!   then `fs::rename` over the target (atomic on the same filesystem). The fsync
+//!   makes the content power-cut durable on every OS; the rename gets a best-effort
+//!   parent-dir fsync on Linux/macOS — a Windows write-through durable rename is
+//!   tracked as koe-z2f. A `save_lock` serialises concurrent saves on the temp path.
 //!
 //! transaction N/A · idempotency_key N/A (local settings file, not billing)
 
@@ -159,21 +161,39 @@ pub trait SettingsStore: Send + Sync {
 // JsonSettingsStore — the real M1 implementation.
 // ---------------------------------------------------------------------------
 
-/// Persists settings as a JSON file at `path`. Saves write a `.tmp` sibling then
-/// `rename` over the target — an atomic swap on the same filesystem, so a
-/// **process** crash mid-save never leaves a partially-written live file.
+/// Persists settings as a JSON file at `path`. Saves write a `.tmp` sibling,
+/// `fsync` it, then `rename` over the target — an atomic swap on the same
+/// filesystem, so a **process** crash mid-save never leaves a partially-written
+/// live file (koe-6ee). The temp-file `fsync` makes the file **content** durable
+/// across a power cut on every platform. On Linux/macOS the rename is additionally
+/// hardened by a best-effort parent-directory fsync (a durability upgrade whose
+/// error is ignored, not a fail-closed guarantee); on **Windows**
+/// a directory cannot be opened as a `File`, so that fsync is a no-op and the
+/// rename relies on NTFS journaling for consistency (old-or-new, never torn) but
+/// is NOT write-through — a power cut in the narrow window after `save` returns
+/// could revert to the prior settings. A Windows write-through durable rename
+/// (`MoveFileExW` + `MOVEFILE_WRITE_THROUGH`) needs Windows verification and is
+/// tracked as koe-z2f.
 ///
-/// NOTE: this is not full power-loss durability — there is no `fsync` of the
-/// temp file or the parent directory, so a power cut could still lose the most
-/// recent write. Acceptable for M1 settings (low-write, user-recoverable);
-/// fsync + a save mutex are a tracked follow-up.
+/// `save_lock` serialises `save` calls. The temp path is a fixed sibling, so two
+/// concurrent saves would otherwise interleave writes into it and a rename could
+/// publish a torn mix. [`ManagedSettings`] already serialises compound
+/// load-modify-save sequences, but this lock also covers any direct `save` call.
+/// The lock is **per-process** (per store instance): koe runs as a single desktop
+/// instance with a single-writer settings UI, so a second concurrent process is
+/// out of scope here — unlike the cost ledger, which guards money and therefore
+/// uses cross-process SQLite atomics.
 pub struct JsonSettingsStore {
     pub path: PathBuf,
+    save_lock: std::sync::Mutex<()>,
 }
 
 impl JsonSettingsStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            save_lock: std::sync::Mutex::new(()),
+        }
     }
 }
 
@@ -194,19 +214,47 @@ impl SettingsStore for JsonSettingsStore {
     }
 
     fn save(&self, settings: &AppSettings) -> Result<(), SettingsError> {
+        use std::io::Write;
+
+        // Serialise saves so concurrent writers cannot interleave into the shared
+        // temp path. Recover from a poisoned lock (a panic in a prior save must
+        // not permanently wedge settings persistence).
+        let _guard = self.save_lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        let parent = self.path.parent();
         // Create parent directory if needed (first run before the data dir exists).
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|_| SettingsError::Unavailable)?;
+        if let Some(p) = parent {
+            std::fs::create_dir_all(p).map_err(|_| SettingsError::Unavailable)?;
         }
 
         let tmp_path = self.path.with_extension("json.tmp");
         let json = serde_json::to_vec_pretty(settings).map_err(|_| SettingsError::Unavailable)?;
 
-        // Write to the temp file first.
-        std::fs::write(&tmp_path, &json).map_err(|_| SettingsError::Unavailable)?;
+        // Write the temp file and fsync its CONTENTS before the rename, so a power
+        // cut right after the rename cannot surface a renamed-but-empty/torn file.
+        // Scope the File so it is closed before the rename.
+        {
+            let mut f = std::fs::File::create(&tmp_path).map_err(|_| SettingsError::Unavailable)?;
+            f.write_all(&json).map_err(|_| SettingsError::Unavailable)?;
+            f.sync_all().map_err(|_| SettingsError::Unavailable)?;
+        }
 
         // Atomic rename: on the same filesystem this is crash-safe.
         std::fs::rename(&tmp_path, &self.path).map_err(|_| SettingsError::Unavailable)?;
+
+        // Best-effort fsync of the parent directory so the rename (a directory-entry
+        // update) is itself durable across a power cut. Works on Linux/macOS (a
+        // directory can be opened read-only and fsync'd); on Windows a directory
+        // cannot be opened as a File, so File::open returns Err and this is a no-op
+        // — there the rename is consistent (NTFS journaling) but not write-through;
+        // a Windows write-through durable rename is tracked as koe-z2f. The error is
+        // intentionally ignored: this is a durability *upgrade* on top of the
+        // already-durable temp-file fsync, never a reason to fail a save.
+        if let Some(p) = parent {
+            if let Ok(dir) = std::fs::File::open(p) {
+                let _ = dir.sync_all();
+            }
+        }
 
         Ok(())
     }
@@ -807,6 +855,40 @@ mod tests {
 
         // The real file must exist.
         assert!(store.path.exists(), "settings file should exist after save");
+    }
+
+    #[test]
+    fn concurrent_saves_leave_a_valid_file() {
+        // The fixed temp path is shared, so save_lock must serialise concurrent
+        // saves — otherwise interleaved writes + rename could publish a torn file.
+        // Many threads hammering save() must always leave a loadable (untorn) file
+        // and clean up the temp sibling (koe-6ee).
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonSettingsStore::new(dir.path().join("koe-settings.json")));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = Arc::clone(&store);
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        s.save(&AppSettings::default()).expect("save");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("save thread panicked");
+        }
+
+        let tmp = store.path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "temp must be renamed away after the last save");
+        assert!(
+            store.load().is_ok(),
+            "file must remain valid (not torn) after concurrent saves"
+        );
     }
 
     // ---- Budget validation (build_budget_config) --------------------------
