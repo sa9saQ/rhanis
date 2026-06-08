@@ -317,6 +317,21 @@ fn is_recoverable_close_code(code: Option<u16>) -> bool {
     matches!(code, Some(1001 | 1006 | 1011 | 1012 | 1013))
 }
 
+/// Classifies a WS handshake failure for the supervisor's retry decision (koe-byf,
+/// CR R-B.5). A 4xx HTTP response (rejected / expired BYOK credentials) is FATAL —
+/// retrying cannot fix a bad key, and burning the retry budget would surface a
+/// misconfiguration as a misleading "reconnect failed". Everything else (network
+/// down / 5xx / transport / handshake) is RECOVERABLE → retry with backoff. The
+/// phrases are fixed, redacted (no key / path / raw error).
+fn classify_connect_error(err: WsError) -> ConnectError {
+    match err {
+        WsError::Http(resp) if resp.status().is_client_error() => {
+            ConnectError::Fatal("invalid credentials")
+        }
+        _ => ConnectError::Recoverable("connection failed"),
+    }
+}
+
 /// A jitter factor in [0, 1) for the live backoff, from the OS CSPRNG
 /// ([`getrandom`], already a dependency). On the (vanishingly rare) RNG failure it
 /// returns 0.5 — a deterministic mid-point, NOT a panic and NOT 0 (fail-safe: a
@@ -846,12 +861,16 @@ async fn establish_connection(
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_message_size = Some(WS_MAX_MESSAGE_SIZE);
     ws_config.max_frame_size = Some(WS_MAX_FRAME_SIZE);
-    // A connect failure (network down / 5xx / handshake / token rejected) is
-    // RECOVERABLE → the supervisor retries with backoff up to its cap.
+    // Classify the handshake failure: a 4xx HTTP response (rejected / expired BYOK
+    // credentials) is FATAL — retrying cannot fix a bad key, and burning the retry
+    // budget would surface a misconfiguration as a misleading "reconnect failed". Any
+    // other failure (network down / 5xx / transport / handshake) is RECOVERABLE → the
+    // supervisor retries with backoff up to its cap (CR R-B.5). The phrases are fixed
+    // (no key / path / raw error).
     let (ws_stream, _resp) =
         tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
             .await
-            .map_err(|_| ConnectError::Recoverable("connection failed"))?;
+            .map_err(classify_connect_error)?;
 
     let (mut sink, stream) = ws_stream.split();
 
@@ -1019,20 +1038,27 @@ async fn run_session_supervised<C, Fut, F, EC, ET, J>(
         // is enabled (an unlimited session skips the read). An unknown balance (read
         // error) is fail-closed (koe rule: unknown/error reject).
         {
-            let month = current_yyyymm();
-            let (budget, carried) = {
+            // Key on the tracker's EFFECTIVE month (`current_month`), NOT the raw clock
+            // `current_yyyymm()`: `add_usage` only advances it on a FORWARD month, so a
+            // backward clock skew / NTP step cannot make this check read an EARLIER
+            // (emptier) month's ledger than the read loop's gate keys on (which would be
+            // fail-open) — koe-ixt month-keying discipline (CR R-B.5).
+            let (budget, effective_month, carried) = {
                 let c = cost.lock().await;
-                let carried = if c.pending_month == month {
+                let effective_month = c.current_month;
+                let carried = if c.pending_month == effective_month {
                     c.pending_nanodollars
                 } else {
                     0
                 };
-                (c.config, carried)
+                (c.config, effective_month, carried)
             };
             if budget.enabled {
                 let rec = Arc::clone(&recorder);
-                let persisted =
-                    tokio::task::spawn_blocking(move || rec.load_cost_snapshot(month)).await;
+                let persisted = tokio::task::spawn_blocking(move || {
+                    rec.load_cost_snapshot(effective_month)
+                })
+                .await;
                 let total = match persisted {
                     Ok(Ok(p)) => p.unwrap_or(0).saturating_add(carried),
                     _ => {
@@ -4838,6 +4864,28 @@ mod tests {
             assert!(!is_recoverable_close_code(Some(c)), "code {c} should not reconnect");
         }
         assert!(!is_recoverable_close_code(None), "a code-less close is a clean end");
+    }
+
+    #[test]
+    fn classify_connect_error_4xx_is_fatal_else_recoverable() {
+        use tokio_tungstenite::tungstenite::http::Response;
+        // A 4xx handshake response (rejected / expired BYOK key) is FATAL — no retry.
+        let resp_401 = Response::builder().status(401).body(None::<Vec<u8>>).unwrap();
+        assert!(matches!(
+            classify_connect_error(WsError::Http(Box::new(resp_401))),
+            ConnectError::Fatal(_)
+        ));
+        // A 5xx (server error) is RECOVERABLE — retry with backoff.
+        let resp_503 = Response::builder().status(503).body(None::<Vec<u8>>).unwrap();
+        assert!(matches!(
+            classify_connect_error(WsError::Http(Box::new(resp_503))),
+            ConnectError::Recoverable(_)
+        ));
+        // A transport-level error (no HTTP response) is RECOVERABLE.
+        assert!(matches!(
+            classify_connect_error(WsError::ConnectionClosed),
+            ConnectError::Recoverable(_)
+        ));
     }
 
     #[test]
