@@ -139,6 +139,15 @@ describe("startSession", () => {
     expect(mockStartSession).toHaveBeenCalledTimes(1);
   });
 
+  it("is a no-op when reconnecting (koe-byf: already an active session)", async () => {
+    act(() => {
+      useSessionStore.getState().setFromEvent(statusEvent("reconnecting", 1));
+    });
+    expect(useSessionStore.getState().status).toBe("reconnecting");
+    await useSessionStore.getState().startSession();
+    expect(mockStartSession).not.toHaveBeenCalled();
+  });
+
   it("clears a previous error on new start", async () => {
     // Plant an error.
     act(() => {
@@ -181,6 +190,16 @@ describe("stopSession", () => {
     expect(mockStopSession).not.toHaveBeenCalled();
   });
 
+  it("calls ipcStopSession when reconnecting (koe-byf: reconnecting is stoppable)", async () => {
+    act(() => {
+      useSessionStore.getState().setFromEvent(statusEvent("reconnecting", 1));
+    });
+    expect(useSessionStore.getState().status).toBe("reconnecting");
+    mockStopSession.mockResolvedValueOnce(undefined);
+    await useSessionStore.getState().stopSession();
+    expect(mockStopSession).toHaveBeenCalledTimes(1);
+  });
+
   it("is a no-op in loading state (stop would race the connecting backend)", async () => {
     // Drive the store to 'loading' via a backend event (inFlight=false here,
     // which is the case where the IPC response arrives before the first event).
@@ -220,6 +239,19 @@ describe("setFromEvent", () => {
     expect(useSessionStore.getState().status).toBe("loading");
 
     act(() => useSessionStore.getState().setFromEvent(statusEvent("connected", 2)));
+    expect(useSessionStore.getState().status).toBe("connected");
+  });
+
+  it("transitions connected → reconnecting → connected (koe-byf)", () => {
+    act(() => useSessionStore.getState().setFromEvent(statusEvent("connected", 1)));
+    expect(useSessionStore.getState().status).toBe("connected");
+
+    act(() => useSessionStore.getState().setFromEvent(statusEvent("reconnecting", 2)));
+    expect(useSessionStore.getState().status).toBe("reconnecting");
+    // A reconnect carries no error (it is recovering, not failed).
+    expect(useSessionStore.getState().error).toBeNull();
+
+    act(() => useSessionStore.getState().setFromEvent(statusEvent("connected", 3)));
     expect(useSessionStore.getState().status).toBe("connected");
   });
 

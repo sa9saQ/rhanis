@@ -33,6 +33,13 @@
   background: var(--tone-connecting);
   animation: koe-pulse 1.3s var(--ease-spring) infinite;
 }
+/* koe-byf: reconnecting reuses the connecting hue (it IS re-connecting) with a
+   faster pulse so it reads as distinct, active recovery rather than a steady link. */
+.koe-tone-reconnecting {
+  color: var(--tone-connecting);
+  background: var(--tone-connecting);
+  animation: koe-pulse 0.9s var(--ease-spring) infinite;
+}
 .koe-tone-conversing {
   color: var(--tone-conversing);
   background: var(--tone-conversing);
@@ -343,6 +350,7 @@
 @media (prefers-reduced-motion: reduce) {
   .koe-spinner,
   .koe-tone-connecting,
+  .koe-tone-reconnecting,
   .koe-tone-working,
   .koe-live-action,
   .koe-thinking-row {

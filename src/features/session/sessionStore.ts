@@ -21,8 +21,12 @@ import {
 } from "../../lib/tauri/ipc";
 import type { SessionConnState, SessionStatusEvent } from "../activity/types";
 
-/** The session lifecycle status as seen by the UI. */
-export type SessionStatus = "idle" | "loading" | "connected" | "error";
+/**
+ * The session lifecycle status as seen by the UI. `reconnecting` (koe-byf) is a
+ * live, STOPPABLE state (the supervisor is retrying a recoverable drop) — distinct
+ * from the initial `loading` (which disables the button while first connecting).
+ */
+export type SessionStatus = "idle" | "loading" | "connected" | "reconnecting" | "error";
 
 interface SessionState {
   status: SessionStatus;
@@ -65,6 +69,10 @@ function mapConnState(state: SessionConnState): SessionStatus {
       return "loading";
     case "connected":
       return "connected";
+    // koe-byf: a distinct status (not "loading") so the UI keeps the session
+    // stoppable while recovering and can show "再接続中" rather than "準備中…".
+    case "reconnecting":
+      return "reconnecting";
     case "error":
       return "error";
     default:
@@ -104,7 +112,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   startSession: async () => {
     const { status, listenerFailed } = get();
-    if (startInFlight || status === "loading" || status === "connected") return;
+    // reconnecting is already an active session (koe-byf) — start is a no-op, like
+    // connected. (stopSession below does NOT bail on reconnecting, so it stays
+    // stoppable.)
+    if (
+      startInFlight ||
+      status === "loading" ||
+      status === "connected" ||
+      status === "reconnecting"
+    )
+      return;
     // FAIL-CLOSED: if the event channel could not be opened, starting a session
     // would leave the backend running with no way to receive its status events —
     // the UI would be stuck on "loading" with no stop path.  Block the start and

@@ -27,9 +27,11 @@
 //! transaction N/A · idempotency_key N/A (real-time session control; the budget
 //! guard stops the session, it does not write a charge).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
@@ -37,12 +39,12 @@ use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use crate::audio_bridge::{ManagedAudioBridge, MAX_WS_TEXT_BYTES};
+use crate::audio_bridge::{AudioBridge, ManagedAudioBridge, MAX_WS_TEXT_BYTES};
 use crate::cost_tracker::{BudgetConfig, CostSnapshot, CostTracker};
 use crate::events::{ManagedSequenceCounter, SequenceCounter};
 use crate::realtime_provider::{select_provider, ProviderEvent, RealtimeAuth, RealtimeProvider};
 use crate::realtime_types::{DispatcherSeam, FunctionCall, ManagedDispatcher};
-use crate::secret_store::{ManagedSecretStore, OPENAI_KEY_NAME};
+use crate::secret_store::{ManagedSecretStore, SecretStore, OPENAI_KEY_NAME};
 use crate::settings_store::ManagedSettings;
 use crate::storage::adapter::{ManagedRecorder, RecorderAdapter};
 use crate::tool_dispatcher::MAX_TOOL_NAME_LEN;
@@ -77,20 +79,6 @@ const MAX_INFLIGHT_DISPATCHES: usize = 64;
 /// (a persistent failure means a restart could lose the running total).
 const MAX_SNAPSHOT_SAVE_FAILURES: u32 = 3;
 
-/// Spend (nanodollars) counted into the budget gate but not yet durably written to
-/// the additive ledger because an `add_month_cost` failed transiently, tagged with
-/// the month it belongs to. Carried across frames so the next add retries the WHOLE
-/// unpersisted amount (and the gate keeps counting it); a failed add must never
-/// silently drop spend (that would undercount / fail-open). Reset to 0 once an add
-/// succeeds. The `month` SCOPES the carry: if the month rolls over while spend is
-/// still unpersisted, the loop fails closed rather than fold a past month's spend
-/// into the new month's row (koe-ixt). (koe-ixt R-C / Codex P2)
-#[derive(Default)]
-struct PendingCost {
-    month: u32,
-    nanodollars: u64,
-}
-
 /// WebSocket frame/message size limits (DoS guard).
 /// Max message: 512 KiB — comfortably above the largest legitimate Realtime
 /// frame (audio deltas are ~256 KiB max; control frames are much smaller).
@@ -108,8 +96,13 @@ pub(crate) struct ActiveSession {
     /// (slot taken, then a new session stored) cannot have the old loop's
     /// teardown clear the newer session's handle.
     generation: u64,
+    /// Master stop signal for the session SUPERVISOR (koe-byf). `stop_session`
+    /// fires it; the supervisor receives it (its `master_shutdown`), forwards a
+    /// clean shutdown to the current connection's read loop and stops reconnecting.
+    /// The per-connection write task is no longer held here — it is recreated on
+    /// every (re)connection by the supervisor, so the read loop's own shutdown arm
+    /// aborts the live writer (see `run_session_supervised` / `establish_connection`).
     shutdown_tx: oneshot::Sender<()>,
-    write_handle: tokio::task::JoinHandle<()>,
 }
 
 /// Tauri managed state: the single optional active session plus the monotonic
@@ -170,6 +163,192 @@ fn current_yyyymm() -> u32 {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let year = if m <= 2 { y + 1 } else { y };
     (year as u32) * 100 + m as u32
+}
+
+// ---- reconnection state machine (koe-byf) ------------------------------------
+//
+// transaction N/A · idempotency_key N/A (real-time connection control; the budget
+// guard and the additive cost ledger remain the only billing-side invariants, and
+// they are PRESERVED across reconnects — the supervisor passes the SAME
+// `Arc<TokioMutex<CostTracker>>` to every connection's read loop and the recorder's
+// additive ledger is the cross-session authority, so a reconnect never resets the
+// monthly total / budget gate).
+
+/// How one connection's read loop ended, decided INSIDE [`run_read_loop`] and
+/// returned to the supervisor (koe-byf).
+///
+/// - [`Ended`](ConnectionOutcome::Ended): a TERMINAL exit (clean stop / server
+///   close / 30-min timeout / mic lost / budget exceeded / cost-tracking
+///   unavailable). The read loop has ALREADY called [`finalize_session_slot`]
+///   (idle or error, generation-guarded). The supervisor does nothing more — the
+///   session is over. These are deliberately NOT reconnected: a timeout / budget /
+///   mic-loss is not fixed by a new socket and reconnecting would defeat the cost
+///   cap (fail-closed).
+/// - [`Reconnect`](ConnectionOutcome::Reconnect): a RECOVERABLE transport loss (a
+///   WS/IO error, or a server close with a transient code). The read loop tore
+///   down THIS connection (aborted the writer, stopped the audio bridge) but did
+///   NOT finalize the slot — it is left intact so the supervisor can reconnect (or,
+///   on exhausting the retry budget, finalize fail-closed).
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectionOutcome {
+    Ended,
+    Reconnect,
+}
+
+/// Whether a connect attempt failed in a way worth retrying (koe-byf).
+///
+/// - [`Recoverable`](ConnectError::Recoverable): transient transport failure
+///   (network down / 5xx / handshake / a socket that died right after connect).
+///   The supervisor retries with exponential backoff up to
+///   [`ReconnectConfig::max_attempts`], then fails closed.
+/// - [`Fatal`](ConnectError::Fatal): a failure a retry cannot fix (missing /
+///   malformed BYOK key, audio device gone). The supervisor stops immediately
+///   (fail-closed) — spinning would just burn the retry budget. The `&'static str`
+///   is a FIXED, redacted phrase (never the key, a path, or a raw provider error).
+enum ConnectError {
+    Recoverable(&'static str),
+    Fatal(&'static str),
+}
+
+/// One established connection's moving parts, handed from [`establish_connection`]
+/// to the supervisor (koe-byf). Type-erased (boxed) so the supervisor and
+/// [`run_read_loop`] are not generic over the per-connection socket/closure types
+/// — every reconnect yields the SAME concrete `Connection`. The boxing costs one
+/// dynamic dispatch per server frame (`stream.next()` / `audio_handler`) and one on
+/// teardown (`stop_audio`), both negligible next to the per-frame `serde_json`
+/// parse the read loop already pays.
+struct Connection {
+    /// Server→client frames for this socket.
+    stream: Pin<Box<dyn Stream<Item = Result<Message, WsError>> + Send>>,
+    /// Sender into this connection's single write task (which owns the WS sink).
+    write_tx: mpsc::Sender<Message>,
+    /// cpal device-loss flag for this connection's audio bridge generation.
+    mic_running: Arc<AtomicBool>,
+    /// Stops this connection's audio bridge: `true` = graceful (flush tail),
+    /// `false` = immediate (discard tail).
+    stop_audio: Box<dyn Fn(bool) + Send>,
+    /// Intercepts server `response.audio.delta` frames for playback.
+    audio_handler: Box<dyn Fn(&Value) + Send>,
+    /// Abort handle for this connection's write task (aborted on abnormal exit so
+    /// queued PCM is not flushed after the decision to stop).
+    writer_abort: Option<tokio::task::AbortHandle>,
+}
+
+/// Reconnect tuning (koe-byf). Injectable so tests use tiny delays.
+#[derive(Debug, Clone, Copy)]
+struct ReconnectConfig {
+    /// Max consecutive failed attempts before failing closed (no infinite retry).
+    /// "Consecutive" because a connection that stayed up at least
+    /// [`min_healthy_uptime`](ReconnectConfig::min_healthy_uptime) resets the count.
+    max_attempts: u32,
+    /// Base backoff; the exponential grows `base * 2^(attempt-1)`.
+    base: Duration,
+    /// Upper bound on a single backoff interval (caps the exponential).
+    cap: Duration,
+    /// A connection must stay up at least this long before its drop resets the retry
+    /// budget. A connect that SUCCEEDS then drops almost immediately (a flapping /
+    /// hostile endpoint, or a MITM that resets right after the handshake) is counted
+    /// as a FAILED attempt — so `attempt` keeps climbing to `max_attempts` and we fail
+    /// closed. This is the core guard against the "connect-success → instant drop"
+    /// billing loop: without it, every successful connect would reset `attempt`, the
+    /// `max_attempts` cap would never be reached, and a server could drive unbounded
+    /// reconnects (each opening a billable BYOK session, none reporting usage so the
+    /// budget gate never fires) — R-B Critical.
+    min_healthy_uptime: Duration,
+    /// Absolute ceiling on TOTAL reconnects for one `start_session`, NEVER reset on a
+    /// healthy connection. Belt-and-suspenders to [`min_healthy_uptime`]: even an
+    /// endpoint that games the uptime check (stays up just past the threshold, sends
+    /// no usage, then drops) is bounded — after this many reconnects the session fails
+    /// closed. Bounds worst-case billable session-opens per start (R-B Critical).
+    max_total_reconnects: u32,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        // Honest transient drops: 6 consecutive failed attempts of 0.5s..30s
+        // equal-jitter backoff ≈ up to ~1.5 min of retrying before fail-closed.
+        // Flapping / hostile endpoints: a connection must stay up >= 10s to be
+        // "healthy" (else `attempt` keeps climbing to 6 → fail-closed), AND a hard
+        // ceiling of 20 total reconnects per session bounds any pattern's billable
+        // session-opens. Together these stop a "connect-success → instant drop" loop
+        // from re-charging the BYOK key forever (R-B Critical).
+        Self {
+            max_attempts: 6,
+            base: Duration::from_millis(500),
+            cap: Duration::from_secs(30),
+            min_healthy_uptime: Duration::from_secs(10),
+            max_total_reconnects: 20,
+        }
+    }
+}
+
+/// EQUAL-JITTER exponential backoff (koe-byf), pure + deterministic given
+/// `jitter_factor`. `attempt` is 1-based. The capped exponential is
+/// `exp = min(cap, base * 2^(attempt-1))` (saturating, so a large attempt can
+/// never overflow); the returned delay is `exp/2 + jitter_factor * (exp/2)`, i.e.
+/// it always lands in `[exp/2, exp]` — a non-zero lower bound (so a thundering herd
+/// is spread out without ever waiting ~0) AND a hard upper bound. `jitter_factor`
+/// is injected in [0, 1) so this is unit-testable without a clock or RNG; the live
+/// caller passes [`jitter_factor`].
+fn reconnect_delay(attempt: u32, base: Duration, cap: Duration, jitter_factor: f64) -> Duration {
+    // Saturating exponential in nanoseconds (u128 head-room), capped, so neither the
+    // shift nor the multiply can overflow at large attempts (fail-safe: clamps to cap).
+    let cap_ns = cap.as_nanos();
+    let base_ns = base.as_nanos();
+    // 2^(attempt-1) with a guard: anything past ~63 doublings is already >= cap, so
+    // clamp the shift to avoid a giant shift; we then min() with cap anyway.
+    let shift = attempt.saturating_sub(1).min(63);
+    let exp_ns = base_ns.saturating_mul(1u128 << shift).min(cap_ns);
+    let half = exp_ns / 2;
+    // jitter_factor clamped to [0,1) defensively (a caller bug must not exceed cap).
+    let jf = jitter_factor.clamp(0.0, 1.0);
+    let jittered = half + ((half as f64) * jf) as u128;
+    // jittered ∈ [half, exp_ns]; convert back (u64 is plenty for any sane cap).
+    Duration::from_nanos(jittered.min(u128::from(u64::MAX)) as u64)
+}
+
+/// Server WS close codes that mean "transient — reconnect" (koe-byf): going away
+/// (1001), abnormal (1006), internal error (1011), service restart (1012), try
+/// again later (1013). A normal close (1000) or a code-less close is NOT
+/// recoverable — it is the server saying "done", which stays the clean idle path.
+/// Pure (takes the numeric code) so it is unit-tested without building a
+/// tungstenite `CloseFrame`.
+fn is_recoverable_close_code(code: Option<u16>) -> bool {
+    matches!(code, Some(1001 | 1006 | 1011 | 1012 | 1013))
+}
+
+/// Classifies a WS handshake failure for the supervisor's retry decision (koe-byf,
+/// CR R-B.5). A 4xx HTTP response (rejected / expired BYOK credentials) is FATAL —
+/// retrying cannot fix a bad key, and burning the retry budget would surface a
+/// misconfiguration as a misleading "reconnect failed". Everything else (network
+/// down / 5xx / transport / handshake) is RECOVERABLE → retry with backoff. The
+/// phrases are fixed, redacted (no key / path / raw error).
+fn classify_connect_error(err: WsError) -> ConnectError {
+    match err {
+        WsError::Http(resp) if resp.status().is_client_error() => {
+            ConnectError::Fatal("invalid credentials")
+        }
+        _ => ConnectError::Recoverable("connection failed"),
+    }
+}
+
+/// A jitter factor in [0, 1) for the live backoff, from the OS CSPRNG
+/// ([`getrandom`], already a dependency). On the (vanishingly rare) RNG failure it
+/// returns 0.5 — a deterministic mid-point, NOT a panic and NOT 0 (fail-safe: a
+/// missing RNG still yields a sane, non-zero backoff).
+fn jitter_factor() -> f64 {
+    let mut buf = [0u8; 8];
+    match getrandom::getrandom(&mut buf) {
+        Ok(()) => {
+            // Take the top 53 bits (f64's mantissa width) and divide by 2^53: every
+            // value is exactly representable, so the result is uniformly in [0, 1)
+            // with NO rounding to exactly 1.0 (a plain `/ 2^64` rounds the largest u64
+            // up to 1.0). `reconnect_delay` also clamps, but keep the source honest.
+            let bits = u64::from_le_bytes(buf) >> 11; // [0, 2^53)
+            (bits as f64) / ((1u64 << 53) as f64)
+        }
+        Err(_) => 0.5,
+    }
 }
 
 // ---- read loop (AppHandle-free; unit-tested via injected frames + emit) ------
@@ -421,7 +600,8 @@ async fn run_read_loop<S, F, EC, ET, A, SA>(
     // `emit` / `emit_cost`. The tool ARGUMENTS are deliberately NOT passed — the
     // closure derives a safe disclosure from the name alone (verifiable-action-first).
     emit_thinking: ET,
-) where
+) -> ConnectionOutcome
+where
     S: Stream<Item = Result<Message, WsError>> + Unpin,
     F: Fn(&str, Option<&str>),
     EC: Fn(u32, u64, BudgetConfig),
@@ -432,11 +612,9 @@ async fn run_read_loop<S, F, EC, ET, A, SA>(
     // Tracks in-flight tool dispatches so a budget trip / stop aborts them too
     // (rather than letting them complete and spend more).
     let mut dispatch_tasks = tokio::task::JoinSet::new();
-    let mut save_failures: u32 = 0;
-    // Unpersisted spend carried across frames after a transient ledger-add failure
-    // (see [`PendingCost`]). Month-scoped so a rollover with unpersisted spend fails
-    // closed instead of mis-attributing it (koe-ixt R-C).
-    let mut pending = PendingCost::default();
+    // The unpersisted-spend carry + consecutive-failure count now live in the SHARED
+    // `CostTracker` (cost.pending_* / cost.save_failures) so they survive a reconnect
+    // (koe-byf) instead of being dropped with this loop's locals — see handle_event.
     // Latch so the in-flight dispatch cap logs once per saturation episode, not
     // once per dropped frame — a sustained flood must not turn the fail-soft drop
     // into a stderr-backpressure DoS (koe-wj2 R-C / Codex).
@@ -458,11 +636,16 @@ async fn run_read_loop<S, F, EC, ET, A, SA>(
     let abort_inflight: bool;
     // Terminal status carried out to `finalize_session_slot`, which emits it under
     // the slot lock (generation-guarded — koe-ego): `Some(reason)` for an abnormal
-    // exit (budget / timeout / mic lost / connection error / cost-tracking
-    // unavailable) → `error(reason)`; `None` for a clean stop/close → `idle`. Set
-    // by the loop's error arms below. Emitting here would leak the dying loop's
-    // status over a newer session during a stop->start handover.
+    // exit (budget / timeout / mic lost / cost-tracking unavailable) →
+    // `error(reason)`; `None` for a clean stop/close → `idle`. Set by the loop's
+    // error arms below. Emitting here would leak the dying loop's status over a
+    // newer session during a stop->start handover. Only consulted on the `Ended`
+    // outcome (a `Reconnect` does not finalize).
     let mut terminal_error: Option<&'static str> = None;
+    // How this connection ends (koe-byf). Default `Ended` (finalize on exit); set
+    // to `Reconnect` by the recoverable-transport arms (WS error / transient close
+    // code) so the supervisor reconnects instead of finalizing the slot.
+    let mut outcome = ConnectionOutcome::Ended;
 
     // Pre-loop check: if the mic is already not running when we enter (e.g., the
     // error_callback fired before or during start_session), fail immediately rather
@@ -478,7 +661,7 @@ async fn run_read_loop<S, F, EC, ET, A, SA>(
         // koe-ego), and only for our own slot: a stop->start handover must not
         // flash this dying loop's error over a newer, connected session.
         finalize_session_slot(&session, generation, &latest_generation, Some("mic device lost"), &emit).await;
-        return;
+        return ConnectionOutcome::Ended;
     }
 
     // Conversation journal (koe-emd): records flow to a single writer task so a
@@ -531,9 +714,8 @@ async fn run_read_loop<S, F, EC, ET, A, SA>(
                         audio_handler(&event);
                         match handle_text(
                             &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
-                            &dispatcher, &mut dispatch_tasks, &mut save_failures,
-                            &mut pending, &mut cap_warned, &mut journal_drop_warned,
-                            &emit_cost, &emit_thinking,
+                            &dispatcher, &mut dispatch_tasks, &mut cap_warned,
+                            &mut journal_drop_warned, &emit_cost, &emit_thinking,
                         ).await {
                             LoopAction::Continue => {}
                             // Carry the terminal error reason out to finalize so it
@@ -547,16 +729,38 @@ async fn run_read_loop<S, F, EC, ET, A, SA>(
                             }
                         }
                     }
-                    // Server closed, or the stream ended: normal exit — drain.
-                    Some(Ok(Message::Close(_))) | None => {
+                    // An explicit server CLOSE frame: a transient close code (going
+                    // away / abnormal / internal error / restart / try-again) is a
+                    // recoverable drop → RECONNECT; a normal (1000) or code-less close
+                    // is the server saying "done" → clean idle exit (koe-byf).
+                    Some(Ok(Message::Close(frame))) => {
+                        let code = frame.as_ref().map(|f| u16::from(f.code));
+                        if is_recoverable_close_code(code) {
+                            outcome = ConnectionOutcome::Reconnect;
+                            abort_inflight = true; // reconnecting: tear down promptly, do not drain
+                        } else {
+                            abort_inflight = false; // clean close: drain in-flight work
+                        }
+                        break;
+                    }
+                    // The stream ended without a close frame: clean end (idle),
+                    // matching pre-koe-byf behavior — only an explicit transport
+                    // ERROR or a transient close code reconnects.
+                    None => {
                         abort_inflight = false;
                         break;
                     }
                     // Binary/ping/pong/frame — ignored; all audio arrives as text
                     // `response.audio.delta` events on the OpenAI Realtime API.
                     Some(Ok(_)) => {}
+                    // A WS/IO transport error (connection reset / 5xx mid-stream /
+                    // protocol error) — a RECOVERABLE drop: tear this connection down
+                    // and hand a `Reconnect` to the supervisor WITHOUT finalizing the
+                    // slot. The supervisor shows `reconnecting` and retries, or fails
+                    // closed after exhausting the retry budget (koe-byf). Previously
+                    // this finalized `error("connection error")` immediately.
                     Some(Err(_)) => {
-                        terminal_error = Some("connection error");
+                        outcome = ConnectionOutcome::Reconnect;
                         abort_inflight = true;
                         break;
                     }
@@ -600,14 +804,476 @@ async fn run_read_loop<S, F, EC, ET, A, SA>(
     // (a racing start_session's `connecting` can only follow this status), and
     // clearing here (not after the conversation-writer drain) means the slot
     // handover is never delayed by journalling.
-    finalize_session_slot(&session, generation, &latest_generation, terminal_error, &emit).await;
+    //
+    // koe-byf: finalize ONLY on a terminal exit. On a recoverable disconnect
+    // (`Reconnect`) the slot is left intact so the supervisor can reconnect; the
+    // teardown above (writer abort + stop_audio) still runs so THIS connection's
+    // socket/audio are released before the next attempt.
+    if matches!(outcome, ConnectionOutcome::Ended) {
+        finalize_session_slot(&session, generation, &latest_generation, terminal_error, &emit).await;
+    }
     // Close the journal channel and flush its tail before run_read_loop returns so
     // a record still in flight is persisted (the seam tests rely on this drain).
     // Unconditional: turns that already happened belong in the history even on an
-    // abnormal exit. Done last (after the slot-clear) so journalling never delays
-    // the session-status transition or the slot handover.
+    // abnormal exit (incl. a reconnect). Done last (after the slot-clear) so
+    // journalling never delays the session-status transition or the slot handover.
     drop(rec_tx);
     let _ = conversation_writer.await;
+
+    outcome
+}
+
+// ---- reconnection: connection builder + supervisor (koe-byf) ------------------
+
+/// Establishes ONE live connection's moving parts (koe-byf): fetch the BYOK key
+/// (exposed ONLY to build the handshake header, then dropped — no long-lived copy),
+/// open the WS with DoS size caps, send the provider's setup frames, spawn the
+/// single write task (owns the sink), and start the audio bridge. Returns the
+/// type-erased [`Connection`] the supervisor feeds to [`run_read_loop`], or a
+/// classified [`ConnectError`] for the supervisor's retry decision.
+///
+/// Called fresh on EVERY (re)connect, so the key-exposure window stays one
+/// header-build per attempt and `AudioBridge::start` reaps the previous audio
+/// thread before opening new devices (koe-flu). Emits NO session-status — the
+/// supervisor owns the connecting/connected/reconnecting/error transitions.
+async fn establish_connection(
+    secret: Arc<dyn SecretStore>,
+    provider: Arc<dyn RealtimeProvider>,
+    dispatcher: Arc<dyn DispatcherSeam>,
+    audio: Arc<TokioMutex<AudioBridge>>,
+) -> Result<Connection, ConnectError> {
+    // Fetch the key; expose it only to build the header, then drop `auth`. A missing
+    // key is FATAL (a retry cannot conjure one). Never stored / logged / emitted.
+    let key = secret
+        .get_api_key(OPENAI_KEY_NAME)
+        .map_err(|_| ConnectError::Fatal("API key not configured"))?;
+    let auth = RealtimeAuth::Byok(key);
+    // A build_request failure means a malformed credential/URL — a retry will not fix
+    // it (FATAL). Phrase is fixed (no key / path / raw error).
+    let request = provider
+        .build_request(&auth)
+        .map_err(|_| ConnectError::Fatal("invalid credentials"))?;
+    drop(auth); // the credential must not outlive header construction
+
+    // Frame/message size caps (DoS guard) — a crafted server cannot force an
+    // oversized single-message allocation. `WebSocketConfig` is `#[non_exhaustive]`,
+    // so mutate a `Default` rather than a struct literal.
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_message_size = Some(WS_MAX_MESSAGE_SIZE);
+    ws_config.max_frame_size = Some(WS_MAX_FRAME_SIZE);
+    // Classify the handshake failure: a 4xx HTTP response (rejected / expired BYOK
+    // credentials) is FATAL — retrying cannot fix a bad key, and burning the retry
+    // budget would surface a misconfiguration as a misleading "reconnect failed". Any
+    // other failure (network down / 5xx / transport / handshake) is RECOVERABLE → the
+    // supervisor retries with backoff up to its cap (CR R-B.5). The phrases are fixed
+    // (no key / path / raw error).
+    let (ws_stream, _resp) =
+        tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
+            .await
+            .map_err(classify_connect_error)?;
+
+    let (mut sink, stream) = ws_stream.split();
+
+    // Advertise tools + enable transcription. A send failure on a just-opened socket
+    // is a transient transport fault → RECOVERABLE.
+    for frame in provider.initial_frames(&dispatcher.tool_schemas()) {
+        sink.send(frame)
+            .await
+            .map_err(|_| ConnectError::Recoverable("session setup failed"))?;
+    }
+
+    // Single writer owns the sink → concurrent dispatch tasks can't interleave.
+    // Detached: controlled via `writer_abort` (read loop aborts it on abnormal exit)
+    // and via the channel closing when the read loop drops `write_tx` on exit.
+    let (write_tx, mut write_rx) = mpsc::channel::<Message>(WRITE_CHANNEL_CAP);
+    let write_handle = tokio::spawn(async move {
+        while let Some(msg) = write_rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    let writer_abort = write_handle.abort_handle();
+
+    // Start the audio bridge (mic → write_tx, server audio → rodio). A device failure
+    // is FATAL (a new socket will not restore a missing mic); abort the writer so the
+    // just-opened WS is torn down promptly (no idle OpenAI session charging the
+    // user's quota).
+    let (mic_running, stop_handle) = {
+        let mut bridge = audio.lock().await;
+        let stop_handle = match bridge.start(write_tx.clone()) {
+            Ok(h) => h,
+            Err(_) => {
+                write_handle.abort();
+                return Err(ConnectError::Fatal("audio device unavailable"));
+            }
+        };
+        // Grab the running flag AFTER a successful start so the read loop polls the
+        // flag the cpal error_callback sets.
+        let running = bridge.running_flag();
+        (running, stop_handle)
+    };
+
+    // Audio playback handler: `try_lock` so a racing stop just skips one chunk rather
+    // than blocking the read loop (mirrors the pre-koe-byf inline closure).
+    let audio_for_handler = Arc::clone(&audio);
+    let audio_handler: Box<dyn Fn(&Value) + Send> = Box::new(move |event: &Value| {
+        if let Ok(bridge) = audio_for_handler.try_lock() {
+            bridge.handle_server_audio(event);
+        }
+    });
+    let stop_audio: Box<dyn Fn(bool) + Send> = Box::new(move |graceful: bool| {
+        if graceful {
+            stop_handle.stop_graceful();
+        } else {
+            stop_handle.stop_immediate();
+        }
+    });
+
+    Ok(Connection {
+        stream: Box::pin(stream),
+        write_tx,
+        mic_running,
+        stop_audio,
+        audio_handler,
+        writer_abort: Some(writer_abort),
+    })
+}
+
+/// Whether the supervisor still owns the session slot when deciding to reconnect
+/// (koe-byf) — a pure QUERY mirroring [`finalize_session_slot`]'s generation guard
+/// (koe-ego), with NO clear and NO emit.
+enum SlotOwnership {
+    /// The slot still holds OUR generation → we are the active session → reconnect.
+    Owns,
+    /// Slot empty AND no newer start has begun (latest == generation + 1):
+    /// stop_session took our handle → the user stopped → finalize idle, don't reconnect.
+    StopIdle,
+    /// A newer generation owns the slot (handover) or a newer start has begun: that
+    /// session owns its own lifecycle → stay silent (don't reconnect, don't emit) so
+    /// a recovering loop can't orphan a live WS or flash status over a newer session.
+    Silent,
+}
+
+async fn slot_ownership(
+    session: &Arc<TokioMutex<Option<ActiveSession>>>,
+    generation: u64,
+    latest_generation: &AtomicU64,
+) -> SlotOwnership {
+    let guard = session.lock().await;
+    match guard.as_ref().map(|s| s.generation) {
+        Some(g) if g == generation => SlotOwnership::Owns,
+        None => {
+            if latest_generation.load(Ordering::Relaxed) == generation + 1 {
+                SlotOwnership::StopIdle
+            } else {
+                SlotOwnership::Silent
+            }
+        }
+        Some(_) => SlotOwnership::Silent,
+    }
+}
+
+/// Drives a session across reconnects (koe-byf): connect → read loop → on a
+/// recoverable disconnect, exponential-backoff reconnect (equal jitter, bounded by
+/// `cfg.max_attempts`), failing closed once the retry budget is exhausted. The SAME
+/// `cost` Arc + recorder ledger flow into every connection's read loop, so the
+/// monthly total / budget gate are PRESERVED across reconnects (never reset).
+///
+/// Generic + AppHandle-free for unit testing: `connect` (a closure yielding a fresh
+/// [`Connection`] or a [`ConnectError`]), the `emit*` closures (cloned per
+/// connection), and `jitter` are all injected — exactly the discipline of
+/// [`run_read_loop`]. `start_session` passes an `establish_connection` closure, real
+/// emitters, and OS-CSPRNG [`jitter_factor`].
+#[allow(clippy::too_many_arguments)]
+async fn run_session_supervised<C, Fut, F, EC, ET, J>(
+    mut connect: C,
+    provider: Arc<dyn RealtimeProvider>,
+    cost: Arc<TokioMutex<CostTracker>>,
+    recorder: Arc<dyn RecorderAdapter>,
+    dispatcher: Arc<dyn DispatcherSeam>,
+    mut master_shutdown: oneshot::Receiver<()>,
+    emit: F,
+    session: Arc<TokioMutex<Option<ActiveSession>>>,
+    generation: u64,
+    latest_generation: Arc<AtomicU64>,
+    emit_cost: EC,
+    emit_thinking: ET,
+    cfg: ReconnectConfig,
+    jitter: J,
+) where
+    C: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Connection, ConnectError>> + Send + 'static,
+    // `Sync` (not just `Send`): the spawned `run_read_loop` borrows `&emit*` across
+    // `.await` points, so `&F`/`&EC`/`&ET` must be `Send` ⇒ the closures must be
+    // `Sync`. The live emitters (AppHandle + `Arc<SequenceCounter>`) and the test
+    // no-op closures all satisfy this.
+    F: Fn(&str, Option<&str>) + Clone + Send + Sync + 'static,
+    EC: Fn(u32, u64, BudgetConfig) + Clone + Send + Sync + 'static,
+    ET: Fn(&str, &str) + Clone + Send + Sync + 'static,
+    J: Fn() -> f64 + Send + 'static,
+{
+    // Consecutive failed attempts. Reset to 0 ONLY when a connection stayed up at
+    // least `cfg.min_healthy_uptime` (see the Reconnect arm) — NOT on every successful
+    // connect — so a "connect-success → instant drop" flap counts toward
+    // `max_attempts` and fails closed (R-B Critical).
+    let mut attempt: u32 = 0;
+    // Total reconnects this session, NEVER reset: an absolute ceiling on billable
+    // session-opens so no endpoint pattern can drive unbounded BYOK charge.
+    let mut reconnects_total: u32 = 0;
+    // Surface `connecting` once before the first attempt (the inline start_session
+    // used to emit this).
+    emit("connecting", None);
+
+    loop {
+        // Re-validate the budget against the AUTHORITATIVE shared ledger BEFORE every
+        // (re)connect (CR R-B.5 Major / AGENTS.md: validate cost state before a
+        // session). `start_session` checks this for the FIRST connect, but a reconnect
+        // must NOT open a billable WS if the monthly cap was reached DURING the
+        // disconnect — a sibling session's spend, or this session's carried-unpersisted
+        // amount, pushing the shared ledger over. Without this we would open a fresh
+        // connection and only stop on the NEXT usage frame = one reconnect of fail-open
+        // spend. Gate on persisted ledger + the (month-scoped) carried amount — the
+        // same fail-closed lower bound the read loop's budget gate uses. Only when a cap
+        // is enabled (an unlimited session skips the read). An unknown balance (read
+        // error) is fail-closed (koe rule: unknown/error reject).
+        {
+            // Key on the tracker's EFFECTIVE month (`current_month`), NOT the raw clock
+            // `current_yyyymm()`: `add_usage` only advances it on a FORWARD month, so a
+            // backward clock skew / NTP step cannot make this check read an EARLIER
+            // (emptier) month's ledger than the read loop's gate keys on (which would be
+            // fail-open) — koe-ixt month-keying discipline (CR R-B.5).
+            let (budget, effective_month, carried) = {
+                let c = cost.lock().await;
+                let effective_month = c.current_month;
+                let carried = if c.pending_month == effective_month {
+                    c.pending_nanodollars
+                } else {
+                    0
+                };
+                (c.config, effective_month, carried)
+            };
+            if budget.enabled {
+                let rec = Arc::clone(&recorder);
+                let persisted = tokio::task::spawn_blocking(move || {
+                    rec.load_cost_snapshot(effective_month)
+                })
+                .await;
+                let total = match persisted {
+                    Ok(Ok(p)) => p.unwrap_or(0).saturating_add(carried),
+                    _ => {
+                        finalize_session_slot(
+                            &session,
+                            generation,
+                            &latest_generation,
+                            Some("cost tracking unavailable"),
+                            &emit,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                if budget.is_over(total) {
+                    finalize_session_slot(
+                        &session,
+                        generation,
+                        &latest_generation,
+                        Some("monthly budget exceeded"),
+                        &emit,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        // Race connect against the master stop so a user `stop_session` is responsive
+        // even while a (re)connect is hanging (no per-attempt timeout; OS TCP timeout
+        // bounds the worst case). If the user stops mid-connect, abandon the attempt
+        // and finalize idle — the dropped connect future releases its socket/write
+        // task, and stop_session (which fired master) stops the audio bridge.
+        let connected = tokio::select! {
+            res = connect() => res,
+            _ = &mut master_shutdown => {
+                finalize_session_slot(&session, generation, &latest_generation, None, &emit).await;
+                return;
+            }
+        };
+        match connected {
+            Ok(conn) => {
+                // When this connection started — used after it ends to decide whether
+                // it was "healthy" (long enough to reset the retry budget) or a flap.
+                let connected_at = Instant::now();
+                emit("connected", None);
+
+                // Per-connection clean-shutdown channel: the supervisor forwards
+                // `master_shutdown` here so the read loop tears down gracefully (and
+                // we still get its real ConnectionOutcome) rather than dropping its
+                // future mid-flight (which would skip teardown).
+                let (conn_sd_tx, conn_sd_rx) = oneshot::channel();
+                let mut conn_sd_tx = Some(conn_sd_tx);
+                let mut jh = tokio::spawn(run_read_loop(
+                    conn.stream,
+                    Arc::clone(&provider),
+                    conn.write_tx,
+                    Arc::clone(&cost),
+                    Arc::clone(&recorder),
+                    Arc::clone(&dispatcher),
+                    conn_sd_rx,
+                    emit.clone(),
+                    Arc::clone(&session),
+                    generation,
+                    Arc::clone(&latest_generation),
+                    conn.audio_handler,
+                    conn.mic_running,
+                    conn.stop_audio,
+                    conn.writer_abort,
+                    emit_cost.clone(),
+                    emit_thinking.clone(),
+                ));
+
+                let mut forwarded = false;
+                let joined = loop {
+                    tokio::select! {
+                        joined = &mut jh => break joined,
+                        _ = &mut master_shutdown, if !forwarded => {
+                            // User stop: ask the read loop to shut down cleanly, then
+                            // keep awaiting it for the real (idle-finalized) outcome.
+                            if let Some(tx) = conn_sd_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            forwarded = true;
+                        }
+                    }
+                };
+
+                let outcome = match joined {
+                    Ok(o) => o,
+                    // The read loop task panicked (should be unreachable — no unwrap on
+                    // hostile input). Fail closed: clear the slot + notify so the UI does
+                    // not hang on `connected` (finalize's generation guard handles a
+                    // concurrent handover).
+                    Err(_) => {
+                        finalize_session_slot(
+                            &session,
+                            generation,
+                            &latest_generation,
+                            Some("session error"),
+                            &emit,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+
+                if forwarded {
+                    // The user stopped. If the read loop exited via its WS-error arm at
+                    // the same instant (returned `Reconnect` → it did NOT finalize),
+                    // finalize idle so the slot clears and the UI leaves
+                    // connected/reconnecting. If it returned `Ended` it already
+                    // finalized — don't double-emit.
+                    if matches!(outcome, ConnectionOutcome::Reconnect) {
+                        finalize_session_slot(&session, generation, &latest_generation, None, &emit)
+                            .await;
+                    }
+                    return;
+                }
+
+                match outcome {
+                    // run_read_loop already finalized (idle/error) — session over.
+                    ConnectionOutcome::Ended => return,
+                    // Recoverable transport loss — fall through to the backoff below.
+                    ConnectionOutcome::Reconnect => {
+                        // Only a connection that stayed up long enough is "healthy"
+                        // and resets the retry budget. A connect that drops almost
+                        // immediately is treated as a failed attempt (attempt is NOT
+                        // reset), so a flapping / hostile endpoint climbs to
+                        // `max_attempts` and fails closed instead of re-charging the
+                        // BYOK key forever (R-B Critical).
+                        if connected_at.elapsed() >= cfg.min_healthy_uptime {
+                            attempt = 0;
+                        }
+                    }
+                }
+            }
+            // A retry cannot fix this (missing/malformed key, audio device) — fail
+            // closed now rather than burning the retry budget.
+            Err(ConnectError::Fatal(reason)) => {
+                finalize_session_slot(&session, generation, &latest_generation, Some(reason), &emit)
+                    .await;
+                return;
+            }
+            // Transient connect failure — fall through to the backoff below. The reason
+            // is a fixed, redacted phrase (no key / path); surface it (content-free) so
+            // a recurring failure cause is diagnosable. Bounded by max_total_reconnects.
+            Err(ConnectError::Recoverable(reason)) => {
+                eprintln!("[session] (re)connect failed: {reason}; backing off");
+            }
+        }
+
+        // ---- backoff before the next attempt (shared by a read-loop `Reconnect` and
+        // a recoverable connect failure) ----
+
+        // Generation gate: only reconnect if we still own the slot. A handover
+        // (stop->start) means a newer session owns everything — reconnecting would
+        // create a competing live socket (BYOK double-charge). Mirrors finalize's
+        // generation guard (koe-ego).
+        match slot_ownership(&session, generation, &latest_generation).await {
+            SlotOwnership::Owns => {}
+            SlotOwnership::StopIdle => {
+                finalize_session_slot(&session, generation, &latest_generation, None, &emit).await;
+                return;
+            }
+            SlotOwnership::Silent => return,
+        }
+
+        // Absolute ceiling on total reconnects (never reset on a healthy connection):
+        // bounds billable session-opens for ANY endpoint pattern, including one that
+        // games min_healthy_uptime (stays up just past the threshold, sends no usage,
+        // then drops). Checked before the consecutive-attempt cap (R-B Critical).
+        reconnects_total += 1;
+        if reconnects_total > cfg.max_total_reconnects {
+            finalize_session_slot(
+                &session,
+                generation,
+                &latest_generation,
+                Some("reconnect failed"),
+                &emit,
+            )
+            .await;
+            return;
+        }
+
+        attempt += 1;
+        if attempt > cfg.max_attempts {
+            // Consecutive-failure budget exhausted → fail closed: stop + notify (no
+            // infinite retry). A healthy connection (>= min_healthy_uptime) resets
+            // `attempt`, so this bounds CONSECUTIVE failures / flaps.
+            finalize_session_slot(
+                &session,
+                generation,
+                &latest_generation,
+                Some("reconnect failed"),
+                &emit,
+            )
+            .await;
+            return;
+        }
+
+        emit("reconnecting", None);
+        let delay = reconnect_delay(attempt, cfg.base, cfg.cap, jitter());
+        let mut stopped = false;
+        tokio::select! {
+            _ = &mut master_shutdown => { stopped = true; }
+            _ = tokio::time::sleep(delay) => {}
+        }
+        if stopped {
+            // User stopped during the backoff wait → finalize idle, don't reconnect.
+            finalize_session_slot(&session, generation, &latest_generation, None, &emit).await;
+            return;
+        }
+        // loop → reconnect
+    }
 }
 
 /// One conversation event queued for the journal writer (koe-emd). `role` /
@@ -720,8 +1386,6 @@ async fn handle_text<EC, ET>(
     rec_tx: &mpsc::Sender<ConversationRecord>,
     dispatcher: &Arc<dyn DispatcherSeam>,
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
-    save_failures: &mut u32,
-    pending: &mut PendingCost,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
     emit_cost: &EC,
@@ -740,8 +1404,6 @@ where
             rec_tx,
             dispatcher,
             dispatch_tasks,
-            save_failures,
-            pending,
             cap_warned,
             journal_drop_warned,
             emit_cost,
@@ -769,8 +1431,6 @@ async fn handle_event<EC, ET>(
     rec_tx: &mpsc::Sender<ConversationRecord>,
     dispatcher: &Arc<dyn DispatcherSeam>,
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
-    save_failures: &mut u32,
-    pending: &mut PendingCost,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
     emit_cost: &EC,
@@ -871,6 +1531,19 @@ where
             LoopAction::Continue
         }
         ProviderEvent::Usage(usage) => {
+            // Reconnect double-count safety (AGENTS.md: "WebSocket 再接続で usage を
+            // 二重カウント → event_id/response.id で dedup"). koe-byf does NOT need an
+            // explicit usage-id seen-set because a duplicate `response.done` cannot
+            // reach this arm twice across a reconnect: (1) the supervisor `jh.await`s
+            // the old connection's read loop to completion — including this cost path
+            // and the journal drain — BEFORE it reconnects (connections are SEQUENTIAL,
+            // never overlapping), and (2) each reconnect sends a FRESH `session.update`
+            // (no session resumption), so the server starts a new session and never
+            // replays the previous session's `response.done`. Explicit
+            // event_id/response.id dedup is deferred to when session resumption is
+            // added OR koe-ef8 verifies the live frame id shapes (server event shapes
+            // are koe-ef8-verified — see OpenAiRealtime::build_request) — tracked.
+            //
             // This frame's incremental cost — the delta to add to the month's
             // ledger. Advance the SESSION-LOCAL tracker too (month rollover +
             // saturating add + its own view) and capture the EFFECTIVE accounting
@@ -885,29 +1558,32 @@ where
             // an already-over-cap current month (fail-open) across a month boundary.
             let delta = usage.cost_nanodollars();
             let observed_month = current_yyyymm();
-            let (effective_month, budget) = {
+            // The amount to add includes any earlier spend that FAILED to persist
+            // (carried in the SHARED `CostTracker.pending_*`, so it survives a
+            // reconnect — koe-byf), so a transient ledger failure never silently drops
+            // spend: we retry the whole unpersisted amount and the gate keeps counting
+            // it until an add succeeds. The carry is MONTH-SCOPED: if it belongs to a
+            // PAST month (a rollover happened while spend was still unpersisted), the
+            // stale carry is DROPPED rather than folded into the new month's row (which
+            // would over-count the new month). Dropping it is sound because the old
+            // month's cap was already enforced live, frame by frame, and its persisted
+            // total is never read again once it is no longer the current month
+            // (`load_cost_snapshot` is only called for the current month at session
+            // start). We then proceed normally so THIS frame's spend IS still recorded
+            // in — and gated against — the NEW month, instead of being lost to an early
+            // stop (koe-ixt R-C / Codex P2). Computed under the first lock so the carry
+            // read + the add_usage advance + the month-scope reset are atomic.
+            let (effective_month, budget, to_add) = {
                 let mut c = cost.lock().await;
                 c.add_usage(&usage, observed_month);
-                (c.current_month, c.config)
+                let effective_month = c.current_month;
+                if c.pending_month != effective_month {
+                    c.pending_nanodollars = 0;
+                    c.pending_month = effective_month;
+                }
+                let to_add = c.pending_nanodollars.saturating_add(delta);
+                (effective_month, c.config, to_add)
             };
-            // The amount to add includes any earlier spend that FAILED to persist
-            // (carried in `pending`), so a transient ledger failure never silently
-            // drops spend: we retry the whole unpersisted amount and the gate keeps
-            // counting it until an add succeeds. The carry is MONTH-SCOPED: if it
-            // belongs to a PAST month (a rollover happened while spend was still
-            // unpersisted), the stale carry is DROPPED rather than folded into the
-            // new month's row (which would over-count the new month). Dropping it is
-            // sound because the old month's cap was already enforced live, frame by
-            // frame, and its persisted total is never read again once it is no longer
-            // the current month (`load_cost_snapshot` is only called for the current
-            // month at session start). We then proceed normally so THIS frame's spend
-            // IS still recorded in — and gated against — the NEW month, instead of
-            // being lost to an early stop (koe-ixt R-C / Codex P2).
-            if pending.month != effective_month {
-                pending.nanodollars = 0;
-                pending.month = effective_month;
-            }
-            let to_add = pending.nanodollars.saturating_add(delta);
             // Add to the SHARED monthly ledger and read back the new authoritative
             // cross-session total (koe-ixt). Additive accounting is the single source
             // of truth: it SUMS every session's spend, so a stop->start handover
@@ -927,19 +1603,24 @@ where
             let (authoritative_total, durable) = match added {
                 Ok(Ok(new_total)) => {
                     // The whole unpersisted amount is now durably in the ledger.
-                    *save_failures = 0;
-                    pending.nanodollars = 0;
+                    let mut c = cost.lock().await;
+                    c.save_failures = 0;
+                    c.pending_nanodollars = 0;
                     (new_total, true)
                 }
                 _ => {
-                    *save_failures += 1;
-                    // Carry the unpersisted amount forward (tagged with its month) so
-                    // the NEXT add retries it (and the gate below keeps counting it) —
-                    // a failed add must never drop spend from the ledger (undercount
-                    // / fail-open).
-                    pending.nanodollars = to_add;
-                    pending.month = effective_month;
-                    if *save_failures >= MAX_SNAPSHOT_SAVE_FAILURES {
+                    // Carry the unpersisted amount forward (tagged with its month) in
+                    // the SHARED tracker so the NEXT add — even after a reconnect —
+                    // retries it (and the gate below keeps counting it): a failed add
+                    // must never drop spend from the ledger (undercount / fail-open).
+                    let failures = {
+                        let mut c = cost.lock().await;
+                        c.save_failures += 1;
+                        c.pending_nanodollars = to_add;
+                        c.pending_month = effective_month;
+                        c.save_failures
+                    };
+                    if failures >= MAX_SNAPSHOT_SAVE_FAILURES {
                         // Can't durably track spend → stop rather than risk a restart
                         // resetting the monthly total (fail-closed). Terminal error
                         // emitted by finalize_session_slot under the slot lock
@@ -1080,150 +1761,35 @@ pub async fn start_session(
         return Err("monthly budget exceeded".to_string());
     }
 
-    // Fetch the key; expose it only to build the header, then drop `auth`.
-    let key = secret
+    // Validate the BYOK key EXISTS before spawning so a missing key is an invoke-Err
+    // (the frontend's start path expects that for a misconfigured app), but do NOT
+    // hold it: the supervisor's `establish_connection` re-fetches it per (re)connect
+    // and drops it right after building the header — no long-lived key copy
+    // (koe-byf keeps the pre-existing "expose only to build the header" discipline,
+    // now per attempt).
+    secret
         .0
         .get_api_key(OPENAI_KEY_NAME)
         .map_err(|_| "API key not configured".to_string())?;
-    let auth = RealtimeAuth::Byok(key);
 
-    emit_session_status(&app, &seq.0, "connecting", None);
-
-    let request = provider.build_request(&auth).map_err(|e| e.to_string())?;
-    drop(auth); // the credential must not outlive header construction
-
-    // Connect with explicit frame/message size limits so a crafted server cannot
-    // cause the client to allocate more than WS_MAX_MESSAGE_SIZE bytes for a
-    // single message (DoS guard).
-    // Note: WebSocketConfig is `#[non_exhaustive]` so we must mutate a Default.
-    let mut ws_config = WebSocketConfig::default();
-    ws_config.max_message_size = Some(WS_MAX_MESSAGE_SIZE);
-    ws_config.max_frame_size = Some(WS_MAX_FRAME_SIZE);
-    let (ws_stream, _resp) = tokio_tungstenite::connect_async_with_config(
-        request,
-        Some(ws_config),
-        false,
-    )
-    .await
-    .map_err(|_| {
-        emit_session_status(&app, &seq.0, "error", Some("connection failed"));
-        "connection failed".to_string()
-    })?;
-    emit_session_status(&app, &seq.0, "connected", None);
-
-    let (mut sink, stream) = ws_stream.split();
-
-    // Advertise tools so the model can issue function calls (else the dispatch
-    // loop is permanently idle). The provider supplies the exact setup frames
-    // (OpenAI: one `session.update`); each is sent in order over the sink.
-    for frame in provider.initial_frames(&dispatcher.0.tool_schemas()) {
-        sink.send(frame).await.map_err(|_| {
-            // Emit error status before returning so the frontend transitions out
-            // of the "connected" state that was emitted at the WS-connect step.
-            // Generic wording (not "session.update") since the provider may send
-            // a different / multi-frame setup sequence.
-            emit_session_status(&app, &seq.0, "error", Some("session setup failed"));
-            "session setup failed".to_string()
-        })?;
-    }
-
-    // Single writer owns the sink → concurrent dispatch tasks can't interleave.
-    let (write_tx, mut write_rx) = mpsc::channel::<Message>(WRITE_CHANNEL_CAP);
-    let write_handle = tokio::spawn(async move {
-        while let Some(msg) = write_rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Start the audio bridge (mic capture → write_tx + server audio → rodio sink).
-    // On WSL / CI this will return Err (no audio device); fail-closed rule: we
-    // surface the error to the caller. On the error path we also abort write_handle
-    // so the WS TCP connection is torn down promptly (avoids an OpenAI session that
-    // charges against the user's quota without performing any work), and emit the
-    // corrective `error` session-status event so the frontend UI transitions out of
-    // the "connected" state that was emitted at the WS-connect step above.
-    //
-    // `start()` returns an `AudioStopHandle` — a lock-free (Arc<AtomicBool> +
-    // SyncSender) pair captured at start-time. We use it in `stop_audio` so the
-    // closure NEVER needs `try_lock()`. Under contention (budget-trip / mic-lost /
-    // WS-error while another task holds the bridge mutex) `stop_audio()` still
-    // stops the mic atomically via the atomic flag + try_send, avoiding the silent
-    // skip that the old `try_lock` path could produce (P0 fix).
-    let (mic_running, stop_handle) = {
-        let mut bridge = audio.0.lock().await;
-        let stop_handle = match bridge.start(write_tx.clone()) {
-            Ok(h) => h,
-            Err(e) => {
-                write_handle.abort();
-                emit_session_status(&app, &seq.0, "error", Some("audio device unavailable"));
-                return Err(format!("audio bridge: {e}"));
-            }
-        };
-        // Grab the running flag *after* a successful start so the poll in the
-        // read loop sees the flag set by the cpal error_callback.
-        let running = bridge.running_flag();
-        (running, stop_handle)
-    };
-
-    // An `Arc` clone of the inner bridge so the audio_handler closure below can
-    // call `handle_server_audio` without holding the Tauri `State` guard across
-    // the `'static` boundary that `tokio::spawn` requires.  The bridge is only
-    // accessed for playback (immutable `&self`), so there is no contention with
-    // the `stop_session` path (which holds the `Mutex` for a brief `stop()` call).
-    let audio_arc = Arc::clone(&audio.0);
-    let audio_handler = move |event: &serde_json::Value| {
-        // `try_lock` is non-blocking; if `stop_session` is racing to stop the
-        // bridge we simply skip one audio chunk rather than blocking the read loop.
-        if let Ok(bridge) = audio_arc.try_lock() {
-            bridge.handle_server_audio(event);
-        }
-    };
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    // The running monthly total / budget gate. The SAME Arc flows into EVERY
+    // connection's read loop via the supervisor, so a reconnect never resets the
+    // total (the recorder's additive ledger is the cross-session authority; this
+    // tracker is the session-local view restored from it above).
     let cost = Arc::new(TokioMutex::new(tracker));
-    let recorder_arc = Arc::clone(&recorder.0);
-    let dispatcher_arc = Arc::clone(&dispatcher.0);
+
+    // Session-status emitter — cloned per connection by the supervisor (so it must
+    // be `Clone`). Captures its own AppHandle + sequence clones so the spawned
+    // supervisor is `'static`. The supervisor (not start_session) now emits
+    // connecting / connected / reconnecting / error.
     let app_for_loop = app.clone();
     let seq_for_loop = Arc::clone(&seq.0);
     let emit = move |state: &str, error: Option<&str>| {
         emit_session_status(&app_for_loop, &seq_for_loop, state, error);
     };
-    let session_for_loop = Arc::clone(&session.0);
 
-    // `stop_audio` is called by run_read_loop on EVERY exit path (error /
-    // budget / timeout / shutdown / normal close) so the audio bridge is always
-    // torn down fail-closed even when stop_session was not called explicitly.
-    //
-    // P0 fix: uses the lock-free `AudioStopHandle` captured at start() time.
-    // The closure does ONLY: running.store(false) + try_send(FlushThenStop or StopNow).
-    // It never calls `try_lock()`, so it CANNOT silently skip the mic stop under
-    // contention.
-    //
-    // P1 fix: the bool arg selects graceful (true → FlushThenStop, unconditional flush)
-    // vs immediate (false → StopNow, discard tail). Abnormal exits pass false so no
-    // tail PCM races onto the WS after the writer is aborted.
-    let stop_audio = move |graceful: bool| {
-        if graceful {
-            stop_handle.stop_graceful();
-        } else {
-            stop_handle.stop_immediate();
-        }
-    };
-
-    // P1 fix: extract the AbortHandle BEFORE storing write_handle in ActiveSession.
-    // The read loop aborts the writer on abnormal exits via this handle so
-    // already-queued PCM is not flushed after a budget trip / WS error / timeout.
-    // On normal server-close exits the writer is left to drain gracefully.
-    let writer_abort_handle = write_handle.abort_handle();
-
-    // Live cost emitter (koe-9xi): on each usage frame the read loop calls this with
-    // the authoritative (effective month, cross-session total, budget); we mint a
-    // shared sequence, build the single `CostSnapshot` DTO, and push it on the
-    // `cost-update` channel for the UI's live header. The payload is numbers + a bool
-    // only — no key / path / PII ever reaches the WebView (cf. session-status). Owns
-    // its own `AppHandle` + sequence clones so the spawned loop is `'static`.
+    // Live cost emitter (koe-9xi): pushes a `cost-update` on each DURABLE usage frame.
+    // Numbers + a bool only — no key / path / PII.
     let app_for_cost = app.clone();
     let seq_for_cost = Arc::clone(&seq.0);
     let emit_cost = move |month: u32, used: u64, budget: BudgetConfig| {
@@ -1232,14 +1798,8 @@ pub async fn start_session(
         let _ = app_for_cost.emit("cost-update", snapshot);
     };
 
-    // Pre-tool thinking emitter (glass-box M1, koe-sua.1): when a function call
-    // arrives the read loop calls this with (call_id, tool_name) BEFORE it spawns
-    // the dispatch, so this `thinking-event` always precedes the dispatcher's
-    // `tool-event` phase=start (and shares the SAME `seq` counter, so a disclosure
-    // sequences below the start it precedes). The payload is built from the tool
-    // NAME only — `ThinkingEvent::for_tool` redacts/bounds it — so no key / path /
-    // PII / tool argument ever reaches the WebView. Owns its own `AppHandle` +
-    // sequence clones so the spawned loop stays `'static`.
+    // Pre-tool thinking emitter (glass-box M1, koe-sua.1): redacted `thinking-event`
+    // built from the tool NAME only — no key / path / PII / tool argument.
     let app_for_thinking = app.clone();
     let seq_for_thinking = Arc::clone(&seq.0);
     let emit_thinking = move |call_id: &str, tool_name: &str| {
@@ -1248,35 +1808,53 @@ pub async fn start_session(
         let _ = app_for_thinking.emit("thinking-event", payload);
     };
 
-    // Detached: the loop clears the session slot + emits idle on its own exit;
-    // stop_session signals it via shutdown_tx rather than holding its handle.
-    // `generation` was minted above (right after the is_some check) and
-    // `latest_generation` is the shared counter the loop checks at finalize.
-    tokio::spawn(run_read_loop(
-        stream,
+    // Connect factory (koe-byf): builds ONE fresh connection per (re)connect. Captures
+    // only `'static` Arcs so the supervisor and each call's future are `Send + 'static`.
+    // The provider is resolved once (a session does not switch voice provider
+    // mid-flight); the BYOK key is re-fetched + dropped inside `establish_connection`.
+    let secret_for_connect = Arc::clone(&secret.0);
+    let provider_for_connect = Arc::clone(&provider);
+    let dispatcher_for_connect = Arc::clone(&dispatcher.0);
+    let audio_for_connect = Arc::clone(&audio.0);
+    let connect = move || {
+        let s = Arc::clone(&secret_for_connect);
+        let p = Arc::clone(&provider_for_connect);
+        let d = Arc::clone(&dispatcher_for_connect);
+        let a = Arc::clone(&audio_for_connect);
+        async move { establish_connection(s, p, d, a).await }
+    };
+
+    // Master stop signal: stop_session fires `shutdown_tx`; the supervisor receives
+    // `master_shutdown_rx`, forwards a clean shutdown to the current read loop, and
+    // stops reconnecting.
+    let (shutdown_tx, master_shutdown_rx) = oneshot::channel();
+    let recorder_arc = Arc::clone(&recorder.0);
+    let dispatcher_arc = Arc::clone(&dispatcher.0);
+    let session_for_loop = Arc::clone(&session.0);
+
+    // Spawn the reconnect supervisor (koe-byf): connect → read loop → backoff
+    // reconnect, emitting connecting/connected/reconnecting and failing closed
+    // (error) once the retry budget is exhausted. `generation` was minted above
+    // (right after the is_some check); `latest_generation` is the shared counter the
+    // loop + supervisor check at finalize / before reconnecting.
+    tokio::spawn(run_session_supervised(
+        connect,
         provider,
-        write_tx,
         cost,
         recorder_arc,
         dispatcher_arc,
-        shutdown_rx,
+        master_shutdown_rx,
         emit,
         session_for_loop,
         generation,
         latest_generation,
-        audio_handler,
-        mic_running,
-        stop_audio,
-        Some(writer_abort_handle),
         emit_cost,
         emit_thinking,
+        ReconnectConfig::default(),
+        jitter_factor,
     ));
 
-    *guard = Some(ActiveSession {
-        generation,
-        shutdown_tx,
-        write_handle,
-    });
+    *guard = Some(ActiveSession { generation, shutdown_tx });
     Ok(())
 }
 
@@ -1289,18 +1867,28 @@ pub async fn stop_session(
 ) -> Result<(), String> {
     let taken = { session.0.lock().await.take() };
     if let Some(active) = taken {
-        // Signal the read loop to break; it clears the (now-empty) slot and emits
-        // the single terminal idle on exit. Abort the writer so it stops promptly.
-        // We do NOT abort read_handle — letting it run its shutdown arm guarantees
-        // the in-flight dispatch cleanup + the one idle emission happen exactly once.
+        // Fire the master stop signal (koe-byf): the SUPERVISOR receives it, forwards
+        // a clean shutdown to the current connection's read loop (whose shutdown arm
+        // aborts the live write task) and stops reconnecting. The read loop then runs
+        // its shutdown arm — guaranteeing the in-flight dispatch cleanup + the one
+        // idle emission happen exactly once. The per-connection write task is owned by
+        // the supervisor (recreated each reconnect), so there is no `write_handle`
+        // here to abort; its abort is the read loop's shutdown-arm responsibility.
         let _ = active.shutdown_tx.send(());
-        // Abort the writer FIRST (before stopping audio) so no tail PCM that might
-        // still be in-flight can reach the WS after manual shutdown.
-        active.write_handle.abort();
     }
-    // Stop the audio bridge immediately (no tail flush) — manual shutdown aborts
-    // the writer first so no tail PCM should race onto the WS.  Idempotent: safe
-    // even if start() was never called.
+    // Stop the audio bridge immediately (no tail flush). The read loop's shutdown arm
+    // aborts the writer before any tail could race onto the WS. Idempotent: safe even
+    // if start() was never called.
+    //
+    // PRE-EXISTING handover caveat (NOT introduced by koe-byf — stop_session always
+    // stopped the shared bridge directly): this stops the bridge's CURRENT generation,
+    // which during a stop->start handover could be a newer session's audio (and a stale
+    // read loop could then read `mic_running=false` and emit "mic device lost"). The
+    // proper fix routes the stop through a generation-specific handle held per session
+    // rather than the shared bridge — that is an audio-bridge generation redesign,
+    // Windows-audio territory verified on real devices (koe-pr3), out of scope for this
+    // reconnect-state-machine PR. Tracked as a follow-up. The per-generation flag
+    // design (koe-flu) already prevents a stale thread from clobbering the new flag.
     audio.0.lock().await.stop_immediate();
     Ok(())
 }
@@ -1380,13 +1968,11 @@ mod tests {
     }
 
     /// Builds an `ActiveSession` standing in for a session that occupies the slot,
-    /// with `generation` set. The `shutdown_tx` / `write_handle` are inert (a
-    /// dropped receiver, an immediately-finished task) — the koe-ego tests only
-    /// inspect `generation` to prove the slot was (not) cleared.
+    /// with `generation` set. The `shutdown_tx` is inert (a dropped receiver) — the
+    /// koe-ego tests only inspect `generation` to prove the slot was (not) cleared.
     fn fake_active_session(generation: u64) -> ActiveSession {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        let write_handle = tokio::spawn(async {});
-        ActiveSession { generation, shutdown_tx, write_handle }
+        ActiveSession { generation, shutdown_tx }
     }
 
     // ---- current_yyyymm ------------------------------------------------------
@@ -1507,7 +2093,14 @@ mod tests {
         )
     }
 
-    fn collect_emit() -> (Arc<StdMutex<Vec<(String, Option<String>)>>>, impl Fn(&str, Option<&str>)) {
+    fn collect_emit() -> (
+        Arc<StdMutex<Vec<(String, Option<String>)>>>,
+        // `Clone + Send + Sync + 'static` so the emitter satisfies the supervisor's
+        // bounds (it is cloned per connection and the spawned read loop borrows it
+        // across `.await`). The underlying move-closure captures only an `Arc`, so it
+        // already has all four — the `impl` return type just has to expose them.
+        impl Fn(&str, Option<&str>) + Clone + Send + Sync + 'static,
+    ) {
         let log = Arc::new(StdMutex::new(Vec::new()));
         let l = Arc::clone(&log);
         let emit = move |state: &str, err: Option<&str>| {
@@ -1539,11 +2132,9 @@ mod tests {
         // (1) A is live: store its handle and start its read loop, parked on a
         // stream that never yields (only the shutdown signal will end it).
         let (a_shutdown_tx, a_shutdown_rx) = oneshot::channel();
-        let a_write = tokio::spawn(async {});
         *slot.lock().await = Some(ActiveSession {
             generation: GEN_A,
             shutdown_tx: a_shutdown_tx,
-            write_handle: a_write,
         });
 
         let cost = Arc::new(TokioMutex::new(CostTracker::new(
@@ -2552,8 +3143,6 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let mut save_failures = 0u32;
-        let mut pending = PendingCost::default();
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
         handle_text(
             usage,
@@ -2564,8 +3153,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
@@ -2823,10 +3410,8 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        // Persistent state across both frames (run_read_loop owns these for the
-        // whole session, so the carry survives between frames).
-        let mut save_failures = 0u32;
-        let mut pending = PendingCost::default();
+        // The carry + failure count now live in the SHARED `cost` tracker (so they
+        // survive between frames AND across a reconnect — koe-byf), not in locals.
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
 
         // Frame 1: add fails; the $10 is carried, gate sees only $10 (< $15 cap).
@@ -2839,8 +3424,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
@@ -2851,9 +3434,9 @@ mod tests {
             "the first $10 (< $15 cap) must continue"
         );
         assert_eq!(
-            pending.nanodollars,
+            cost.lock().await.pending_nanodollars,
             10 * NANODOLLARS_PER_USD,
-            "the failed $10 add must be carried forward, not dropped from the ledger"
+            "the failed $10 add must be carried forward (in the shared tracker), not dropped"
         );
 
         // Frame 2: add fails again; gate sees carried $10 + new $10 = $20 (>= $15) →
@@ -2868,8 +3451,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
@@ -2916,13 +3497,15 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let mut save_failures = 0u32;
-        // Unpersisted $5 left over from an EARLIER month (tracker_month - 1).
-        let mut pending = PendingCost {
-            month: tracker_month - 1,
-            nanodollars: 5 * NANODOLLARS_PER_USD,
-        };
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
+        // Pre-seed the SHARED tracker's carry with unpersisted $5 left over from an
+        // EARLIER month (tracker_month - 1). koe-byf moved the carry into CostTracker
+        // so it survives reconnects; tests seed/assert it there instead of a local.
+        {
+            let mut c = cost.lock().await;
+            c.pending_month = tracker_month - 1;
+            c.pending_nanodollars = 5 * NANODOLLARS_PER_USD;
+        }
 
         let result = handle_text(
             &ten_dollars,
@@ -2933,8 +3516,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
@@ -2957,8 +3538,9 @@ mod tests {
             "the dropped old-month pending must not be written anywhere"
         );
         // After a successful add the carry is reset and re-scoped to the new month.
-        assert_eq!(pending.nanodollars, 0, "carry is cleared after a successful add");
-        assert_eq!(pending.month, tracker_month, "carry is re-scoped to the current month");
+        let c = cost.lock().await;
+        assert_eq!(c.pending_nanodollars, 0, "carry is cleared after a successful add");
+        assert_eq!(c.pending_month, tracker_month, "carry is re-scoped to the current month");
     }
 
     #[tokio::test]
@@ -3231,12 +3813,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recorded_turn_survives_abnormal_exit() {
-        // The tail-drain on loop exit is unconditional: a turn that already
-        // happened must be persisted even when the session ends abnormally (here a
-        // connection error). Guards the "turns belong in the history even on an
-        // abnormal exit" contract — a regression that moved the drain into the
-        // normal-close branch would lose the tail on every error exit.
+    async fn recorded_turn_survives_recoverable_disconnect() {
+        // The tail-drain on loop exit is unconditional: a turn that already happened
+        // must be persisted even when the connection drops abnormally (here a WS
+        // error → koe-byf `Reconnect`). Guards the "turns belong in the history even
+        // on an abnormal exit" contract — a regression that gated the drain on the
+        // `Ended` (finalize) branch would lose the tail on every reconnect.
         let (rec, events) = RecordingRecorder::new();
         let cost = Arc::new(TokioMutex::new(CostTracker::new(
             BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
@@ -3257,7 +3839,7 @@ mod tests {
             )),
             Err(WsError::ConnectionClosed),
         ]);
-        run_read_loop(
+        let outcome = run_read_loop(
             stream,
             Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
@@ -3277,12 +3859,15 @@ mod tests {
         |_call_id: &str, _tool: &str| {},)
         .await;
 
-        // The abnormal exit emitted the terminal error...
+        // The recoverable disconnect returns `Reconnect` and emits NO terminal status
+        // (the supervisor owns reconnecting/error)...
+        assert_eq!(outcome, ConnectionOutcome::Reconnect);
         assert!(
-            log.lock().unwrap().iter().any(|(s, _)| s == "error"),
-            "expected a terminal error status on abnormal exit"
+            !log.lock().unwrap().iter().any(|(s, _)| s == "error" || s == "idle"),
+            "a recoverable disconnect must not emit a terminal status from the read loop"
         );
-        // ...yet the turn that already happened was still flushed to the journal.
+        // ...yet the turn that already happened was still flushed to the journal
+        // (the tail-drain is unconditional, not gated on the finalize branch).
         assert_eq!(
             events.lock().unwrap().as_slice(),
             [("user".to_string(), "speech".to_string(), "remember this".to_string())]
@@ -3290,7 +3875,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_error_emits_and_exits() {
+    async fn connection_error_returns_reconnect_and_keeps_slot() {
+        // koe-byf: a WS/IO transport error is a RECOVERABLE drop. run_read_loop must
+        // return `Reconnect`, NOT finalize the slot (so the supervisor can reconnect),
+        // and emit NO terminal idle/error (the supervisor owns the
+        // reconnecting/error transitions). Previously this finalized
+        // `error("connection error")` immediately and ended the session.
         let cost = Arc::new(TokioMutex::new(CostTracker::new(
             BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
             current_yyyymm(),
@@ -3298,8 +3888,11 @@ mod tests {
         let (write_tx, _rx) = mpsc::channel::<Message>(8);
         let (_sd, sd_rx) = oneshot::channel();
         let (log, emit) = collect_emit();
+        // Our session occupies the slot; a recoverable disconnect must LEAVE it.
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(TEST_GENERATION))));
         let stream = futures_util::stream::iter(vec![Err(WsError::ConnectionClosed)]);
-        run_read_loop(
+        let outcome = run_read_loop(
             stream,
             Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
             write_tx,
@@ -3308,7 +3901,7 @@ mod tests {
             Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
             sd_rx,
             emit,
-            Arc::new(TokioMutex::new(None)),
+            Arc::clone(&slot),
             TEST_GENERATION,
             test_counter(),
             |_| {}, // no-op audio_handler (no device in test)
@@ -3319,10 +3912,77 @@ mod tests {
             |_call_id: &str, _tool: &str| {},
         )
         .await;
+        assert_eq!(outcome, ConnectionOutcome::Reconnect);
         let events = log.lock().unwrap();
-        assert!(events.iter().any(|(s, e)| s == "error" && e.as_deref() == Some("connection error")));
-        // error is terminal — no trailing idle that would clear the reason in the UI.
+        // No terminal status from the read loop — the supervisor shows `reconnecting`.
+        assert!(!events.iter().any(|(s, _)| s == "error"));
         assert!(!events.iter().any(|(s, _)| s == "idle"));
+        // The slot is LEFT INTACT for the supervisor to reconnect.
+        assert_eq!(
+            slot.lock().await.as_ref().map(|s| s.generation),
+            Some(TEST_GENERATION),
+            "a recoverable disconnect must not clear the slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_cost_carry_survives_a_recoverable_disconnect() {
+        // koe-byf (Codex Cloud P1): unpersisted spend (the koe-ixt carry) must live in
+        // the SHARED CostTracker, not run_read_loop's locals, so a recoverable
+        // disconnect does NOT drop it (dropping = undercount across the reconnect =
+        // fail-open). A usage frame whose ledger add FAILS leaves $10 carried; a
+        // following WS error returns Reconnect — and the $10 must still be in the
+        // shared tracker for the next connection to retry.
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        // FailingRecorder: add_month_cost -> Err (so $10 is carried, not persisted),
+        // load_cost_snapshot -> Ok(None) (gate sees 0 + carry; budget disabled here).
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(FailingRecorder);
+        // $10 = 312_500 audio-input tokens * 32_000 nanodollars.
+        let ten_dollars = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 312_500u64 } } }
+        });
+        let (write_tx, _rx) = mpsc::channel::<Message>(8);
+        let (_sd, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+        // usage (add fails → carry) then a recoverable WS error (→ Reconnect).
+        let stream = futures_util::stream::iter(vec![
+            Ok(Message::Text(ten_dollars.to_string().into())),
+            Err(WsError::ConnectionClosed),
+        ]);
+        let outcome = run_read_loop(
+            stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            Arc::clone(&cost),
+            recorder,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {},
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+            None,
+            |_m: u32, _u: u64, _b: BudgetConfig| {},
+            |_c: &str, _t: &str| {},
+        )
+        .await;
+        assert_eq!(outcome, ConnectionOutcome::Reconnect);
+        // The unpersisted $10 survives in the SHARED tracker (would have been dropped
+        // with run_read_loop's old local `pending`).
+        let c = cost.lock().await;
+        assert_eq!(
+            c.pending_nanodollars,
+            10 * NANODOLLARS_PER_USD,
+            "the unpersisted carry must survive a recoverable disconnect for the next connection to retry"
+        );
+        assert_eq!(c.save_failures, 1, "the failure count also survives in the shared tracker");
     }
 
     #[tokio::test]
@@ -3951,8 +4611,6 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let mut save_failures = 0u32;
-        let mut pending = PendingCost::default();
         let (mut cap_warned, mut journal_drop_warned) = (false, false);
         let action = handle_text(
             frame,
@@ -3963,8 +4621,6 @@ mod tests {
             &rec_tx,
             &dispatcher,
             &mut dispatch_tasks,
-            &mut save_failures,
-            &mut pending,
             &mut cap_warned,
             &mut journal_drop_warned,
             &move |mo: u32, us: u64, bg: BudgetConfig| sink.lock().unwrap().push((mo, us, bg)),
@@ -4079,5 +4735,679 @@ mod tests {
             emits.lock().unwrap().is_empty(),
             "no cost-update for a non-durable (unpersisted) total"
         );
+    }
+
+    // ---- koe-byf: reconnection (backoff + supervisor) ------------------------
+
+    /// A mock `Connection` whose stream yields `items` then ends. No device → no-op
+    /// audio/stop closures; the write channel's receiver is dropped (the test streams
+    /// issue no function calls → no writes).
+    fn mock_conn(items: Vec<Result<Message, WsError>>) -> Connection {
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        Connection {
+            stream: Box::pin(futures_util::stream::iter(items)),
+            write_tx,
+            mic_running: Arc::new(AtomicBool::new(true)),
+            stop_audio: Box::new(|_g: bool| {}),
+            audio_handler: Box::new(|_e: &Value| {}),
+            writer_abort: None,
+        }
+    }
+
+    /// A mock `Connection` whose stream never yields — parks the read loop until the
+    /// supervisor forwards a clean shutdown.
+    fn mock_conn_pending() -> Connection {
+        let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+        Connection {
+            stream: Box::pin(futures_util::stream::pending()),
+            write_tx,
+            mic_running: Arc::new(AtomicBool::new(true)),
+            stop_audio: Box::new(|_g: bool| {}),
+            audio_handler: Box::new(|_e: &Value| {}),
+            writer_abort: None,
+        }
+    }
+
+    /// Fast reconnect config: sub-ms delays so the backoff sleeps don't slow tests.
+    /// `min_healthy_uptime = 0` so any (instant, in-test) connection counts as healthy
+    /// and resets `attempt` — i.e. the default-success-resets-attempt behavior, kept so
+    /// the reconnect-success / cost-preservation tests are unaffected. The flap /
+    /// total-cap guards are exercised by their own configs (large min_healthy / small
+    /// max_total).
+    fn fast_reconnect_cfg(max_attempts: u32) -> ReconnectConfig {
+        ReconnectConfig {
+            max_attempts,
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(1),
+            min_healthy_uptime: Duration::ZERO,
+            max_total_reconnects: 1_000,
+        }
+    }
+
+    /// Runs the supervisor to completion with no-op cost/thinking emitters, the real
+    /// `OpenAiRealtime` provider double, an `OkRecorder`, a `NoopDispatcher`, and a
+    /// deterministic (0.0) jitter. Returns the recorded `(state, error)` emissions.
+    async fn run_supervisor_collecting<C, Fut>(
+        connect: C,
+        cost: Arc<TokioMutex<CostTracker>>,
+        slot: Arc<TokioMutex<Option<ActiveSession>>>,
+        generation: u64,
+        latest: Arc<AtomicU64>,
+        master: oneshot::Receiver<()>,
+        cfg: ReconnectConfig,
+    ) -> Arc<StdMutex<Vec<(String, Option<String>)>>>
+    where
+        C: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Connection, ConnectError>> + Send + 'static,
+    {
+        let (log, emit) = collect_emit();
+        run_session_supervised(
+            connect,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            master,
+            emit,
+            slot,
+            generation,
+            latest,
+            |_m: u32, _u: u64, _b: BudgetConfig| {},
+            |_c: &str, _t: &str| {},
+            cfg,
+            || 0.0_f64,
+        )
+        .await;
+        log
+    }
+
+    #[test]
+    fn reconnect_delay_stays_within_equal_jitter_bounds() {
+        let base = Duration::from_millis(500);
+        let cap = Duration::from_secs(30);
+        for attempt in 1..=8u32 {
+            let exp = std::cmp::min(
+                cap.as_nanos(),
+                base.as_nanos().saturating_mul(1u128 << (attempt - 1).min(63)),
+            );
+            let half = exp / 2;
+            for jf in [0.0, 0.25, 0.5, 0.999] {
+                let d = reconnect_delay(attempt, base, cap, jf).as_nanos();
+                assert!(
+                    d >= half && d <= exp,
+                    "attempt {attempt} jf {jf}: {d} not in [{half}, {exp}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconnect_delay_caps_and_never_overflows() {
+        let base = Duration::from_millis(500);
+        let cap = Duration::from_secs(30);
+        // Huge attempts must not overflow and must stay within [cap/2, cap].
+        for attempt in [20u32, 60, 1000, u32::MAX] {
+            let d = reconnect_delay(attempt, base, cap, 1.0);
+            assert!(d <= cap, "attempt {attempt}: {d:?} exceeds cap");
+            assert!(d >= cap / 2, "attempt {attempt}: {d:?} below cap/2");
+        }
+        // jitter 0 at/above the cap → exactly cap/2 (equal-jitter lower bound).
+        assert_eq!(reconnect_delay(60, base, cap, 0.0), cap / 2);
+    }
+
+    #[test]
+    fn is_recoverable_close_code_classifies_transient_codes() {
+        for c in [1001u16, 1006, 1011, 1012, 1013] {
+            assert!(is_recoverable_close_code(Some(c)), "code {c} should reconnect");
+        }
+        for c in [1000u16, 1002, 1003, 1005, 1007, 1008] {
+            assert!(!is_recoverable_close_code(Some(c)), "code {c} should not reconnect");
+        }
+        assert!(!is_recoverable_close_code(None), "a code-less close is a clean end");
+    }
+
+    #[test]
+    fn classify_connect_error_4xx_is_fatal_else_recoverable() {
+        use tokio_tungstenite::tungstenite::http::Response;
+        // A 4xx handshake response (rejected / expired BYOK key) is FATAL — no retry.
+        let resp_401 = Response::builder().status(401).body(None::<Vec<u8>>).unwrap();
+        assert!(matches!(
+            classify_connect_error(WsError::Http(Box::new(resp_401))),
+            ConnectError::Fatal(_)
+        ));
+        // A 5xx (server error) is RECOVERABLE — retry with backoff.
+        let resp_503 = Response::builder().status(503).body(None::<Vec<u8>>).unwrap();
+        assert!(matches!(
+            classify_connect_error(WsError::Http(Box::new(resp_503))),
+            ConnectError::Recoverable(_)
+        ));
+        // A transport-level error (no HTTP response) is RECOVERABLE.
+        assert!(matches!(
+            classify_connect_error(WsError::ConnectionClosed),
+            ConnectError::Recoverable(_)
+        ));
+    }
+
+    #[test]
+    fn jitter_factor_is_in_unit_interval() {
+        for _ in 0..64 {
+            let f = jitter_factor();
+            assert!((0.0..1.0).contains(&f), "jitter {f} out of [0,1)");
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_reconnects_after_recoverable_drop() {
+        // First connection's stream errors (recoverable) → the supervisor reconnects
+        // and the second connection ends cleanly (idle). connect is called twice and
+        // `reconnecting` is surfaced between them.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let connect = move || {
+            let n = calls_c.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Ok::<Connection, ConnectError>(mock_conn(vec![Err(WsError::ConnectionClosed)]))
+                } else {
+                    Ok::<Connection, ConnectError>(mock_conn(vec![]))
+                }
+            }
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        const GEN: u64 = 7;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let (master_tx, master_rx) = oneshot::channel();
+        let log = run_supervisor_collecting(
+            connect,
+            cost,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            master_rx,
+            fast_reconnect_cfg(5),
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "drop then one reconnect = 2 connects");
+        let e = log.lock().unwrap();
+        let states: Vec<&str> = e.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(states.contains(&"connecting"), "{states:?}");
+        assert!(
+            states.iter().filter(|s| **s == "connected").count() >= 2,
+            "one connected per connection: {states:?}"
+        );
+        assert!(states.contains(&"reconnecting"), "must surface reconnecting: {states:?}");
+        assert_eq!(states.last(), Some(&"idle"), "clean end is idle: {states:?}");
+        assert!(slot.lock().await.is_none(), "slot cleared after the clean end");
+    }
+
+    #[tokio::test]
+    async fn supervisor_fails_closed_after_max_attempts() {
+        // Every connect fails recoverably → after max_attempts the supervisor stops
+        // fail-closed (error "reconnect failed"), never spinning forever.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<Connection, ConnectError>(ConnectError::Recoverable("connection failed")) }
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        const GEN: u64 = 3;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let (master_tx, master_rx) = oneshot::channel();
+        let log = run_supervisor_collecting(
+            connect,
+            cost,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            master_rx,
+            fast_reconnect_cfg(3),
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "max_attempts(3) + 1 final attempt then fail closed"
+        );
+        let e = log.lock().unwrap();
+        assert_eq!(
+            e.iter().filter(|(s, _)| s == "reconnecting").count(),
+            3,
+            "one reconnecting per retry: {e:?}"
+        );
+        assert!(
+            e.iter().any(|(s, err)| s == "error" && err.as_deref() == Some("reconnect failed")),
+            "fail-closed terminal error: {e:?}"
+        );
+        assert!(!e.iter().any(|(s, _)| s == "connected"), "no connection ever succeeded");
+        assert!(slot.lock().await.is_none(), "slot cleared on fail-closed");
+    }
+
+    #[tokio::test]
+    async fn supervisor_fails_closed_on_flapping_short_connections() {
+        // CRITICAL (R-B): a server that completes the handshake/setup then drops almost
+        // immediately (no usage frame → the budget gate never fires) must NOT reconnect
+        // forever. With `min_healthy_uptime` above any (instant, in-test) uptime, each
+        // flap counts as a FAILED attempt, so `attempt` climbs to max_attempts and the
+        // session fails closed — bounding the unbounded-BYOK-charge loop.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        // Each connect SUCCEEDS, then the stream immediately errors (recoverable drop).
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok::<Connection, ConnectError>(mock_conn(vec![Err(WsError::ConnectionClosed)]))
+            }
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        const GEN: u64 = 21;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let cfg = ReconnectConfig {
+            max_attempts: 3,
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(1),
+            // No in-test connection lasts this long, so NONE counts as "healthy".
+            min_healthy_uptime: Duration::from_secs(3600),
+            max_total_reconnects: 1_000, // not the guard under test here
+        };
+        let (master_tx, master_rx) = oneshot::channel();
+        let log = run_supervisor_collecting(
+            connect,
+            cost,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            master_rx,
+            cfg,
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "flapping connects must NOT reset attempt: max_attempts(3) + 1 then fail closed"
+        );
+        let e = log.lock().unwrap();
+        assert!(
+            e.iter().any(|(s, err)| s == "error" && err.as_deref() == Some("reconnect failed")),
+            "flapping must fail closed, not reconnect forever: {e:?}"
+        );
+        assert!(slot.lock().await.is_none(), "slot cleared on fail-closed");
+    }
+
+    #[tokio::test]
+    async fn supervisor_fails_closed_on_total_reconnect_cap() {
+        // CRITICAL (R-B) belt-and-suspenders: even if every connection counts as
+        // "healthy" (resets `attempt`, so the consecutive cap is never hit), the
+        // absolute `max_total_reconnects` ceiling stops the session — bounding billable
+        // session-opens for ANY endpoint pattern.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok::<Connection, ConnectError>(mock_conn(vec![Err(WsError::ConnectionClosed)]))
+            }
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        const GEN: u64 = 22;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let cfg = ReconnectConfig {
+            max_attempts: 100, // high → not the guard under test
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(1),
+            min_healthy_uptime: Duration::ZERO, // every drop resets `attempt`
+            max_total_reconnects: 3,            // the guard under test
+        };
+        let (master_tx, master_rx) = oneshot::channel();
+        let log = run_supervisor_collecting(
+            connect,
+            cost,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            master_rx,
+            cfg,
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "max_total_reconnects(3) + 1 then fail closed (despite attempt resetting)"
+        );
+        let e = log.lock().unwrap();
+        assert!(
+            e.iter().any(|(s, err)| s == "error" && err.as_deref() == Some("reconnect failed")),
+            "absolute reconnect ceiling must fail closed: {e:?}"
+        );
+        assert!(slot.lock().await.is_none(), "slot cleared on fail-closed");
+    }
+
+    #[tokio::test]
+    async fn supervisor_rechecks_budget_before_connect_fails_closed_when_over_cap() {
+        // CR R-B.5 Major: a (re)connect must NOT open a billable connection if the
+        // SHARED ledger already exceeded the cap (e.g. during a disconnect). With an
+        // over-cap ledger the supervisor fails closed BEFORE connect() — connect is
+        // never called and no new WS is opened.
+        let month = current_yyyymm();
+        let budget = BudgetConfig {
+            enabled: true,
+            monthly_limit_nanodollars: 10 * NANODOLLARS_PER_USD,
+        };
+        let (rec, _persisted) = SharedSnapshotRecorder::new();
+        let recorder: Arc<dyn RecorderAdapter> = Arc::new(rec);
+        recorder.add_month_cost(month, 20 * NANODOLLARS_PER_USD).unwrap(); // ledger $20 > $10 cap
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(budget, month)));
+        const GEN: u64 = 31;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<Connection, ConnectError>(mock_conn(vec![])) }
+        };
+        let (log, emit) = collect_emit();
+        let (master_tx, master_rx) = oneshot::channel();
+        run_session_supervised(
+            connect,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            cost,
+            recorder,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            master_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            |_m: u32, _u: u64, _b: BudgetConfig| {},
+            |_c: &str, _t: &str| {},
+            fast_reconnect_cfg(5),
+            || 0.0_f64,
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "over-budget must fail closed BEFORE opening a (billable) connection"
+        );
+        let e = log.lock().unwrap();
+        assert!(
+            e.iter().any(|(s, err)| s == "error" && err.as_deref() == Some("monthly budget exceeded")),
+            "pre-connect budget gate must surface the fail-closed error: {e:?}"
+        );
+        assert!(slot.lock().await.is_none(), "slot cleared on fail-closed");
+    }
+
+    #[tokio::test]
+    async fn supervisor_preserves_cost_across_reconnect() {
+        // A usage frame on connection #1 adds to the SHARED cost tracker; after the
+        // drop + reconnect the running total must survive (NOT reset by connection #2).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let usage = serde_json::json!({
+            "type": "response.done",
+            "response": { "usage": { "input_token_details": { "audio_tokens": 1_000_000 } } }
+        });
+        let connect = move || {
+            let n = calls_c.fetch_add(1, Ordering::SeqCst);
+            let usage = usage.clone();
+            async move {
+                if n == 0 {
+                    Ok::<Connection, ConnectError>(mock_conn(vec![
+                        Ok(Message::Text(usage.to_string().into())),
+                        Err(WsError::ConnectionClosed),
+                    ]))
+                } else {
+                    Ok::<Connection, ConnectError>(mock_conn(vec![]))
+                }
+            }
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        const GEN: u64 = 9;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let (master_tx, master_rx) = oneshot::channel();
+        let _ = run_supervisor_collecting(
+            connect,
+            Arc::clone(&cost),
+            slot,
+            GEN,
+            latest,
+            master_rx,
+            fast_reconnect_cfg(5),
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let total = cost.lock().await.month_total_nanodollars;
+        assert!(
+            total > 0,
+            "usage from connection #1 must survive the reconnect (not reset to 0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_fatal_connect_fails_closed_without_retry() {
+        // A FATAL connect error (e.g. missing key) must NOT retry — stop immediately
+        // with the fatal reason, no reconnecting.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<Connection, ConnectError>(ConnectError::Fatal("API key not configured")) }
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        const GEN: u64 = 4;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let (master_tx, master_rx) = oneshot::channel();
+        let log = run_supervisor_collecting(
+            connect,
+            cost,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            master_rx,
+            fast_reconnect_cfg(5),
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a fatal connect must not retry");
+        let e = log.lock().unwrap();
+        assert!(!e.iter().any(|(s, _)| s == "reconnecting"), "{e:?}");
+        assert!(
+            e.iter().any(|(s, err)| s == "error" && err.as_deref() == Some("API key not configured")),
+            "fatal reason surfaced: {e:?}"
+        );
+        assert!(slot.lock().await.is_none(), "slot cleared on fatal");
+    }
+
+    #[tokio::test]
+    async fn supervisor_stays_silent_when_slot_taken_by_newer_generation() {
+        // Handover: while OUR connection drops recoverably, a NEWER session owns the
+        // slot. The supervisor must NOT reconnect (would orphan a live WS → BYOK
+        // double-charge) and must emit no terminal status — it leaves the newer
+        // session intact (mirrors finalize's generation guard, koe-ego).
+        const GEN: u64 = 5;
+        const GEN_NEWER: u64 = 6;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<Connection, ConnectError>(mock_conn(vec![Err(WsError::ConnectionClosed)])) }
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN_NEWER))));
+        let latest = Arc::new(AtomicU64::new(GEN_NEWER + 1));
+        let (master_tx, master_rx) = oneshot::channel();
+        let log = run_supervisor_collecting(
+            connect,
+            cost,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            master_rx,
+            fast_reconnect_cfg(5),
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "must not reconnect into a handed-over slot");
+        let e = log.lock().unwrap();
+        assert!(!e.iter().any(|(s, _)| s == "reconnecting"), "{e:?}");
+        assert!(
+            !e.iter().any(|(s, _)| s == "idle" || s == "error"),
+            "must stay silent (no terminal status over a newer session): {e:?}"
+        );
+        assert_eq!(
+            slot.lock().await.as_ref().map(|s| s.generation),
+            Some(GEN_NEWER),
+            "the newer session's slot must be left intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_master_shutdown_during_read_loop_emits_idle() {
+        // A user stop (master_shutdown) while the read loop is live must end the
+        // session idle WITHOUT reconnecting — the supervisor forwards a clean
+        // shutdown to the read loop, which finalizes idle.
+        const GEN: u64 = 8;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<Connection, ConnectError>(mock_conn_pending()) }
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let (log, emit) = collect_emit();
+        let (master_tx, master_rx) = oneshot::channel();
+        let h = tokio::spawn(run_session_supervised(
+            connect,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            master_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            |_m: u32, _u: u64, _b: BudgetConfig| {},
+            |_c: &str, _t: &str| {},
+            fast_reconnect_cfg(5),
+            || 0.0_f64,
+        ));
+        // Let the supervisor connect + park the read loop on the pending stream.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        master_tx.send(()).unwrap();
+        h.await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "user stop must not reconnect");
+        let e = log.lock().unwrap();
+        assert!(!e.iter().any(|(s, _)| s == "reconnecting"), "{e:?}");
+        assert_eq!(e.last().map(|(s, _)| s.as_str()), Some("idle"), "user stop ends idle: {e:?}");
+        assert!(slot.lock().await.is_none(), "slot cleared on stop");
+    }
+
+    #[tokio::test]
+    async fn supervisor_master_shutdown_during_connect_emits_idle() {
+        // A user stop while a (re)connect is HANGING must end idle without ever
+        // connecting — connect is raced against master_shutdown (koe-byf).
+        const GEN: u64 = 11;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        // connect() never resolves: models a hung TCP/handshake.
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<Connection, ConnectError>>()
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let (log, emit) = collect_emit();
+        let (master_tx, master_rx) = oneshot::channel();
+        let h = tokio::spawn(run_session_supervised(
+            connect,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            master_rx,
+            emit,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            |_m: u32, _u: u64, _b: BudgetConfig| {},
+            |_c: &str, _t: &str| {},
+            fast_reconnect_cfg(5),
+            || 0.0_f64,
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        master_tx.send(()).unwrap();
+        h.await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "connect attempted once (hung)");
+        let e = log.lock().unwrap();
+        assert!(
+            !e.iter().any(|(s, _)| s == "connected" || s == "reconnecting"),
+            "never connected, never retried: {e:?}"
+        );
+        assert_eq!(e.last().map(|(s, _)| s.as_str()), Some("idle"), "hung-connect stop ends idle: {e:?}");
+        assert!(slot.lock().await.is_none(), "slot cleared on stop");
     }
 }

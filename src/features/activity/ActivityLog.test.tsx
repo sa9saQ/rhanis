@@ -39,6 +39,16 @@ describe("ActivityLog", () => {
     expect(screen.getAllByText("web_search").length).toBeGreaterThanOrEqual(1);
   });
 
+  it("shows 再接続中 while the session is reconnecting (koe-byf)", () => {
+    render(<ActivityLog />);
+    act(() => {
+      useActivityStore.getState().setSessionStatus({ state: "reconnecting", sequence: 1 });
+    });
+    expect(screen.getByText("再接続中")).toBeInTheDocument();
+    // Not a terminal state: no error alert is shown.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("shows the pending-approval badge", () => {
     render(<ActivityLog />);
     act(() => {

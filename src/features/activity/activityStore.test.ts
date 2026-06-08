@@ -338,6 +338,14 @@ describe("selectDisplayStatus — derived state machine", () => {
     expect(selectDisplayStatus(useActivityStore.getState())).toBe("connecting");
   });
 
+  it("reconnecting maps to reconnecting, not idle/conversing (koe-byf)", () => {
+    setConn("reconnecting");
+    expect(selectDisplayStatus(useActivityStore.getState())).toBe("reconnecting");
+    // It is NOT a terminal state: connState is set and no sticky error is created.
+    expect(useActivityStore.getState().connState).toBe("reconnecting");
+    expect(useActivityStore.getState().lastError).toBeNull();
+  });
+
   it("connected with no active tool = conversing", () => {
     setConn("connected");
     expect(selectDisplayStatus(useActivityStore.getState())).toBe("conversing");

@@ -42,6 +42,13 @@ const STATUS_META: Record<
     ariaLabel: "セッションを停止",
     tone: "connected",
   },
+  // koe-byf: a live, STOPPABLE state — the button shows a spinner but stays enabled
+  // and acts as "stop" so the user is never trapped during a long reconnect.
+  reconnecting: {
+    label: "停止",
+    ariaLabel: "セッションを停止（再接続中）",
+    tone: "loading",
+  },
   error: {
     label: "再試行",
     ariaLabel: "セッションを開始（再試行）",
@@ -67,10 +74,15 @@ export function VoiceButton() {
           ariaLabel: "セッションを停止（リスナーエラー）",
         }
       : metaBase;
+  // `loading` DISABLES the button (first connect in flight). `reconnecting` (koe-byf)
+  // shows the same spinner / busy state but stays ENABLED so the user can stop a
+  // recovering session — so split "show a spinner" (busy) from "is disabled".
   const isLoading = status === "loading";
+  const isReconnecting = status === "reconnecting";
+  const busy = isLoading || isReconnecting;
 
   async function handleClick() {
-    if (status === "connected") {
+    if (status === "connected" || status === "reconnecting") {
       await stopSession();
     } else if (status === "error") {
       // FAIL-CLOSED: if the listener channel itself failed, the "retry" action
@@ -93,12 +105,12 @@ export function VoiceButton() {
         type="button"
         className={`koe-voice-btn koe-voice-tone-${meta.tone}`}
         aria-label={meta.ariaLabel}
-        aria-pressed={status === "connected"}
-        aria-busy={isLoading ? "true" : undefined}
+        aria-pressed={status === "connected" || status === "reconnecting"}
+        aria-busy={busy ? "true" : undefined}
         disabled={isLoading}
         onClick={() => void handleClick()}
       >
-        {isLoading && (
+        {busy && (
           <span className="koe-voice-spinner" aria-hidden />
         )}
         <span className="koe-voice-btn-label">{meta.label}</span>
