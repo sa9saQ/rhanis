@@ -43,7 +43,7 @@ bd memory `koe-2026-06-10-competitive-landscape`、戦略 issue `koe-20f`。
 ## 最大脅威 + 守れる優位
 - **最大脅威 = Microsoft Copilot on Windows**（koe の M1 surface に OS ネイティブで ①②④ 無料投入）。
   OpenAI の Mac voice 撤退は **Windows 継続なので M1 を救わない**。Actions が opt-in/experimental なのが唯一の時間稼ぎ。
-- **守れる優位 = end-user 向け校正 glass-box**。大手は構造的に出しにくい（「どれくらい自信がないか」を見せると魔法アシスタント UX を損なう）= koe の唯一の耐久ウェッジ。+ 音声=背骨(設計) + provider中立/ローカルfirst(「Microsoft でなくあなたの秘書」)。
+- **守れる優位 = end-user 向け校正 glass-box**。大手は構造的に出しにくい（「どれくらい自信がないか」を見せると魔法アシスタント UX を損なう）= koe の唯一の耐久ウェッジ。+ 音声=背骨(設計) + provider中立/ローカルfirst(「Microsoft でなくあなたの秘書」)。（**精緻化 2026-06-10 徹底レビュー stress-test: 「構造的に出せない」は Google double-check〔2023〜、検索照合ハイライト〕の前例があり、正確には「出しても使われなかったので再投資しない」。見せかけ確信度 UI〔confidence theater〕は数週間〜6ヶ月で模倣可能なため単独ウェッジでは弱く、防御は複合体 = provider 中立+ローカル主権 × 校正品質の実行 × 真正性。分離装置 = 正直レポート `koe-84w`。詳細 = `2026-06-10-exhaustive-review.md` §5 / `koe-20f` note**）
 
 ## 戦略 5 つ（`koe-20f` で tracked）
 1. **ピッチを校正 glass-box 主役に再center**。「常駐音声PCエージェント」は支援行に降格（その見出しは Microsoft に直行、透明性見出しは空室に直行）。
