@@ -11,11 +11,13 @@
 | 種別 | 物 |
 |---|---|
 | 研究レポート | `docs/reviews/2026-06-09-competitor-design-research.md`（competitor 研究 + §9 ビジョン拡張） |
-| 研究ドシエ | `docs/research/competitor-2026-06-09/01-11`（Codex/Hermes teardown・craft・taxonomy・voice-ux・fact-check・curation） |
+| 研究ドシエ | `docs/research/competitor-2026-06-09/01-16`（Codex/Hermes teardown・craft・taxonomy・voice-ux・fact-check・Hermes curation・**12-16 競合地図2026**） |
+| 競合地図レポート | `docs/reviews/2026-06-10-competitive-landscape.md`（音声=table-stakes / 脅威=MS Copilot / 堀=校正glass-box / 勝ち筋） |
 | 設計ブリーフ（現行の正） | `docs/design/2026-06-10-glassbox-console-design-brief.md` |
 | 設計ブリーフ（旧・superseded） | `docs/design/2026-06-09-immersive-orb-design-brief.md` |
 | 本書（引き継ぎマスター） | `docs/reviews/2026-06-10-session-decisions.md` |
-| bd memory | `koe-2026-06-09-vision-expansion` / `koe-2026-06-10-session-decisions` |
+| bd memory | `koe-2026-06-09-vision-expansion` / `koe-2026-06-10-session-decisions` / `koe-2026-06-10-competitive-landscape` |
+| 戦略 issue | `koe-20f`（ピッチ再center / 主張スコープ修正 / 校正最速 / watch=Simular Sai・Confidence UI） |
 | SoT 更新 | `~/.claude/plans/virtual-riding-hearth.md`（2026-06-09/06-10 節）/ `koe/CLAUDE.md`（Branches/Milestones） |
 
 ---
@@ -75,7 +77,18 @@
 - **label `competitor-2026-06-09`（7）**: `koe-es8`(録音三状態+同意) / `koe-6ul`(Realtime VAD前段ゲート) / `koe-0bc`(文字起こし後音声破棄) / `koe-9jp`(発話/沈黙ルーティング) / `koe-i9a`(発話字幕+SR譲渡) / `koe-b9x`(koe doctor) / `koe-6hu`(グローバルPTT+DND)
 - **label `vision-2026-06-09`**: `koe-jhk`(epic 視覚グラウンディング)+`.1`/`.2`/`.3` / `koe-45n`(モデルギャラリー) / `koe-5ed`(OSS提供+課金 decision) / `koe-7yy`(プロバイダ拡張) / `koe-pj1`(チャネル常駐) / `koe-d9t`(翻訳手足) / `koe-0yq`(epic 設定統合) / `koe-v5i`(epic 消費者手足+OAuth) / `koe-3og`(タスクボード)
 
-## 9. 次セッション（ハンドオフ）
+## 9. 競合地図 + 勝ち筋（2026-06-10 後半に確定）
+
+研究 = `docs/reviews/2026-06-10-competitive-landscape.md` + `docs/research/competitor-2026-06-09/12-16`、bd memory `koe-2026-06-10-competitive-landscape`、戦略 `koe-20f`。
+
+- **音声 + 常駐 + PC操作は table-stakes 化**（Copilot/Gemini/Siri/Alexa+/Perplexity/ChatGPT/Hermes 全社）。**「話せる」「3段承認ゲート」を差別化に使わない**。
+- **最大脅威 = Microsoft Copilot（Windows = M1 surface に OS ネイティブ）**。Hermes/OpenAI でない。OpenAI の Mac voice 撤退は Windows 継続で M1 を救わない。直接 = Simular Sai（最接近 startup・最重要 watch）/ Gemini Spark / Perplexity Personal Computer / Claude Cowork。
+- **唯一の真の堀 = end-user 向け校正 glass-box**（4軸採点で axis3 = 全社0）。大手は魔法UXを自壊させるため構造的に出しにくい。
+- **新規性主張の重大修正**: 「校正確信度=製品0」は無条件版が FALSE（Maven AGI が企業内部向けで実装）→ 真の主張「**消費者×音声×PC秘書で校正確信度を end-user にリアルタイム開示する製品=0**」。CLAUDE.md / plan / novelty report / `koe-sua` をスコープ修正済。
+- **勝ち筋の思想**: **能力（レンタル・コモディティ）でなく信頼（積み上がる・奪えない）で戦う**。Calibration Memory（使うほど校正が正確化＝奪えない蓄積）+ first-mover window で最速 + 作り手=プロダクトの透明性一致（build-in-public）+ provider中立/ローカル。勝ちの定義 = Microsoft を倒さない、黒箱を信用しない層の信頼を積み上がる校正の堀で長く深く取る = 乗換不能なニッチの王。
+- **戦略5（`koe-20f`）**: ①ピッチを校正glass-box主役に再center（音声/常駐は降格）②主張を Maven 込みでスコープ修正③校正（`koe-sua.2`/`.3`）を最速で出す＝会社の本体④承認ゲートを差別化に売らない⑤watch=Simular Sai + Confidence UI pattern。
+
+## 10. 次セッション（ハンドオフ）
 
 - **状態**: 設計フェーズ完了。コード変更ゼロ（lib.rs は HEAD 同一）。frontend typecheck 緑。ブランチ `chore/koe-2026-06-09-ux-rootcause-records`（PR #51 open）に docs+bd を積載、main 未マージ。
 - **真実の源**: `bd ready` / `bd prime` / bd memory `koe-2026-06-10-session-decisions`。
