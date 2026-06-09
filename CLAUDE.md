@@ -8,7 +8,7 @@
 - **Stack**: Tauri 2 + React 19 + TypeScript + Rust + OpenAI Realtime-2 (WebSocket BYOK)
 - **Languages**: TypeScript (frontend) + Rust (backend)
 - **収益モデル**: M1 = BYOK 単独。M4 = 運営キー主役 + BYOK 退避（2026-06-03 転換、SoT=プラン + bd koe-1mf）:
-  - **既定（マス層）**: 運営キー（声=OpenAI/Google を「標準/高品質」の体験ラベルで選択）+ 手足 tool API も運営持ち = 完全ターンキー。**プリペイド残高（前払いチャージ）を基盤**、UI は「残高 ¥◯◯（目安: 約◯分）」と時間併記（時間売り切りは原価 2.5 倍ブレで赤字化のため不可、内部精算はドル/トークン建て）。**月の上限金額キャップ + 自動チャージ**（上限到達で停止 → その場で上限引上げ可、表示通貨は国別）
+  - **既定（マス層）**: 運営キー + 手足 tool API も運営持ち = 完全ターンキー。**声＝モデルギャラリー（モデル名+説明+言語ラベル 日/英/両+非エンジニア向けおすすめ+おまかせ自動）で選択**（2026-06-09 更新: 旧「標準/高品質ラベルでモデル名を隠す」を撤回 = `koe-45n`。プロバイダは全 API+OSS 対応 `koe-7yy`。製品は言語非依存グローバル）。**プリペイド残高（前払いチャージ）を基盤**、UI は「残高 ¥◯◯（目安: 約◯分）」と時間併記（時間売り切りは原価 2.5 倍ブレで赤字化のため不可、内部精算はドル/トークン建て）。**月の上限金額キャップ + 自動チャージ**（上限到達で停止 → その場で上限引上げ可、表示通貨は国別）
   - **無料お試し（フリーミアム入口）**: 初回 15〜30 分相当（実会話時間ベース）+ **電話番号（SMS）認証主軸**で捨てアカ対策（クレカは求めない）。「24 時間付与」等は原価 + Sybil で破産リスクのため不可
   - **上級設定（技術層）**: BYOK + アプリ本体有料化（買い切り or ソフト月額）。廃止せず奥に退避
   - 接続層を `RealtimeAuth` enum (`ManagedCredit` 主役 / `Byok` 退避) で抽象化
@@ -148,6 +148,8 @@ M1 では `.env` 不使用。API キーはユーザーがアプリ UI で入力 
 - タスクの最新状態は markdown ではなく **bd**（`bd ready` / `bd show <id>`）が真実の源。本節は節目の要約のみに留める
 
 - **2026-06-09 UX/動線 根本原因レビュー + デザイン全面リデザイン方針**: E2E 実機(Windows)で観測した UX 不良(保存/起動が遅い・「準備中」固着・完成度)を Dynamic Workflow(27 エージェント、19 確定/4 却下、敵対検証済)で根因特定。**遅さ(症状1/2/3)の主犯 = stronghold が全 open/save で age scrypt(work_factor=19, ~1s/回)を回す → 起動時 `try_set_encrypt_work_factor(0)`(koe 鍵は 32byte CSPRNG 強鍵で安全、後方互換)= `koe-ds6`(P0)**。派生 = `koe-nt2`(has 冗長排除 + spawn_blocking)。**「準備中」固着(症状4)** = establish_connection に connect timeout 欠如(`koe-9wb` backend)+ sessionStore loading に脱出口欠如(`koe-5fs` frontend)。`gpt-realtime-2` は**実在の正しいモデル名**(2026-05-07 リリース、格下げ禁止 — bd memory `koe-gpt-realtime-2-is-real`)。**ユーザー方針でデザイン全面リデザイン = 没入型 orb + OS追従配色(`koe-ios` epic)**、プロンプト全文 = `docs/design/2026-06-09-immersive-orb-design-brief.md`。bd label `review-2026-06-09`、着手順 = koe-ds6 → koe-nt2 → (koe-9wb + koe-5fs) → koe-ios(デザイン生成後)。レポート全文 = `docs/reviews/2026-06-09-ux-rootcause-review.md`
+
+- **2026-06-09 ビジョン拡張（ユーザー確定、競合研究 Codex App/Hermes Desktop 起点）**: ①声のコクピット＝全機能を抱えず tool/MCP/エージェント委譲で「声で何でも」(コードも Codex 劣化版にせず `koe-eal` 上に code tool)。②**グローバル多言語**(JP-first 撤回、英語圏含め販売、言語非依存)。③**モデル選択を見せる** `koe-45n`(名前+説明+言語 日/英/両+非エンジニア向けおすすめ+おまかせ自動)＝**M4「モデル名を隠す」決定を撤回**。④**全プロバイダ対応** `koe-7yy`(trait `koe-zv3` 段階導入: API=OpenAI/Gemini/Nova Sonic/Grok Voice/InWorld、OSS=Qwen3.5-Omni/Moshi/J-Moshi/PersonaPlex/Nemotron)。⑤OSS提供+課金 `koe-5ed`(前払い残高1本=`koe-1mf`一致、koe-hosted=規模後/on-device Moshi級=無料完全ローカル)。⑥**視覚グラウンディング** epic `koe-jhk`(注釈オーバーレイ『指して話す』`koe-jhk.1`/ライブ画面共有`koe-jhk.2`/視覚指示→computer_use`koe-jhk.3`)＝裏取り: OpenAI Realtime 画像入力+Gemini Live 画面共有対応。⑦外出先 `koe-pj1`(OpenClaw 方式 Discord/LINE bot+VC 音声, 電話 SIP/スマホアプリ M4+)。検証: computer_use は OSWorld 2026 で 38–79%=不安定→透明性+DANGER 承認が人間保険。bd label `vision-2026-06-09`、bd memory `koe-2026-06-09-vision-expansion`、レポート = `docs/reviews/2026-06-09-competitor-design-research.md`
 
 詳細マイルストーンは `~/.claude/plans/virtual-riding-hearth.md` 参照。
 
