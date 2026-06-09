@@ -1,0 +1,138 @@
+{
+  "summary": "Adversarially fact-checked ~20 of the riskiest capability claims across the three scans via web search and the local koe novelty report. Headline verdicts: (1) The core \"calibrated confidence is vacant\" thesis SURVIVES for koe's exact niche (consumer + voice + operates-your-PC + end-user-facing calibrated confidence shown in real time = 0 shipping products, confirmed). BUT the blanket framing \"0 products do calibrated confidence anywhere\" is CONTRADICTED — a real counterexample exists: Maven AGI ships well-calibrated tiered confidence (90%+/60-90%/<60%) driving response/escalation behavior. SCAN3 correctly caught and quarantined this (enterprise CX, internal-facing to support teams, explicitly NOT shown to end users), so koe's niche claim holds, but the unqualified version is false. The \"Confidence UI\" design pattern is trending in 2026 with an empty \"Real-World Examples\" section in its own catalog — vacancy real, first-mover window closing. (2) Voice IS becoming table-stakes — CONFIRMED across Copilot, Gemini, Siri, Alexa+, Perplexity, Atlas, Hermes, Sai, Claude. The founder's worry is factually correct on axes 1/2/4. (3) OpenAI DID retire desktop voice — CONFIRMED but with a precision fix: it is the macOS app specifically (Jan 15 2026); Windows keeps voice. So \"OpenAI vacated koe's exact surface\" is true only for Mac, NOT Windows (koe's M1 target is Windows-only). This materially weakens the \"OpenAI left koe's surface open\" relief for koe's actual platform. (4) Big-player always-on-voice-PC roadmap claims mostly CONFIRMED, but two are OVERSTATED: Microsoft Copilot Actions is off-by-default/opt-in/experimental/sandboxed (not a default always-on resident — axis-4=3 scoring is generous), and Gemini Spark macOS local-file operation is summer-2026 ROADMAP (not shipped) running on cloud VMs (not local-first). (5) One scan-vs-scan contradiction: SCAN2 calls Perplexity \"browser-bound, not PC-wide\" — OUTDATED; Perplexity Personal Computer (launched Apr-May 2026) does local file editing + native Mac apps + 24/7 on Mac mini. SCAN1 is more accurate. (6) gpt-realtime-2 (koe's own stack model) is REAL — confirmed via OpenAI API docs, released May 7 2026; the koe memory flag koe-gpt-realtime-2-is-real is validated. No fabricated products found; the scans' factual reliability is high, with the corrections above. Net for the founder: voice + always-on + PC-operation are now contested commodity (Microsoft on Windows is the existential threat, NOT relieved by OpenAI's Mac-only retreat); the surviving moat is end-user-facing calibrated glass-box transparency, which is genuinely empty in the consumer-voice-PC niche but NOT empty in enterprise CX — so koe must scope its novelty claim to the niche, not assert \"nobody does calibrated confidence.\"",
+  "claims": [
+    {
+      "product": "Cross-scan thesis: calibrated confidence shown to end user = 0 products",
+      "claim": "No shipping product discloses a CALIBRATED confidence signal matched to real accuracy to end users (koe's axis 3 vacancy)",
+      "status": "verified",
+      "source": "aiuxdesign.guide/patterns/confidence-visualization (empty Real-World Examples section); agentic-design.ai CVP patterns; arxiv 2401.05612 calibrated-frequency study; WebSearch consumer-voice calibrated-confidence (research-only)",
+      "note": "SURVIVES but ONLY for koe's exact niche (consumer + voice + operates-your-PC + end-user-facing, real-time). The pattern catalogs cite guidelines/libraries and an EMPTY examples section; academic work (MIT RLCR, calibrated-frequency) is research-only. First-mover window is closing — the 'Confidence UI' pattern is actively trending in 2026 design literature."
+    },
+    {
+      "product": "Maven AGI (counterexample to '0 products do calibrated confidence')",
+      "claim": "Calibrated confidence is vacant — 0 products anywhere ship it",
+      "status": "contradicted",
+      "source": "mavenagi.com/glossary/ai-confidence-score; mavenagi.com/resources/post/breaking-open-the-ai-black-box ('Thinks Out Loud')",
+      "note": "REAL counterexample to the UNQUALIFIED claim: Maven AGI ships well-calibrated tiered confidence (90%+ direct / 60-90% caveat+escalate / <60% human) that drives response behavior, and 'Thinks Out Loud' exposes the reasoning. SCAN3 correctly quarantined it: enterprise customer-support, internal-facing to support teams, and Maven explicitly states raw scores aren't shown to end customers. So koe's NICHE claim holds; the blanket 'nobody does calibrated confidence' is false. koe must scope its novelty claim accordingly."
+    },
+    {
+      "product": "OpenAI ChatGPT desktop voice retirement",
+      "claim": "OpenAI retired the dedicated desktop-app voice mode, vacating koe's exact desktop surface (Jan 15 2026)",
+      "status": "verified",
+      "source": "9to5mac.com/2025/12/19/chatgpt-voice-mode-retiring-on-macos-app; varindia.com; webpronews.com OpenAI retire voice macOS Jan 15 2026",
+      "note": "CONFIRMED but with a PRECISION FIX the scans blurred: it is the macOS app ONLY. Voice CONTINUES on chatgpt.com, iOS, Android, AND the Windows app. Since koe M1 targets Windows-only, the framing 'OpenAI left koe's exact surface open' is NOT true for koe's actual platform — OpenAI still ships voice on Windows. The Mac-surface relief is real only for the future Mac target (M3)."
+    },
+    {
+      "product": "Microsoft Copilot Actions / Hey Copilot (Windows)",
+      "claim": "Turnkey always-on PC-operating voice secretary built into Windows (axis-4 = 3, biggest direct threat)",
+      "status": "verified",
+      "source": "blogs.windows.com/windows-insider 2025/11/17 Copilot Actions; windowsforum.com Copilot Actions; cnbc.com 2025/10/16; techcommunity.microsoft.com Ignite 2025",
+      "note": "Largely CONFIRMED and IS the most credible platform threat on Windows (koe's surface). NUANCE/OVERSTATEMENT: Copilot Actions (the agentic PC-operation that edits local files, multi-step workflows) is explicitly OFF BY DEFAULT, opt-in, experimental, and runs in a SANDBOXED separate desktop session — not a default always-on resident operating your live desktop. 'Hey Copilot' wake word is always-listening but opt-in. So axis-4=3 scoring is generous; the always-on agentic layer is gated. Threat is real but earlier-stage than 'shipped default' implies."
+    },
+    {
+      "product": "Google Gemini Spark (macOS local file operation)",
+      "claim": "24/7 agent that drives your Mac / organizes/edits/renames local files (axis-4 shipping summer 2026)",
+      "status": "verified",
+      "source": "techcrunch.com 2026/05/19 Gemini Spark; 9to5google.com 2026/05/22 Gemini Mac Spark summer; gigazine.net; gemini.google/overview/agent/spark",
+      "note": "CONFIRMED as announced, but two material caveats the scans softened: (1) macOS local-file operation is SUMMER-2026 ROADMAP, NOT shipped as of June 2026; (2) Spark runs persistently on Google CLOUD virtual machines, not as a local-first resident — it 'operates Google's cloud,' and the Mac client indexes an authorized folder. SCAN2 correctly flagged 'cloud not local'; SCAN1's 'Mac file-op agent shipping' should be read as roadmap. Always-on=true (cloud), operates-YOUR-local-PC=partial/future."
+    },
+    {
+      "product": "Perplexity Personal Computer (Mac)",
+      "claim": "Operates your PC: local file editing, native Mac apps, 24/7 on Mac mini, voice orchestration",
+      "status": "verified",
+      "source": "perplexity.ai/changelog Personal Computer on Mac (Apr 17 2026); techcrunch.com 2026/05/07; macrumors.com 2026/04/16 + 2026/05/07",
+      "note": "CONFIRMED and stronger than one scan portrayed. SCAN-vs-SCAN CONTRADICTION: SCAN2 calls Perplexity 'browser-bound, not PC-wide, not resident' — that is OUTDATED (old Comet assistant). Personal Computer (launched Apr-May 2026, now all Mac users) does local file editing + native Mac app control + 24/7 on Mac mini in a sandbox. SCAN1's scoring (axis-4=2, partial 2) is the accurate one. Windows still pending. Still no calibrated confidence (approval gates only)."
+    },
+    {
+      "product": "Anthropic Claude Cowork / Dispatch + computer use",
+      "claim": "Non-developer agentic desktop, persistent (Dispatch), computer use on Windows/Mac; voice mobile-only",
+      "status": "verified",
+      "source": "claude.com/product/cowork; claude.com/blog/dispatch-and-computer-use; cnbc.com 2026/03/24; support.claude.com/articles voice-mode; techcrunch.com 2026/03/03 Claude Code voice mode",
+      "note": "Non-developer push, computer use, and Dispatch persistence CONFIRMED — genuinely dangerous on axes 1+4 (closest big-lab to 'resident secretary'). CORRECTION to SCAN2: voice mode is NOT strictly mobile-only; Claude voice mode (20 languages, push-to-talk + continuous listening) and a Claude Code voice capability exist beyond the phone. Still bolt-on, not voice-first, and Dispatch dies on machine sleep/close (tethered). koe's gap vs Claude = voice-first + calibrated glass-box (both absent in Claude)."
+    },
+    {
+      "product": "Simular Sai",
+      "claim": "Closest direct analog: always-on agentic AI coworker, GUI like a human, Mac/Windows local or cloud VM, voice commands, transparency+guardrails",
+      "status": "verified",
+      "source": "simular.ai/sai; sai.work; simular.ai/simular-for-macos; techcrunch.com 2025/12/02 Simular Mac agent $21.5M",
+      "note": "CONFIRMED as the single closest startup analog (always-on + turnkey + real local PC operation, Mac 1.0 shipped, Windows in dev with Microsoft). Voice = 'introducing voice commands for hands-free use' = recent BOLT-ON, not voice-first launch framing. Transparency = live visibility + approval gates ('double-checking before critical actions'), NOT calibrated confidence. koe's wedge vs Sai = voice-first + calibrated glass-box. Watch item if Sai adds either."
+    },
+    {
+      "product": "Nous Research Hermes Agent / Desktop (founder's 'voice now table-stakes' trigger)",
+      "claim": "Always-on PC agent that added voice mode (音声会話); validates category but not turnkey/voice-first",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/desktop + /docs voice-mode; marktechpost.com 2026/06/03 Hermes Desktop v0.15.2; github.com/nousresearch/hermes-agent",
+      "note": "CONFIRMED: desktop app shipped Jun 2 2026 (cross-platform), voice mode (Whisper STT + streaming TTS, Japanese support) is real but a BOLT-ON I/O mode (voice not on the desktop landing-page hero). Always-on via gateway systemd daemon + cron scheduler. BYOK / shares API keys+config across surfaces = developer-oriented, NOT turnkey. Founder read is correct: Hermes adding voice validates the category but does NOT erode koe's turnkey + voice-first + calibrated-transparency stack."
+    },
+    {
+      "product": "OpenAI gpt-realtime-2 (koe's own stack model)",
+      "claim": "gpt-realtime-2 is a real model koe builds on (referenced in koe CLAUDE.md/plan)",
+      "status": "verified",
+      "source": "developers.openai.com/api/docs/models/gpt-realtime-2; openai.com introducing-gpt-realtime; techcrunch.com 2026/05/07; ghacks.net 2026/05/11",
+      "note": "REAL — NOT a hallucination. Released May 7 2026 with three new realtime voice models; gpt-realtime-2 has configurable reasoning effort (normal/high/xhigh), parallel tool calls, 128k context, $32/$64 per M audio in/out tokens. Validates the koe bd memory flag koe-gpt-realtime-2-is-real and the novelty-report scoring. Note: its 'reasoning effort' + side-channel function-call events are exactly the substrate koe's thinking-event glass-box plans to surface."
+    },
+    {
+      "product": "Amazon Alexa+",
+      "claim": "Voice-first turnkey agentic assistant that navigates the web and completes tasks autonomously (but home/web surface, not your PC)",
+      "status": "verified",
+      "source": "aboutamazon.com/news/devices/new-alexa-generative-artificial-intelligence; techcrunch.com 2026/02/04 Alexa+ all US; aboutamazon.com France launch",
+      "note": "CONFIRMED: agentic (navigates web, authenticates, books repairs via Thumbtack autonomously), voice-first by design, turnkey ($19.99/mo, free for Prime, all US Feb 2026 + Alexa.com web + Europe expansion). Correctly ADJACENT: it does NOT operate your Windows/Mac PC (Echo/home/web surface). No calibrated confidence. Strongest voice-first turnkey agentic product overall but different device surface from koe."
+    },
+    {
+      "product": "Apple Siri 2.0 (WWDC 2026, Gemini-powered)",
+      "claim": "Gemini-powered (1.2T), App Intents 2.0 replaces SiriKit, agentic cross-app actions, on-screen awareness, iOS 27",
+      "status": "verified",
+      "source": "apple.com/newsroom 2026/06 Siri AI; techcrunch.com 2026/06/08 WWDC; business-standard.com WWDC 2026; techtimes.com App Intents replaces SiriKit",
+      "note": "CONFIRMED announce: Siri rebuilt on ~1.2T Gemini + on-device, SiriKit deprecated for App Intents, agentic system-app actions (e.g., Passwords auto-navigates/sign-in/update). Correctly ADJACENT: iOS-centric, App-Intents-gated (apps must migrate over 2-3 yrs), Mac full-PC-operation depth unproven. Agentic DEPTH is announce-stage (iOS 27 betas from Jun 8 2026), not market-hands-tested. No calibrated confidence."
+    },
+    {
+      "product": "OpenAI ChatGPT Agent / Atlas / Operator",
+      "claim": "Operator shut down (folded into ChatGPT Agent); Atlas browser has agent mode; computer use is browser/cloud-scoped, narrates steps, asks confirmation",
+      "status": "verified",
+      "source": "presenc.ai/research openai-operator-update-tracker-2026; openai.com/index/introducing-chatgpt-atlas; help.openai.com Atlas release notes",
+      "note": "CONFIRMED: Operator retired Aug 31 2025, capabilities absorbed into ChatGPT Agent (CUA model) + exposed via Agents SDK; Atlas = macOS browser with opt-in agent mode (Plus/Pro/Business). Computer use is browser/cloud-scoped, not full local PC. Step narration + confirmation = control/approval UX, NOT calibrated confidence. Browser-bounded scoring is accurate."
+    },
+    {
+      "product": "Microsoft Recall / Copilot Vision (always-on/ambient claim)",
+      "claim": "Copilot Vision opt-in screen-see; Recall passive ambient screen snapshots (axis-4 partial)",
+      "status": "verified",
+      "source": "techcommunity.microsoft.com Ignite 2025; tomsguide.com Copilot Vision/Recall; SCAN2 Microsoft sources",
+      "note": "CONFIRMED as described — Vision is opt-in 'Share with Copilot' screen awareness; Recall is passive/ambient snapshots (privacy-controversial). This is the 'always-on ambient' layer, distinct from agentic PC operation. SCAN2's axis-4 = partial (Recall passive) is fair. Reinforces that Microsoft's TRUE always-on layer is passive observation, while the agentic-action layer (Copilot Actions) is opt-in/sandboxed."
+    },
+    {
+      "product": "Rabbit r1 DLAM",
+      "claim": "Operates your full desktop (Mac/Win/Linux) via USB-tethered r1 + screen-share, 'no setup, all technical levels', voice present",
+      "status": "verified",
+      "source": "rabbit.tech/blog/first-major-update-of-2026-dlam-openclaw; rabbit.tech/blog/get-started-using-dlam-on-r1; x.com/rabbit_hmi DLAM launch",
+      "note": "CONFIRMED: DLAM (late Jan 2026, free trial) lets r1 see/operate full desktop on Mac/Win/Linux via USB-C + dlam.rabbit.tech screen-share, voice-or-type. Correctly ADJACENT/hardware-gated: requires the $199 r1 dongle, per-session, cloud screen-share, low trust ('still makes mistakes'). No calibrated confidence. Differentiated from koe (software-only, resident)."
+    },
+    {
+      "product": "Sesame (Maya/Miles/Simone/Charlie)",
+      "claim": "Most human voice-first companion, iOS app launched May 28 2026, 39 countries, no agentic/PC operation",
+      "status": "verified",
+      "source": "techcrunch.com 2026/05/28 Sesame iOS app; winbuzzer.com 2026/05/29 four agents; testingcatalog.com",
+      "note": "CONFIRMED exactly: iOS public preview May 28 2026, 39 countries, free, four distinct voice agents with personality+memory. Companion/voice-quality benchmark, NOT a secretary — no agentic PC operation, no transparency. Correctly scored ADJACENT (voice-quality bar, different job-to-be-done). Validates scan reliability on the companion tier."
+    },
+    {
+      "product": "Inflection Pi",
+      "claim": "Strategically dead-ended: founders to Microsoft, pivoted to enterprise AI studio on Azure, Pi maintained not advancing",
+      "status": "verified",
+      "source": "sectionai.com/blog/what-happened-to-inflection-and-pi; en.wikipedia.org/wiki/Inflection_AI; techcrunch.com 2024/08/26 Pi usage caps",
+      "note": "CONFIRMED: co-founders Suleyman+Simonyan + most team to Microsoft AI (Mar 2024, $650M license), Inflection pivoted to API-first/enterprise AI studio on Azure under new CEO Sean White, Pi lost momentum (usage caps added). Correctly LOW/stagnant. Not a koe threat."
+    },
+    {
+      "product": "Gemini Live 'voice-first vs bolt-on' classification",
+      "claim": "0 competitors are voice-FIRST; all voice-having products (incl. Gemini) are voice-bolt-on (SCAN2)",
+      "status": "contradicted",
+      "source": "gemini.google/overview/gemini-live; mindstudio.ai Gemini 3.1 Flash Live; medium.com/google-cloud Gemini 3.1 Live native audio",
+      "note": "PARTIALLY OVERSTATED. Gemini Flash Live is a NATIVE speech-to-speech model (audio output produced natively, native VAD, not text→TTS) — architecturally voice-NATIVE, same class as koe's own gpt-realtime-2. So SCAN2's blanket 'all bolt-on, 0 voice-first' conflates MODEL capability with PRODUCT surface. The defensible claim is narrower: the AGENT/PC-operation surfaces (Spark, Copilot Actions) primarily intake via chat/email and treat voice as a mode — that product-architecture point holds, but 'no competitor has voice-native tech' does NOT. koe should frame its voice-first moat as product-spine, not model-novelty."
+    },
+    {
+      "product": "Manus",
+      "claim": "Cloud autonomous task worker, no voice, not a koe competitor",
+      "status": "verified",
+      "source": "SCAN2 en.wikipedia.org/wiki/Manus_(AI_agent); cross-referenced via scans",
+      "note": "CONFIRMED as characterized (cloud virtual computer, text/prompt-driven, no voice, fire-and-forget task runner). Different shape from koe (conversational resident). Low-priority; not independently deep-verified beyond scan consistency since it is explicitly NOT a competitor on koe's axes — flagged here for completeness."
+    }
+  ]
+}
