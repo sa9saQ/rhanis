@@ -1,0 +1,125 @@
+{
+  "claims": [
+    {
+      "claim": "The desktop Capabilities/Tools screen has 19 toolsets (source tools.ts), not 14 as the README prose says.",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/fathah/hermes-desktop/main/src/shared/i18n/locales/en/tools.ts",
+      "note": "Confirmed: 19 distinct toolset keys in tools.ts (web, x_search, browser, terminal, file, code_execution, computer_use, vision, image_gen, video_gen, tts, skills, memory, session_search, clarify, delegation, cronjob, moa, todo/task-planning). The README at github.com/fathah/hermes-desktop says '14 toolsets — web, browser, terminal, file, code execution, vision, image gen, TTS, skills, memory, session search, clarify, delegation, MoA, and task planning' (which is actually 15 listed). Source file is authoritative; the '14' is a curated/undercounted README grouping. INV1 and INV2 correct; the '20/21' counts a WebFetch returned were miscounts including title/subtitle metadata."
+    },
+    {
+      "claim": "The unofficial desktop Capabilities list includes X Search but does NOT include Spotify, Home Assistant, or a separate 'Video Analysis' toolset.",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/fathah/hermes-desktop/main/src/shared/i18n/locales/en/tools.ts",
+      "note": "X Search present ('Search posts and content on X (Twitter)'). Spotify ABSENT, Home Assistant ABSENT (Home Assistant appears only as a messaging gateway, not a toolset). Only Video Generation present ('Generate videos from text or image prompts'); no 'Video Analysis' entry. This contrasts with the OFFICIAL agent (next claim)."
+    },
+    {
+      "claim": "Spotify, Home Assistant, X Search, and Video Analysis ARE official Hermes Agent built-in toolsets (with the named tools).",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/website/docs/reference/tools-reference.md",
+      "note": "Confirmed in official tools-reference: spotify_playback/devices/queue/search/playlists/albums/library (Spotify OAuth); ha_call_service/get_state/list_entities/list_services (Home Assistant); x_search (XAI_API_KEY or xAI Grok OAuth); video_analyze AND video_generate both exist; computer_use is macOS-only (cua-driver). Total registry ~71 tools. KEY DISTINCTION: these are official-agent toolsets; the unofficial desktop GUI surfaces only a 19-toolset subset that omits Spotify/Home Assistant/video_analyze."
+    },
+    {
+      "claim": "Skills exist to drive Claude Code CLI and Codex CLI ('Delegate coding to ...').",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/website/docs/reference/skills-catalog.md",
+      "note": "Confirmed verbatim in autonomous-ai-agents category: claude-code = 'Delegate coding to Claude Code CLI (features, PRs).'; codex = 'Delegate coding to OpenAI Codex CLI (features, PRs).'; opencode = 'Delegate coding to OpenCode CLI (features, PR review).' The 4th sibling is hermes-agent = 'Configure, extend, or contribute to Hermes Agent' — NOT a 'hermes-cli' delegation skill. No skill literally named 'hermes-cli' exists. INV2's correction is right."
+    },
+    {
+      "claim": "'Claude Design' is a real skill — but it is an HTML-artifact design skill, NOT an Anthropic product.",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/website/docs/reference/skills-catalog.md",
+      "note": "Confirmed: claude-design = 'Design one-off HTML artifacts (landing, deck, prototype).' It is a creative skill in the catalog, unrelated to any Anthropic offering. Likely to confuse end users."
+    },
+    {
+      "claim": "Each model has its own per-model API key field in the desktop Models screen.",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/fathah/hermes-desktop/main/src/shared/i18n/locales/en/models.ts",
+      "note": "Confirmed verbatim: field label 'API Key', description 'Stored as an environment variable. Picks the matching env key based on the URL, or CUSTOM_API_KEY otherwise.' Per-model API keys are REAL. Release v0.5.2 also added per-model api_key auto-population. User's observation correct."
+    },
+    {
+      "claim": "The desktop has exactly 8 memory providers (in memory.ts).",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/fathah/hermes-desktop/main/src/shared/i18n/locales/en/memory.ts",
+      "note": "Confirmed 8 in the unofficial desktop: honcho, hindsight, mem0, retaindb, supermemory, holographic, openviking, byterover. NOTE: this is NOT '3'. The official Hermes Agent docs list 9 providers (adds Memori). README mentions 6 'discoverable'. So the count is surface-dependent: desktop UI source = 8, official agent = 9. INV1 (8) and INV3 (9 official) both correct for their respective surfaces; INV3's guess that the UI shows '~3 on fresh install' is unverified speculation."
+    },
+    {
+      "claim": "The official Hermes Agent lists 9 memory providers (Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, Supermemory, Memori).",
+      "status": "verified",
+      "source": "https://hermes-agent.nousresearch.com/docs/user-guide/features/memory-providers",
+      "note": "Confirmed verbatim, 9 providers, only one active at a time alongside always-on built-in MEMORY.md/USER.md. The user's recollection of '3' is wrong for both surfaces (desktop=8, official=9); '3' is unverified."
+    },
+    {
+      "claim": "There is NO 'context engine' selector in the unofficial desktop UI (it is an official-agent-only config concept).",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/fathah/hermes-desktop/main/src/shared/i18n/locales/en/memory.ts",
+      "note": "Confirmed absent in desktop memory.ts. Officially, context.engine is a single plugin selector defaulting to 'compressor' (built-in lossy summarization), with alternatives like 'lcm' (lossless) that are never auto-activated. The user's 'context engine (how many? 3)' does not map to any desktop count; '3' is unverified and likely an install-state artifact or conflation with official config."
+    },
+    {
+      "claim": "Auto-compression defaults: threshold 0.50, target_ratio 0.20, protect_last_n 20, protect_first_n 3, enabled true.",
+      "status": "verified",
+      "source": "https://hermes-agent.nousresearch.com/docs/developer-guide/context-compression-and-caching/",
+      "note": "All confirmed verbatim in official docs: enabled: true, threshold: 0.50 (fires at 50% of context window), target_ratio: 0.20, protect_last_n: 20, protect_first_n: 3 (hardcoded). Context engine default = 'compressor'. Caveat: these are official-agent config.yaml defaults, NOT a desktop GUI panel — the unofficial desktop exposes no compression settings UI. The numbers the user cited are correct; the surface (GUI vs config) is the only nuance."
+    },
+    {
+      "claim": "The desktop accent/theme names are Mono, Midnight, Rose, Amber, Cyberpunk, Slate.",
+      "status": "contradicted",
+      "source": "https://raw.githubusercontent.com/fathah/hermes-desktop/main/src/renderer/src/constants.ts",
+      "note": "CONTRADICTED. The actual THEMES array in constants.ts is 12 syntax-style themes: Dark, Light, Dracula, Nord, One Dark, GitHub Dark, Monokai, Solarized Dark, Gruvbox Dark, Tokyo Night, GitHub Light, Solarized Light. None of Mono/Midnight/Rose/Amber/Cyberpunk/Slate/Ember appear. The names Mono/Slate/Cyberpunk belong to the OFFICIAL CLI SKIN namespace (see next claim); Midnight/Rose/Amber appear in NEITHER. INV1 correct (MISMATCH). INV3 is WRONG: it claimed desktop accents 'Midnight/Ember/Mono/Cyberpunk/Rose CONFIRMED' — that is not in the current source."
+    },
+    {
+      "claim": "Official Hermes CLI built-in skins are: default, ares, mono, slate, daylight, warm-lightmode, poseidon, sisyphus, charizard.",
+      "status": "verified",
+      "source": "https://hermes-agent.nousresearch.com/docs/user-guide/features/skins",
+      "note": "Confirmed verbatim list of 9 built-in skins. mono and slate ARE built-in skins. cyberpunk is NOT a built-in (it appears only as a custom-skin example elsewhere) — so INV2/INV3 listing cyberpunk among built-ins is slightly off. midnight/rose/amber/ember are NOT built-in skins either. These are CLI terminal skins, a different namespace from the desktop GUI's 12 syntax themes."
+    },
+    {
+      "claim": "The Hermes desktop UI supports Japanese (日本語) as a real locale.",
+      "status": "verified",
+      "source": "https://github.com/fathah/hermes-desktop",
+      "note": "Confirmed: README language line 'English · 简体中文 · 日本語 · Español (LATAM)'; full ja/ locale directory exists; Japanese localization landed in desktop v0.5.2; v0.5.6 added an IME/CJK Enter-key fix specifically for Japanese/Chinese input. Genuinely supported, not just docs."
+    },
+    {
+      "claim": "In the official Hermes Agent, 'ja' (Japanese) is a distinct display.language entry, separate from 'zh-hant' (Traditional Chinese).",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/website/docs/user-guide/configuration.md",
+      "note": "Confirmed: display.language default 'en'; supported list includes both 'ja' (Japanese) AND 'zh-hant' (Traditional Chinese) as separate entries (full list: en, zh, zh-hant, ja, de, es, fr, tr, uk, af, ko, it, ga, pt, ru, hu). This refutes INV3's flagged user-confusion 'zh-Hant = Japanese' — they are different rows, both present. (Caveat: display.language translates UI chrome only, not the agent's reply language.)"
+    },
+    {
+      "claim": "Memory/profile budgets are implemented as character limits: memory_char_limit 2200 (~800 tokens), user_char_limit 1375 (~500 tokens).",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/website/docs/user-guide/configuration.md",
+      "note": "Confirmed verbatim: memory_char_limit: 2200 (~800 tokens), user_char_limit: 1375 (~500 tokens). The desktop memory.ts shows '{{count}} chars' capacity displays, consistent with character-based (not token-slider) budgets. INV1 and INV3 correct."
+    },
+    {
+      "claim": "The desktop sidebar labels the tools screen 'Capabilities', soul as 'Persona', and agents as 'Profiles'; there is NO 'Artifacts' or 'Projects' sidebar item.",
+      "status": "verified",
+      "source": "https://raw.githubusercontent.com/fathah/hermes-desktop/main/src/shared/i18n/locales/en/navigation.ts",
+      "note": "Confirmed verbatim: tools->'Capabilities', soul->'Persona', agents->'Profiles'. Full nav: Chat, Sessions, Discover, Profiles, Office, Models, Providers, Skills, Persona, Memory, Capabilities, Schedules, Kanban, Gateway, Settings. No 'Artifacts' and no 'Projects' label. Confirms INV1's MISMATCH calls. (Note: official desktop docs do describe an 'Artifacts'/preview-rail concept, and media renders inline in chat, but there is no standalone Artifacts sidebar screen in this app's source.)"
+    },
+    {
+      "claim": "Per-model API key behavior, OAuth providers, and per-model reasoning-effort picker are real (release-confirmed).",
+      "status": "verified",
+      "source": "https://github.com/fathah/hermes-desktop/releases",
+      "note": "Confirmed across releases: v0.5.2 per-model api_key auto-populated; v0.5.0 in-app OAuth sign-in for ChatGPT/xAI Grok/Qwen/Gemini CLI/MiniMax; v0.5.8 reasoning effort picker + Ollama Cloud; v0.5.9 Atlas Cloud + AIML API providers, Rename Sessions. Consistent with INV1/INV2/INV3."
+    },
+    {
+      "claim": "The desktop has 16 messaging gateways including Home Assistant (as a gateway), and Gateway is the messaging control surface (not a 'Messaging' view).",
+      "status": "verified",
+      "source": "https://github.com/fathah/hermes-desktop",
+      "note": "Confirmed verbatim: '16 messaging gateways — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Mattermost, Email (IMAP/SMTP), SMS (Twilio/Vonage), iMessage (BlueBubbles), DingTalk, Feishu/Lark, WeCom, WeChat (iLink Bot), Webhooks, Home Assistant'. Sidebar item is 'Gateway'. Home Assistant appears here as a delivery gateway, separate from its official toolset role."
+    },
+    {
+      "claim": "Image sending (attach/drag-drop/paste, auto-compress) is real in the desktop chat.",
+      "status": "verified",
+      "source": "https://github.com/fathah/hermes-desktop/releases",
+      "note": "Confirmed: v0.4.5 'Chat attachments — image and text-file attachments via click, drag-and-drop, and paste'; v0.5.0 right-click copy/paste + render agent-generated media in chat; v0.5.0 per-conversation context folder. Inbound image analysis handled by the vision toolset. INV1/INV3 correct."
+    },
+    {
+      "claim": "Voice in the desktop is speech-to-text input in Chat (v0.5.5) plus a TTS toolset — there is NO dedicated 'Voice' settings tab with a TTS-model picker.",
+      "status": "verified",
+      "source": "https://github.com/fathah/hermes-desktop/releases",
+      "note": "Confirmed: v0.5.5 'Prompt Efficiency and Speech to Text in Chat' (voice input/transcription in chat). Text-to-Speech is toolset #11 in tools.ts, not a settings panel. No 'Voice' top-level Settings section and no TTS-model picker in the desktop source — settings.ts sections are Hermes Agent / Appearance / Privacy / Credential Pool. The user's 'Voice -> TTS model picker' tree is unverified for this app."
+    }
+  ],
+  "summary": "Verified ~20 load-bearing claims against primary sources (fathah/hermes-desktop source files + GitHub README/releases, and official Hermes Agent docs). Two products are in play and must be kept separate: the UNOFFICIAL desktop GUI (fathah/hermes-desktop, what the user is looking at) and the OFFICIAL Hermes Agent (NousResearch). Most claims hold; the biggest correction is the accent-color claim.\\n\\nKEY VERDICTS:\\n- Toolset list: desktop source tools.ts has 19 toolsets (verified), not the README's '14'. X Search is present in the desktop; Spotify, Home Assistant, and Video Analysis are NOT desktop toolsets but ARE official-agent toolsets (verified in tools-reference.md, ~71 tools, spotify_*/ha_*/x_search/video_analyze all real). Home Assistant appears in the desktop only as 1 of 16 messaging gateways.\\n- 'Drive Claude Code/Codex CLI' skills: VERIFIED verbatim (claude-code, codex, opencode are 'Delegate coding to ...'). There is NO 'hermes-cli' delegation skill — the 4th sibling is 'hermes-agent' (self-config). 'Claude Design' is a real skill but is an HTML-artifact design skill, NOT an Anthropic product.\\n- Per-model API keys: VERIFIED REAL (models.ts: each model has its own 'API Key' field).\\n- Memory providers: NOT 3. Desktop source = 8 (verified in memory.ts); official agent = 9 (verified, adds Memori). The user's '3' is unverified/wrong on both surfaces.\\n- Context engine: NO selector in the desktop UI (verified absent). Officially it's a plugin defaulting to 'compressor'. The '3 context engines' count is unverified.\\n- Compression: threshold 0.50 / target_ratio 0.20 / protect_last_n 20 / protect_first_n 3 / enabled true — ALL VERIFIED, but they are official config.yaml defaults, not a desktop GUI panel.\\n- Accent colors: CONTRADICTED. The desktop's actual themes (constants.ts) are 12 syntax-style themes (Dark/Light/Dracula/Nord/One Dark/GitHub Dark/Monokai/Solarized Dark/Gruvbox Dark/Tokyo Night/GitHub Light/Solarized Light). Mono/Midnight/Rose/Amber/Cyberpunk/Slate are NOT in the desktop source. Mono/Slate are official CLI SKINS; Midnight/Rose/Amber/Ember appear in NEITHER namespace. INV3 was wrong here (it claimed Midnight/Ember/Mono/Cyberpunk/Rose were CONFIRMED desktop accents — they are not). Also note: 'cyberpunk' is NOT an official built-in skin (only a custom-skin example), so INV2/INV3 listing it among built-ins is slightly off.\\n- Japanese UI: VERIFIED. Desktop supports 日本語 (full ja/ locale, v0.5.2, plus a v0.5.6 CJK IME fix). Officially 'ja' is a distinct display.language entry, separate from 'zh-hant' (Traditional Chinese) — refuting the 'zh-Hant = Japanese' confusion INV3 flagged. Caveat: language setting changes UI chrome, not the agent's reply language.\\n- Sidebar labels VERIFIED (Capabilities/Persona/Profiles); no Artifacts or Projects sidebar screen. Image attach/drag-drop/paste VERIFIED. Voice = STT-in-chat + TTS toolset, no dedicated Voice settings tab.\\n\\nBOTTOM LINE: The user is looking at the unofficial fathah/hermes-desktop. The single hard contradiction is the accent-color names (those belong to the official CLI skin set or to nowhere). The '3 memory providers' / '3 context engines' counts are wrong/unverified. Everything else — per-model keys, the CLI-delegation skills, Claude Design, Japanese support, compression numbers, the big toolset list (with the desktop-vs-official subset caveat) — checks out against primary sources."
+}
