@@ -200,15 +200,42 @@ describe("stopSession", () => {
     expect(mockStopSession).toHaveBeenCalledTimes(1);
   });
 
-  it("is a no-op in loading state (stop would race the connecting backend)", async () => {
-    // Drive the store to 'loading' via a backend event (inFlight=false here,
-    // which is the case where the IPC response arrives before the first event).
+  it("calls ipcStopSession in loading state (koe-5fs: escape hatch for a hung 準備中)", async () => {
+    // Drive the store to 'loading' via a backend event (the case where the IPC
+    // response arrives before the first event). The old guard made stop a no-op
+    // here; koe-5fs makes "loading" stoppable — run_session_supervised races
+    // connect() against the master stop (session_manager.rs ~1095), so a stop
+    // mid-connect cleanly abandons the attempt instead of orphaning it, giving
+    // the user an escape from a hung connect (symptom 4).
     act(() => {
       useSessionStore.getState().setFromEvent(statusEvent("connecting", 1));
     });
     expect(useSessionStore.getState().status).toBe("loading");
+    mockStopSession.mockResolvedValueOnce(undefined);
     await useSessionStore.getState().stopSession();
-    expect(mockStopSession).not.toHaveBeenCalled();
+    expect(mockStopSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("double-stop guard still holds in loading (concurrent stop is a no-op)", async () => {
+    // The stopInFlight guard is state-agnostic, so making loading stoppable must
+    // not open a double-stop window: a second concurrent stop still bails.
+    act(() => {
+      useSessionStore.getState().setFromEvent(statusEvent("connecting", 1));
+    });
+    let release: (() => void) | undefined;
+    mockStopSession.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const first = useSessionStore.getState().stopSession();
+    // Second call while the first is still in flight: must not invoke ipc again.
+    await useSessionStore.getState().stopSession();
+    expect(mockStopSession).toHaveBeenCalledTimes(1);
+    release?.();
+    await first;
+    expect(mockStopSession).toHaveBeenCalledTimes(1);
   });
 
   it("is a no-op in error state (backend session already cleared)", async () => {
