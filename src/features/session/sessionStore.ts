@@ -174,9 +174,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // That path clears the status guards below (not "idle", not "loading",
     // listenerFailed=true), so only the stop-specific double-stop guard applies.
     if (stopInFlight) return;
-    // loading: the IPC call or first event has not settled yet; a stop here
-    // races the backend and would leave the UI stuck (no state change on
-    // success). To cancel a connecting session, use an explicit abort path.
+    // STOPPABLE during "loading" (koe-5fs): the previous guard also bailed on
+    // "loading" to avoid racing a connecting backend, but that left a hung
+    // "準備中…" with no escape (symptom 4). Stopping is safe now —
+    // run_session_supervised races connect() against the master stop via
+    // tokio::select! (session_manager.rs ~1095): a stop mid-connect abandons the
+    // attempt and finalizes idle (emitting a "session-status" idle that drives
+    // this store back to idle), so there is no orphaned connecting session.
+    // ipcStopSession is idempotent and generation-guarded on the Rust side.
+    //
+    // idle: nothing to stop — bail.
     // error (non-listener): the backend read loop has already exited and cleared
     // the session slot; stop_session would hit an already-idle slot and, if it
     // rejects for any other reason, would clobber the sticky error message with a
@@ -185,7 +192,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // session may still be running (listener failed during or after start).  We
     // MUST allow stopSession here (idempotent on the Rust side) so the user can
     // prevent an orphaned, unbounded backend session (cost-protection P1).
-    if (status === "idle" || status === "loading") return;
+    if (status === "idle") return;
     if (status === "error" && !listenerFailed) return;
     stopInFlight = true;
     try {
