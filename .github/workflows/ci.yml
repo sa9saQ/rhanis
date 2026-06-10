@@ -138,9 +138,96 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # windows-latest ships Edge + a matching msedgedriver on PATH; tauri-driver
-      # forwards WebDriver to it. If WebView2 / msedgedriver versions drift the
-      # run fails loudly (documented Tauri gotcha) — add a pinned
-      # setup-msedgedriver step here if that happens.
+      # windows-latest ships Edge + an msedgedriver on PATH, but that driver
+      # tracks the Edge *browser* while tauri-driver actually drives the app's
+      # *WebView2 Runtime*. The two drift (e.g. Edge 149 vs WebView2 148) and the
+      # mismatched driver then refuses the session ("session not created"): an
+      # identical E2E spec passes on one runner image and fails on the next
+      # (koe-m3o). Pin the driver to the WebView2 Runtime that is actually
+      # installed: read its version, download the major-matching Edge WebDriver,
+      # and prepend it to PATH so tauri-driver picks it over the drifted system
+      # one. (tauri-driver searches PATH for msedgedriver by default — v2 Tauri
+      # WebDriver docs.)
+      - name: Pin Edge WebDriver to the installed WebView2 Runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1) Resolve the installed WebView2 Runtime version. The Evergreen
+          #    Runtime always lays its build down as a version-named folder, so
+          #    that is the source of truth; the EdgeUpdate registry key is only a
+          #    fallback. (Deliberately NOT the Edge browser version — that is the
+          #    value that drifts.)
+          $appBase = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft\EdgeWebView\Application'
+          $version = $null
+          if (Test-Path $appBase) {
+            $dir = Get-ChildItem -Path $appBase -Directory |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+              Sort-Object { [version]$_.Name } -Descending |
+              Select-Object -First 1
+            if ($dir) { $version = $dir.Name }
+          }
+          if (-not $version) {
+            $clientKey = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+            foreach ($p in @(
+              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$clientKey",
+              "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$clientKey")) {
+              if (Test-Path $p) {
+                $pv = (Get-ItemProperty -Path $p -Name pv -ErrorAction SilentlyContinue).pv
+                if ($pv) { $version = $pv; break }
+              }
+            }
+          }
+          if (-not $version) { throw 'Could not determine the installed WebView2 Runtime version' }
+          $major = $version.Split('.')[0]
+          Write-Host "WebView2 Runtime version: $version (major $major)"
+
+          # 2) Download a matching msedgedriver. Try the exact build first, then
+          #    fall back to the latest driver for the same major — WebDriver only
+          #    requires the MAJOR to match the engine. The fallback is best-effort
+          #    (its lookup is wrapped so a miss never breaks the exact path).
+          function Get-LatestForMajor($m) {
+            try {
+              $raw = (Invoke-WebRequest -Uri "https://msedgedriver.microsoft.com/LATEST_RELEASE_$m" -UseBasicParsing).Content
+              $s = if ($raw -is [byte[]]) { [System.Text.Encoding]::Unicode.GetString($raw) } else { [string]$raw }
+              return ($s -replace '[^0-9.]', '')
+            } catch { return $null }
+          }
+          $dest = Join-Path $env:RUNNER_TEMP 'edgedriver'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $candidates = @($version)
+          $latestMajor = Get-LatestForMajor $major
+          if ($latestMajor -and $latestMajor -ne $version) { $candidates += $latestMajor }
+          $zip = Join-Path $dest 'edgedriver.zip'
+          $got = $null
+          foreach ($v in $candidates) {
+            $url = "https://msedgedriver.microsoft.com/$v/edgedriver_win64.zip"
+            try {
+              Write-Host "Downloading $url"
+              Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+              $got = $v; break
+            } catch { Write-Host "  not available: $($_.Exception.Message)" }
+          }
+          if (-not $got) { throw "No msedgedriver available for WebView2 $version (major $major)" }
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+
+          # 3) Verify the driver major matches WebView2, then prepend to PATH so
+          #    tauri-driver's PATH lookup finds it ahead of the system driver.
+          $driverExe = Join-Path $dest 'msedgedriver.exe'
+          if (-not (Test-Path $driverExe)) { throw "msedgedriver.exe not found after extracting $zip" }
+          # Out-String collapses the (possibly multi-line) output to ONE scalar
+          # string. -match only populates $matches when its left side is a scalar;
+          # on an array it would silently leave $matches stale and fail the check.
+          $driverVer = (& $driverExe --version | Out-String).Trim()
+          Write-Host "Pinned msedgedriver: $driverVer"
+          if ($driverVer -match '(\d+)\.\d+\.\d+\.\d+') {
+            if ($matches[1] -ne $major) {
+              throw "msedgedriver major $($matches[1]) does not match WebView2 major $major ($driverVer)"
+            }
+          } else {
+            throw "Could not parse msedgedriver version from: $driverVer"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $dest
+
       - name: E2E smoke (tauri-driver + WebdriverIO)
         run: pnpm e2e:smoke
