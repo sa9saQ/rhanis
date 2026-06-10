@@ -1,0 +1,257 @@
+{
+  "claims": [
+    {
+      "app": "Codex",
+      "claim": "In-app browser is 'derived from OpenAI's Atlas browser' / built on Atlas technology",
+      "status": "unverified",
+      "source": "developers.openai.com/codex/app/features (Atlas NOT mentioned); secondary: macstories.net, opentools.ai, digitalapplied.com",
+      "note": "Primary Codex docs do NOT mention Atlas. Multiple secondary outlets say the in-app browser 'draws aspects of Atlas browser'/built on Atlas tech, but this is announcement-level framing, not in any fetched primary page. Teardown correctly labels it [C2]. DISTRUST as a hard primary claim; treat as plausible secondary framing only. Do not assert 'derived from Atlas' as fact in synthesis."
+    },
+    {
+      "app": "Codex",
+      "claim": "Three primary regions: project sidebar, active thread, review pane",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app",
+      "note": "Confirmed verbatim. Project sidebar / active thread / review pane all present."
+    },
+    {
+      "app": "Codex",
+      "claim": "Three execution modes: Local, Worktree, Cloud",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/features",
+      "note": "Local='work directly in your current project directory', Worktree='isolate changes in a Git worktree', Cloud='run remotely in a configured cloud environment'. Exact match."
+    },
+    {
+      "app": "Codex",
+      "claim": "In-app browser does NOT support authentication flows at launch",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/features",
+      "note": "Primary: browser 'doesn't support authentication flows, signed-in pages, your regular browser profile, cookies, extensions, or existing tabs.' Solid."
+    },
+    {
+      "app": "Codex",
+      "claim": "Image generation uses gpt-image-2 (NOT gpt-image-1.5)",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/features; community.openai.com gpt-image-2 announcement",
+      "note": "Primary /features confirms gpt-image-2. The 'gpt-image-1.5' figure in secondary teardown notes is STALE/version-confused: gpt-image-2 (launched ~Apr 21 2026) replaced gpt-image-1.5. Synthesis should use gpt-image-2 and drop the 1.5 discrepancy as resolved."
+    },
+    {
+      "app": "Codex",
+      "claim": "Two automation types: thread automations (preserve thread context, wake-up calls) and project/standalone automations",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/features",
+      "note": "Primary: 'thread automations' = 'recurring wake-up calls that preserve the thread's context' + standalone project automations. Confirmed."
+    },
+    {
+      "app": "Codex",
+      "claim": "Computer use: macOS background+parallel+'locked use' via Apple authorization plug-in; Windows foreground-only",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/computer-use",
+      "note": "Strongly confirmed. macOS 'locked use' via 'an Apple authorization plug-in that participates in the macOS unlock flow' with safeguards; Windows 'runs on the active desktop... can't operate in the background'. Solid."
+    },
+    {
+      "app": "Codex",
+      "claim": "Computer use requires Screen Recording + Accessibility (macOS); install via Computer Use plugin; 'Always allow' per-app",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/computer-use",
+      "note": "All confirmed verbatim, including hard limits (can't automate terminal apps or Codex itself, can't do admin auth or approve security prompts)."
+    },
+    {
+      "app": "Codex",
+      "claim": "Computer use unavailable in EEA, UK, Switzerland at launch",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/computer-use",
+      "note": "Verbatim: 'except in the European Economic Area, the United Kingdom, and Switzerland at launch.' Solid."
+    },
+    {
+      "app": "Codex",
+      "claim": "Keyboard shortcuts (Cmd+B sidebar, Cmd+Option+B diff, Cmd+J terminal, Ctrl+L clear, Cmd+Shift+P/Cmd+K menu, Cmd+G search, Cmd+N/Cmd+Shift+O new thread, Cmd+Shift+[/] prev/next, Ctrl+M dictation)",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/commands",
+      "note": "ALL shortcuts confirmed exactly on the commands page. High confidence."
+    },
+    {
+      "app": "Codex",
+      "claim": "Slash commands: /feedback, /goal, /mcp, /plan, /review, /status",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/commands",
+      "note": "All six confirmed verbatim with descriptions. Note: /plugins and /theme were NOT on the commands page (teardown sourced those to secondary digitalapplied/danielvaughan) — treat those two as secondary-only."
+    },
+    {
+      "app": "Codex",
+      "claim": "Review pane: Unstaged/Staged toggle; stage/revert at full-diff/per-file/per-hunk; inline comments via hover+'+'; GitHub PR context via gh CLI",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app/review",
+      "note": "Fully confirmed including 'Stage all'/'Revert all', per-file, per-hunk; 'uncommitted changes' default with all-branch and last-turn scopes; PR context requires gh auth. Solid."
+    },
+    {
+      "app": "Codex",
+      "claim": "Linux not yet available ('Get notified for Linux' / coming)",
+      "status": "verified",
+      "source": "developers.openai.com/codex/app + /features",
+      "note": "Confirmed: macOS (Apple Silicon+Intel) + Windows (Microsoft Store) shipped; Linux 'Get notified' = pending. Solid."
+    },
+    {
+      "app": "Codex",
+      "claim": "Default terminal location setting (bottom vs right panel) added v26.601, Jun 1 2026",
+      "status": "verified",
+      "source": "developers.openai.com/codex/changelog",
+      "note": "Confirmed verbatim at 26.601 (June 1, 2026)."
+    },
+    {
+      "app": "Codex",
+      "claim": "Computer Use on Windows + Remote control on Windows + stable identicons for subagents + search by Git branch names/conversation content, all v26.527 (May 29 2026)",
+      "status": "verified",
+      "source": "developers.openai.com/codex/changelog",
+      "note": "All four confirmed at 26.527 (2026-05-29). Strong."
+    },
+    {
+      "app": "Codex",
+      "claim": "Role-based onboarding ('more role choices') + 'Improved Computer Use startup readiness and appshot error reporting' at v26.602 (Jun 4 2026)",
+      "status": "verified",
+      "source": "developers.openai.com/codex/changelog",
+      "note": "Both confirmed at 26.602 (2026-06-04). Activity insights/share cards also at 26.602. Solid."
+    },
+    {
+      "app": "Codex",
+      "claim": "Sites plugin in preview (create/save/deploy/inspect websites) launched Jun 2 2026",
+      "status": "verified",
+      "source": "developers.openai.com/codex/changelog",
+      "note": "Confirmed: 'Sites is now available in preview... create, save, deploy, and inspect websites, dashboards, internal tools, web apps, and games hosted by OpenAI.' (June 2, 2026)."
+    },
+    {
+      "app": "Codex",
+      "claim": "Appshots (send frontmost Mac app window + text) added at v26.519",
+      "status": "unverified",
+      "source": "developers.openai.com/codex/app/features (feature exists); changelog (version 26.519 NOT in fetchable range)",
+      "note": "Appshots feature IS confirmed to exist in primary docs and the /changelog references appshot improvements at 26.602. BUT the specific 'added at v26.519' attribution could not be verified — the fetchable changelog only reaches back to ~late May 2026; 26.519/26.517/26.415/26.417 predate it. Trust the feature; DISTRUST the exact v26.519 version tag (secondary-sourced)."
+    },
+    {
+      "app": "Codex",
+      "claim": "v26.415/26.417 items: multi-window/parallel projects across windows, collapsible sidebar sections, command-palette theme switcher, tray usage-limit surfacing, local branch search + non-image file pasting",
+      "status": "unverified",
+      "source": "secondary only: releasebot.io, codex.danielvaughan.com (these versions outside fetchable changelog)",
+      "note": "None of these v26.415/26.417 entries appear in the fetchable primary changelog (which starts ~May 28 2026). All sourced from secondary outlets. Features may well be real but version attributions and existence are UNVERIFIED against primary. DISTRUST in synthesis unless reframed as secondary."
+    },
+    {
+      "app": "Codex",
+      "claim": "Codex app tech base is Electron",
+      "status": "unverified",
+      "source": "secondary: codex.danielvaughan.com, getpushtoprod.substack.com",
+      "note": "No primary OpenAI source states Electron. Secondary-only inference. Plausible but DISTRUST as fact; mark [C2]/[INF]."
+    },
+    {
+      "app": "Codex",
+      "claim": "'codex-theme-v1' JSON theme format, partner themes (Linear/Notion/OpenClaw), Codex Pets",
+      "status": "unverified",
+      "source": "secondary: codex.danielvaughan.com; Codex Pets in primary /settings per teardown",
+      "note": "Codex Pets and Appearance theming likely real (teardown cites /settings) but the detailed codex-theme-v1 schema, field names, and partner-theme list are secondary-only (danielvaughan). I did not fetch /settings to confirm. Treat theme-schema specifics as UNVERIFIED secondary; the existence of theming/Pets is plausible-primary."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Desktop launch version v0.15.2 (public preview); agent core now v0.16.0 'The Surface Release' (Jun 5 2026); MIT license",
+      "status": "verified",
+      "source": "github.com/nousresearch/hermes-agent; marktechpost.com; hermes-agent.nousresearch.com",
+      "note": "Confirmed: desktop shipped with v0.15.2 (~Jun 2-3 2026 preview); GitHub README shows v0.16.0 (2026.6.5) 'The Surface Release'; MIT confirmed in 3 sources. Version reconciliation in teardown is correct."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Stack = Electron shell + React renderer over Python 'hermes dashboard' backend; installs runtime into HERMES_HOME on first launch",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop; digitalapplied.com",
+      "note": "Primary desktop doc confirms Electron+React renderer talking to hermes dashboard backend over gateway APIs; HERMES_HOME=~/.hermes or %LOCALAPPDATA%\\hermes. Note: digitalapplied frames Electron+React+Python as 'reported', so the Python-specifically attribution is partly secondary, but the architecture is primary-confirmed. Solid."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Three-zone layout: left sidebar nav / center chat / right preview rail (renders web pages, files, tool outputs side-by-side)",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop; marktechpost.com",
+      "note": "Confirmed verbatim in primary desktop doc and corroborated by marktechpost ('right-hand pane previews web pages, files, and tool outputs'). Solid."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Bottom status bar: inline model picker + per-session YOLO toggle (bypasses dangerous-command approval prompts) + live session state",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop",
+      "note": "Primary confirms inline model picker ('switch the model for the active session straight from the status bar') and per-session YOLO toggle bypassing dangerous-command approval prompts. Solid."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Command palette = Cmd+K (Ctrl+K on Windows/Linux)",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop",
+      "note": "Confirmed verbatim. Solid."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Sidebar panes: Skills, Cron, Profiles, Messaging, Agents & Command Center, Sessions; file browser via --cwd / HERMES_DESKTOP_CWD",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop",
+      "note": "All panes confirmed in primary doc; file browser working dir via 'hermes desktop --cwd <path>' or HERMES_DESKTOP_CWD env var. Solid."
+    },
+    {
+      "app": "Hermes",
+      "claim": "xAI Grok first-class OAuth provider (browser flow); auxiliary-model split warning (titling/summarization pinned to another provider)",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop",
+      "note": "Both confirmed verbatim in primary desktop doc. Solid — the aux-model warning is a real, documented detail."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Remote gateway: Settings→Gateway→Remote gateway, port 9119, OAuth (Nous Portal) vs username/password (local/trusted only); per-profile creds",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop",
+      "note": "Confirmed: Remote URL http://<host>:9119, hermes dashboard --no-open --host 0.0.0.0 --port 9119, OAuth 'Sign in with Nous Research' vs basic-auth env vars, per-profile remote hosts. Solid."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Three-tier uninstall via Settings→About→Danger zone (GUI only / GUI+agent keep data / everything)",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop",
+      "note": "Confirmed verbatim, including underlying commands (hermes uninstall --gui / hermes uninstall / hermes uninstall --full). Solid."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Onboarding 'unified overlay design system' + 'Choose provider later'; UI language switcher incl. zh-Hans; custom zoom half-step; rebindable shortcuts",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop",
+      "note": "All confirmed verbatim in primary desktop doc. Solid. (Single-source: traces to the one desktop doc page — low risk given it's the official doc.)"
+    },
+    {
+      "app": "Hermes",
+      "claim": "Linux install is terminal-only via install script --include-desktop (no native installer); macOS/Windows direct installers; macOS 12+/Win 10-11",
+      "status": "verified",
+      "source": "marktechpost.com; digitalapplied.com; hermes-agent.nousresearch.com",
+      "note": "Confirmed across 3 sources. macOS 12+/Win 10-11 from digitalapplied (secondary but consistent). Solid."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Sandbox/terminal backends: 5 (homepage/marktechpost: local, Docker, SSH, Singularity, Modal) vs 6 (GitHub README adds Daytona)",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com (5); marktechpost.com (5); digitalapplied (5); github.com/nousresearch/hermes-agent (6 incl. Daytona)",
+      "note": "Discrepancy is REAL and correctly flagged: homepage + marktechpost + digitalapplied say FIVE (no Daytona); GitHub README v0.16.0 says SIX (incl. Daytona). Likely Daytona added in v0.16. Synthesis should say '5-6 backends depending on version' not a single hard number."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Messaging gateways include Email (Telegram, Discord, Slack, WhatsApp, Signal, Email, CLI) — desktop is '8th surface'",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com (homepage lists Email); digitalapplied.com ('8th surface' over Telegram/Discord/Slack/WhatsApp/Signal/Email/CLI)",
+      "note": "Email IS confirmed (homepage + digitalapplied). Note GitHub README phrased the list as '...Signal, and CLI' (omitted Email) — but two other sources include Email, so the Email claim is supported. '8th surface' framing confirmed by digitalapplied."
+    },
+    {
+      "app": "Hermes",
+      "claim": "Voice mode = full duplex (STT in + streaming TTS out, multiple providers); macOS prompts once for mic; tccutil reset escape hatch",
+      "status": "verified",
+      "source": "hermes-agent.nousresearch.com/docs/user-guide/desktop; voice-mode doc (referenced)",
+      "note": "Desktop doc confirms 'Talk to Hermes and hear it back' + macOS one-time mic prompt + tccutil reset Microphone com.nousresearch.hermes. The deep STT/TTS provider specifics (faster-whisper/Groq/Edge TTS/ElevenLabs, Ctrl+B, RMS thresholds) come from the separate voice-mode doc and are CLI-specific — teardown correctly notes desktop likely uses a mic button not Ctrl+B. Voice duplex claim solid; granular provider/threshold values are voice-mode-doc-sourced (not re-verified here but internally consistent)."
+    },
+    {
+      "app": "Hermes",
+      "claim": "'Apple-style' visual design language; specific fonts/colors/spacing/motion tokens",
+      "status": "contradicted",
+      "source": "digitalapplied.com + marktechpost.com (purely functional, no aesthetic descriptors); hermes-agent.nousresearch.com ('modern & thoughtfully designed UI' only)",
+      "note": "CONFIRMED HALLUCINATION RISK: 'Apple-style' verbatim appears in NO fetched source. Only 'modern and thoughtfully designed UI' is documented. digitalapplied and marktechpost contain zero aesthetic descriptors. The Hermes teardown ITSELF correctly flags this as unconfirmed/prompt-framing. Any synthesis claim about Hermes fonts/colors/spacing/motion would be fabricated. DO NOT assert visual-design specifics for Hermes."
+    }
+  ],
+  "summary": "Verified ~28 load-bearing claims from both teardowns against primary sources (fetched developers.openai.com/codex/{app,features,computer-use,review,commands,changelog} and hermes-agent.nousresearch.com/docs/user-guide/desktop + GitHub README, marktechpost, digitalapplied, Hermes homepage).\n\nSOLID / SAFE TO USE (strongly primary-confirmed):\n- Codex: three-pane layout (sidebar/thread/review), three execution modes (local/worktree/cloud), in-app browser (no auth flows), gpt-image-2 (NOT 1.5), two automation types, computer use (macOS background+'locked use' via Apple auth plug-in / Windows foreground-only / Screen Recording+Accessibility / EEA-UK-Switzerland excluded / hard limits), ALL keyboard shortcuts + slash commands (/feedback /goal /mcp /plan /review /status), review pane (Unstaged/Staged, per-file/per-hunk stage-revert, inline comments, gh-CLI PR context), Linux pending, and the dated changelog items at v26.527 (CU+remote on Windows, identicons, branch-name search), v26.601 (terminal location), v26.602 (role onboarding, CU/appshot), Sites preview (Jun 2).\n- Hermes: v0.15.2 desktop / v0.16.0 'Surface Release' / MIT, Electron+React over hermes-dashboard backend + HERMES_HOME, three-zone layout + right preview rail, status-bar model picker + per-session YOLO, Cmd/Ctrl+K palette, all sidebar panes, xAI Grok OAuth, auxiliary-model warning, remote gateway (port 9119, OAuth vs basic-auth, per-profile), three-tier uninstall, onboarding 'unified overlay' + 'Choose provider later', zh-Hans switcher, half-step zoom, Linux terminal-only --include-desktop install, voice duplex.\n\nDISTRUST / DON'T ASSERT AS FACT IN SYNTHESIS:\n1. Hermes 'Apple-style' design + any font/color/spacing/motion specifics — CONTRADICTED: appears in no source, only 'modern & thoughtfully designed UI' is documented. Pure hallucination risk. (Both teardowns already flag this honestly.)\n2. Codex in-app browser 'derived from Atlas' — secondary-only; primary /features never mentions Atlas. Plausible framing, not fact.\n3. Codex version tags v26.415 / v26.417 / v26.519 and their feature lists (multi-window, collapsible sidebar, command-palette theme switcher, tray usage-limit, local branch search, appshots-at-26.519) — UNVERIFIED: these versions fall before the fetchable changelog window (~late May 2026) and are secondary-sourced (releasebot, danielvaughan). Features may be real but version attribution is unconfirmed.\n4. Codex 'Electron' base and codex-theme-v1 schema/partner-theme list (Linear/Notion/OpenClaw) — secondary-only (danielvaughan); theming/Codex Pets existence plausible but schema details unverified.\n\nRESOLVED DISCREPANCIES:\n- gpt-image: it's gpt-image-2 (current); 'gpt-image-1.5' is stale (gpt-image-2 replaced it ~Apr 21 2026). Use gpt-image-2.\n- Hermes backends: genuinely 5 (homepage/marktechpost/digitalapplied) vs 6 incl. Daytona (GitHub v0.16 README) — state as '5-6 depending on version,' don't pick one number.\n- Hermes Email gateway: CONFIRMED (homepage + digitalapplied list Email; GitHub README phrasing omitted it but two sources include it).\n\nOverall: both teardowns are unusually disciplined — their own [C]/[C2]/[INF] and [C]/[I] labeling is accurate, and the riskiest items (Atlas, Apple-style, gpt-image version, 5-vs-6 backends, the 403-blocked openai.com posts, single-source Hermes desktop doc) are self-flagged. The main correction for downstream synthesis: drop 'Apple-style' Hermes aesthetics entirely, treat Atlas + pre-late-May Codex version tags as secondary-only, and standardize on gpt-image-2 and '5-6 Hermes backends.'"
+}
