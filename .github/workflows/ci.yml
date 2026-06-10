@@ -220,9 +220,16 @@ jobs:
           # on an array it would silently leave $matches stale and fail the check.
           $driverVer = (& $driverExe --version | Out-String).Trim()
           Write-Host "Pinned msedgedriver: $driverVer"
-          if ($driverVer -match '(\d+)\.\d+\.\d+\.\d+') {
-            if ($matches[1] -ne $major) {
-              throw "msedgedriver major $($matches[1]) does not match WebView2 major $major ($driverVer)"
+          # Edge WebDriver requires the FIRST THREE version parts
+          # (major.minor.build) to match the engine — a same-major but
+          # different-build driver still fails "session not created" (MS Edge
+          # WebDriver docs). The exact download already matches all four parts;
+          # this guards the latest-of-major fallback so an incompatible build is
+          # rejected loudly (fail-closed) instead of being pinned silently.
+          $wantPrefix = ($version -split '\.')[0..2] -join '.'
+          if ($driverVer -match '(\d+\.\d+\.\d+)\.\d+') {
+            if ($matches[1] -ne $wantPrefix) {
+              throw "msedgedriver build $($matches[1]) does not match WebView2 build $wantPrefix ($driverVer)"
             }
           } else {
             throw "Could not parse msedgedriver version from: $driverVer"
