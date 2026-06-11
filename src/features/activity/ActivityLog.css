@@ -64,90 +64,15 @@
   margin-left: auto;
   font-size: 12px;
   font-weight: 600;
-  color: #1a1d24;
+  color: var(--on-warn);
   background: var(--tone-connecting);
   padding: 3px 10px;
   border-radius: 999px;
 }
 
-/* --- COST (koe-9xi): live monthly spend + over-budget stop/raise control. --- */
-.koe-cost {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.koe-cost-line,
-.koe-cost-unknown {
-  font-size: 13px;
-  color: var(--muted); /* #aeb6c2 on --panel ≈ 7:1, well past AA */
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.01em;
-}
-/* Fail-closed: an explicit "unknown" is tinted amber so it never reads as a calm $0. */
-.koe-cost-unknown {
-  color: var(--tone-connecting);
-}
-.koe-cost-overbudget {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px 14px;
-  border: 1px solid color-mix(in srgb, var(--tone-error) 45%, var(--border));
-  border-left: 3px solid var(--tone-error);
-  border-radius: 9px;
-  background: color-mix(in srgb, var(--tone-error) 10%, transparent);
-}
-.koe-cost-stop {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--tone-error);
-}
-.koe-cost-raise {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-  font-size: 12px;
-  color: var(--muted);
-}
-/* Self-contained input/button styles (no dependency on settings.css load order). */
-.koe-cost-input {
-  font-size: 16px; /* >=16px avoids mobile auto-zoom (quality.md) */
-  padding: 7px 10px;
-  width: 8.5rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--panel-2);
-  color: var(--text);
-}
-.koe-cost-input:focus {
-  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
-  outline-offset: 1px;
-}
-.koe-cost-raise-btn {
-  font-size: 14px;
-  font-weight: 600;
-  padding: 8px 14px;
-  border: 0;
-  border-radius: 8px;
-  cursor: pointer;
-  color: #04130f; /* dark on teal --accent → high contrast */
-  background: var(--accent);
-  transition: opacity var(--dur-hover) var(--ease-standard);
-}
-.koe-cost-raise-btn:hover:not(:disabled) {
-  opacity: 0.9;
-}
-.koe-cost-raise-btn:disabled {
-  opacity: 0.55;
-  cursor: default;
-}
-.koe-cost-error {
-  margin: 0;
-  font-size: 12px;
-  color: var(--tone-error);
-}
+/* The COST styles (koe-9xi) moved to CostHeader.css — the component renders in
+   the console sidebar (koe-ios.1), so its styles ship with it instead of
+   depending on this file being loaded (the koe-iyr class of bug). */
 
 .koe-error-line {
   margin: 0;
@@ -276,7 +201,11 @@
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
-  max-height: 46vh;
+  /* The console is the hero panel of the koe-ios.1 layout and grows to fill
+   * the main column, so the log fills the panel instead of capping at a
+   * viewport fraction (the old single-column 46vh cap). */
+  flex: 1;
+  min-height: 0;
 }
 .koe-log-empty {
   color: var(--muted);

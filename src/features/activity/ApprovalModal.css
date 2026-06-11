@@ -39,12 +39,13 @@
   letter-spacing: 0.1em;
   padding: 3px 8px;
   border-radius: 5px;
-  color: #14161a;
+  color: var(--on-warn);
   background: var(--tone-connecting);
 }
 .koe-risk-danger .koe-risk-tag {
   background: var(--tone-error);
-  color: #fff;
+  /* --on-danger replaces the old #fff, which was ~2.4:1 on #f0706a (below AA). */
+  color: var(--on-danger);
 }
 .koe-approval-tool {
   font-family: var(--font-mono);
@@ -89,11 +90,11 @@
   color: var(--text);
 }
 .koe-btn-deny:hover:not(:disabled) {
-  background: #2c313c;
+  background: var(--border);
 }
 .koe-btn-approve {
   background: var(--accent);
-  color: #0c1413;
+  color: var(--on-accent);
   border-color: transparent;
 }
 .koe-btn-approve:hover:not(:disabled) {

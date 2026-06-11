@@ -1,29 +1,45 @@
-/* koe — operator console theme.
+/* koe — glass-box console theme (koe-ios.1).
  * Anti-AI-smell: no Inter, no purple→blue gradient, solid accent, varied radii
- * and motion. Dark "control desk" surface for an always-on assistant. */
+ * and motion. Warm "control desk" surfaces (never pure black / pure white).
+ *
+ * OS-following color scheme: the dark palette is the default; the light
+ * palette overrides the same tokens under prefers-color-scheme so every
+ * component that paints with var(--…) follows the OS automatically.
+ *
+ * Ink tokens (--on-accent / --on-warn / --on-danger) are the AA-checked text
+ * colors for SOLID fills of --accent / --tone-connecting / --tone-error.
+ * Components must use these instead of hardcoding near-black ink, because the
+ * light palette darkens those fills and flips the ink to near-white. */
 
 :root {
+  color-scheme: dark;
+
   /* Type — JP-capable neo-grotesque for UI, mono for the log. Deliberately not Inter. */
   --font-ui: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Segoe UI", system-ui, sans-serif;
   --font-mono: "Cascadia Code", "JetBrains Mono", "SFMono-Regular", Consolas, ui-monospace, monospace;
 
-  /* Surfaces — deep charcoal, never pure black. */
-  --bg: #14161a;
-  --panel: #1c1f26;
-  --panel-2: #232733;
-  --border: #2c313c;
-  --text: #e6e8ec;
-  --muted: #aeb6c2;
+  /* Surfaces — warm near-black (brief 2026-06-10), never pure black. */
+  --bg: #171411;
+  --panel: #1f1b17;
+  --panel-2: #28231e;
+  --border: #3a332b;
+  --text: #ebe7e1;
+  --muted: #b5ada1; /* ≈7.7:1 on --panel — past AA with margin */
 
   /* Single solid accent — no gradient. */
   --accent: #3fb6a8;
 
+  /* Ink on solid fills (see header note). #0c1413 on #3fb6a8 ≈ 8:1. */
+  --on-accent: #0c1413;
+  --on-warn: #14161a; /* on #d99a2b ≈ 7.3:1 */
+  --on-danger: #0c1413; /* on #f0706a ≈ 6.5:1 — white ink would fail AA */
+
   /* Status tones (varied hues, not one palette ramp). */
-  --tone-idle: #737b88;
+  --tone-idle: #7d766b;
   --tone-connecting: #d99a2b;
   --tone-conversing: #3fb6a8;
   --tone-working: #4ade80;
-  /* Contrast on --panel-2 (#232733): #f0706a gives ~5.4:1 (was #e5564b ~4.3:1, below AA). */
+  /* As text on --panel-2: #f0706a ≈ 5.4:1 (AA). */
   --tone-error: #f0706a;
 
   /* Motion — distinct easings + durations per role (never a bare `ease`). */
@@ -34,9 +50,9 @@
   --dur-hover: 150ms;
   --dur-enter: 240ms;
 
-  /* Shared "control desk" background wash — used by the app shell AND the
+  /* Shared "control desk" background wash — used by the console shell AND the
      first-run onboarding so both paint the same surface (no duplicated literal). */
-  --desk-wash: radial-gradient(120% 80% at 50% -10%, #1a1d24 0%, var(--bg) 60%);
+  --desk-wash: radial-gradient(120% 80% at 50% -10%, #211d18 0%, var(--bg) 60%);
 
   font-family: var(--font-ui);
   font-size: 16px;
@@ -49,6 +65,39 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Light palette — warm off-white (#faf9f5 family, never pure white). Fills
+ * darken so their ink tokens flip to near-white; every pair re-checked ≥ AA:
+ *   --muted   #5d5749 on --panel #f2efe8 ≈ 6.3:1
+ *   --accent  #18756b as text on --panel ≈ 4.7:1 / --on-accent on it ≈ 5.0:1
+ *   --tone-error #b3362c on --panel-2 #eae6dc ≈ 4.9:1
+ *   --tone-working #1b7a3a as text on --panel ≈ 4.7:1 */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    --bg: #faf9f5;
+    --panel: #f2efe8;
+    --panel-2: #eae6dc;
+    --border: #d7d0c3;
+    --text: #2b2620;
+    --muted: #5d5749;
+
+    --accent: #18756b;
+
+    --on-accent: #f7f5f0;
+    --on-warn: #fdfcf7; /* on #8a5f00 ≈ 5.6:1 */
+    --on-danger: #fdf6f5; /* on #b3362c ≈ 5.7:1 */
+
+    --tone-idle: #6e6759;
+    --tone-connecting: #8a5f00;
+    --tone-conversing: #18756b;
+    --tone-working: #1b7a3a;
+    --tone-error: #b3362c;
+
+    --desk-wash: radial-gradient(120% 80% at 50% -10%, #f4f1e9 0%, var(--bg) 60%);
+  }
+}
+
 * {
   box-sizing: border-box;
 }
@@ -57,30 +106,12 @@ body {
   margin: 0;
 }
 
-.koe-app {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-  padding: 24px clamp(16px, 4vw, 40px) 28px;
-  background: var(--desk-wash);
-}
-
-.koe-app-title {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
 /* Shared button primitive. Lives in the always-loaded base layer (App.css) — not
-   in a feature stylesheet — because it is used by the header, the approval modal,
-   the settings panel AND the first-run onboarding. Keeping it here means none of
-   those screens depend on another feature's CSS happening to be loaded (the class
-   of bug koe-iyr fixes). Feature stylesheets add only their own VARIANTS
-   (.koe-btn-approve / .koe-btn-primary / .koe-btn-danger / .koe-btn-icon). */
+   in a feature stylesheet — because it is used by the console shell, the approval
+   modal, the settings panel AND the first-run onboarding. Keeping it here means
+   none of those screens depend on another feature's CSS happening to be loaded
+   (the class of bug koe-iyr fixes). Feature stylesheets add only their own
+   VARIANTS (.koe-btn-approve / .koe-btn-primary / .koe-btn-side / .koe-btn-bar). */
 .koe-btn {
   font-family: var(--font-ui);
   font-size: 14px;
