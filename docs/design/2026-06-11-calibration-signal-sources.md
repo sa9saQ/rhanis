@@ -262,14 +262,19 @@ CREATE TABLE calibration_log (
   id            INTEGER PRIMARY KEY,
   ts            INTEGER NOT NULL,          -- unix ms
   call_id       TEXT NOT NULL,             -- thinking/tool/approval と共通キー
-  layer         TEXT NOT NULL,             -- 'exec' | 'sem'
+  layer         TEXT NOT NULL CHECK (layer IN ('exec','sem')),
   tool          TEXT NOT NULL,             -- L2
-  tier          TEXT NOT NULL,             -- 行為時点の SAFE/CAUTION/DANGER
-  target_class  TEXT,                      -- L3（開放後のみ。列挙値のみ、C8）
+  tier          TEXT NOT NULL CHECK (tier IN ('SAFE','CAUTION','DANGER')),  -- 行為時点の分類
+  target_class  TEXT,                      -- L3（開放後のみ。tool 毎の closed set を実装時に CHECK 化、C8）
   predicted_p   REAL,                      -- 内部 conf（D3、その時点）。NULL = 推定前
-  band          TEXT,                      -- 内部バンド high/mid/low（D3。表示文言ではない）
-  outcome       TEXT NOT NULL,             -- §2 のラベリング規約と 1:1
-  signal        TEXT NOT NULL,             -- 'dispatch'|'approval'|'one_tap'|'barge_in'|…
+  band          TEXT CHECK (band IN ('high','mid','low')),  -- 内部バンド（D3。表示文言ではない）
+  outcome       TEXT NOT NULL CHECK (outcome IN (
+                  'success_exec','error_exec','denied','corrected',
+                  'weak_positive','approved','approval_timeout',
+                  'policy_block','interrupted','unlabeled')),  -- §2 規約と 1:1
+  signal        TEXT NOT NULL CHECK (signal IN (
+                  'dispatch','approval','one_tap','barge_in',
+                  'session_end_backfill','session_recovery','sep')),
   calib_version INTEGER NOT NULL,          -- バンド境界・prior の版（R4。aux に混ぜない）
   aux           TEXT                       -- D6 のスカラー手がかり（JSON）。C8: raw 引数/パス/URL/転写 禁止
 );
