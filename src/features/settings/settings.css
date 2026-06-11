@@ -8,10 +8,11 @@
 /* Sub-theme tokens, scoped to the component roots — never a global override — so
  * they cannot repaint the rest of the dark desk (the koe-iyr theme-clash fix).
  * Each token aliases an App.css palette value, so the panel and the onboarding
- * wizard render in one dark theme. Contrast on these dark surfaces:
- *   --koe-text  #e6e8ec on --panel #1c1f26 ≈ 13:1 (AAA)
- *   --koe-text-muted #aeb6c2 on --panel ≈ 8:1 / on --panel-2 #232733 ≈ 7.3:1
- *   --koe-danger (as text) #f0706a on --panel-2 ≈ 5.4:1 (AA). */
+ * wizard follow the OS light/dark palette with the rest of the app (koe-ios.1).
+ * Contrast (AA-checked per palette in App.css):
+ *   --koe-text on --panel ≈ 13:1 (AAA, dark) / ≈ 11:1 (light)
+ *   --koe-text-muted on --panel ≈ 8:1 (dark) / ≈ 6.3:1 (light)
+ *   --koe-danger (as text) on --panel-2 ≈ 5.4:1 (dark) / ≈ 4.9:1 (light). */
 .koe-settings-panel,
 .koe-onboarding-wizard,
 .koe-onboarding-gate-loading,
@@ -129,27 +130,28 @@
 
 /* Button VARIANTS only (base `.koe-btn` comes from App.css). */
 .koe-btn-primary {
-  /* Dark ink on the solid accent — the same AA-safe pair as .koe-btn-approve
-   * (#0c1413 on --accent #3fb6a8 ≈ 8:1). White-on-accent would fail AA. */
-  color: #0c1413;
+  /* AA-checked ink for the solid accent fill — same pair as .koe-btn-approve.
+   * --on-accent flips with the OS palette (App.css). */
+  color: var(--on-accent);
   background: var(--accent);
   border-color: transparent;
   border-radius: 9px;
 }
 .koe-btn-primary:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent) 85%, white);
+  /* Mixing toward --text raises contrast against --on-accent in BOTH palettes
+     (lightens the fill on dark, darkens it on light). */
+  background: color-mix(in srgb, var(--accent) 85%, var(--text));
 }
-/* Destructive action: solid tone-error with dark ink — same button language as
- * .koe-btn-primary / .koe-btn-approve (dark ink on a solid fill). #0c1413 on
- * --tone-error #f0706a ≈ 6.5:1 (AA); white-on-tone-error would fail AA. */
+/* Destructive action: solid tone-error with AA-checked ink — same button
+ * language as .koe-btn-primary / .koe-btn-approve (--on-danger, App.css). */
 .koe-btn-danger {
-  color: #0c1413;
+  color: var(--on-danger);
   background: var(--tone-error);
   border-color: transparent;
   border-radius: 9px;
 }
 .koe-btn-danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--tone-error) 85%, white);
+  background: color-mix(in srgb, var(--tone-error) 85%, var(--text));
 }
 .koe-btn-icon {
   border-radius: 999px; /* icon buttons: pill */

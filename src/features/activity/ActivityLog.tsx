@@ -11,7 +11,6 @@ import {
   selectRecentThinking,
   useActivityStore,
 } from "./activityStore";
-import { CostHeader } from "./CostHeader";
 import type { ActionState, DisplayStatus, ThinkingEvent, ToolEvent } from "./types";
 import "./ActivityLog.css";
 
@@ -99,7 +98,7 @@ function LogRow({ event }: { event: ToolEvent }) {
   );
 }
 
-export function ActivityLog() {
+export function ActivityLog({ className }: { className?: string } = {}) {
   const status = useActivityStore(selectDisplayStatus);
   // `selectActiveActions` builds a fresh array; `useShallow` compares its
   // contents so the component doesn't re-render (and loop) every tick.
@@ -115,7 +114,10 @@ export function ActivityLog() {
   const recent = [...events].reverse();
 
   return (
-    <section className="koe-console" aria-label="アクティビティ">
+    <section
+      className={className ? `koe-console ${className}` : "koe-console"}
+      aria-label="アクティビティ"
+    >
       <header className="koe-console-head">
         <span className={`koe-status-dot koe-tone-${meta.tone}`} aria-hidden />
         <span className="koe-status-label">{meta.label}</span>
@@ -124,9 +126,9 @@ export function ActivityLog() {
         )}
       </header>
 
-      {/* Live monthly cost + over-budget stop / raise control (koe-9xi). */}
-      <CostHeader />
-
+      {/* The live monthly cost header (koe-9xi) moved to the console sidebar
+          foot (koe-ios.1, ConsoleLayout) — the brief pins cost at the bottom
+          of the sidebar, always visible next to 設定. */}
       {status === "error" && lastError && (
         <p className="koe-error-line" role="alert">
           {lastError}

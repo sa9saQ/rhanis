@@ -1,9 +1,13 @@
-/* VoiceButton — the main start/stop control for the Realtime session.
+/* VoiceButton — the voice orb (koe-ios.1): the start/stop control for the
+ * Realtime session, shrunk from the 2026-06-09 immersive orb into a circular
+ * state indicator (brief 2026-06-10: "orb は廃止でなく縮小"). The breathing
+ * craft survives here: a slow halo pulse while idle, a fuller, faster pulse
+ * while live — luminance only under prefers-reduced-motion.
  *
  * Anti-AI-smell: no Inter, no purple/blue gradient. Single solid accent.
- * Radii intentionally varied from other panels (10px here vs 14px panel,
- * 999px for inner spinner). Durations per motion role (not all 300ms).
- */
+ * Distinct animation durations per state (4.6s idle vs 2.4s live — never one
+ * uniform value). Ink on the solid accent fill uses --on-accent (AA-checked in
+ * both palettes, App.css). */
 
 .koe-voice-button-wrap {
   display: flex;
@@ -12,19 +16,22 @@
   gap: 12px;
 }
 
-/* ── Base button ── */
+/* ── Base orb ── */
 .koe-voice-btn {
   display: inline-flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 10px;
-  padding: 14px 36px;
-  border-radius: 10px;
+  gap: 5px;
+  width: 96px;
+  height: 96px;
+  padding: 0;
+  border-radius: 999px;
   border: 2px solid transparent;
   font-family: var(--font-ui);
-  font-size: 17px;
+  font-size: 14px;
   font-weight: 700;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.03em;
   cursor: pointer;
   /* Spring easing for human-initiated interactions (anti-AI-smell rule). */
   transition:
@@ -33,7 +40,6 @@
     transform var(--dur-hover) var(--ease-spring),
     opacity var(--dur-hover) var(--ease-spring);
   user-select: none;
-  min-width: 120px;
 }
 
 .koe-voice-btn:focus-visible {
@@ -52,35 +58,39 @@
 
 /* ── Tone variants ── */
 
-/* idle — neutral, invites action */
+/* idle — neutral, low saturation, slow breathing halo: invites action. */
 .koe-voice-tone-idle {
   background: var(--panel-2);
   border-color: var(--border);
   color: var(--text);
+  animation: koe-orb-breathe 4.6s var(--ease-standard) infinite;
 }
 .koe-voice-tone-idle:not(:disabled):hover {
   border-color: var(--accent);
   color: var(--accent);
 }
 
-/* loading — muted, disabled interaction */
+/* loading / reconnecting — muted, spinner carries the motion (no halo). */
 .koe-voice-tone-loading {
   background: var(--panel-2);
   border-color: var(--border);
   color: var(--muted);
 }
 
-/* connected — solid accent, shows the active state */
+/* connected — solid accent at full saturation, livelier pulse. */
 .koe-voice-tone-connected {
   background: var(--accent);
   border-color: var(--accent);
-  color: #0d1117;
+  color: var(--on-accent);
+  animation: koe-orb-live 2.4s var(--ease-standard) infinite;
 }
 .koe-voice-tone-connected:not(:disabled):hover {
-  background: color-mix(in srgb, var(--accent) 85%, white);
+  /* Mixing toward --text raises contrast against --on-accent in BOTH palettes
+     (lightens the fill on dark, darkens it on light). */
+  background: color-mix(in srgb, var(--accent) 85%, var(--text));
 }
 
-/* error — danger tone, invites retry */
+/* error — danger ring, invites retry. */
 .koe-voice-tone-error {
   background: var(--panel-2);
   border-color: var(--tone-error);
@@ -90,7 +100,7 @@
   background: color-mix(in srgb, var(--tone-error) 12%, transparent);
 }
 
-/* ── Spinner (loading state) ── */
+/* ── Spinner (loading / reconnecting) ── */
 .koe-voice-spinner {
   display: inline-block;
   width: 16px;
@@ -122,11 +132,35 @@
   }
 }
 
+/* Breathing halo (idle): a soft ring exhaled from the rim. */
+@keyframes koe-orb-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--tone-idle) 35%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 11px transparent;
+  }
+}
+
+/* Live pulse (connected): fuller, faster ring in the accent. */
+@keyframes koe-orb-live {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+  45% {
+    box-shadow: 0 0 0 14px transparent;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .koe-voice-spinner {
     animation: none;
   }
   .koe-voice-btn {
     transition: none;
+    /* Halo pulses off; states stay readable through color + label + border. */
+    animation: none;
   }
 }

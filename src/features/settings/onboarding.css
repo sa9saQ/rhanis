@@ -7,12 +7,12 @@
  * .koe-label / .koe-api-key-*) comes from settings.css, which OnboardingGate also
  * imports; the `.koe-btn` base comes from App.css.
  *
- * Palette: the app's dark "control desk" tokens (App.css). Never a light theme —
- * the wizard must match the running app, not stand out as a white form. */
+ * Palette: the app's "control desk" tokens (App.css), which follow the OS
+ * light/dark scheme (koe-ios.1) — the wizard always matches the running app. */
 
 /* Full-viewport centered stage — shared by the wizard and the gate's loading /
- * error states. The radial wash mirrors `.koe-app` so the first paint already
- * feels like the app. */
+ * error states. The radial wash mirrors the console shell (`.koe-shell`) so the
+ * first paint already feels like the app. */
 .koe-onboarding-wizard,
 .koe-onboarding-gate-loading,
 .koe-onboarding-gate-error {

@@ -60,7 +60,10 @@ describe("App", () => {
     await act(async () => {
       render(<App />);
     });
-    expect(screen.getByText(/koe — activity/)).toBeInTheDocument();
+    // The console shell (koe-ios.1) renders the idle greeting as its h1 anchor.
+    expect(
+      screen.getByRole("heading", { level: 1, name: "今日は何をしましょう？" }),
+    ).toBeInTheDocument();
     // ActivityLog renders with the default idle status.
     expect(screen.getByText("待機")).toBeInTheDocument();
     await waitFor(() => expect(onToolEvent).toHaveBeenCalled());

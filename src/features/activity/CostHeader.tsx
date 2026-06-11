@@ -11,6 +11,7 @@
 import { useState, type FormEvent } from "react";
 
 import { getCostSnapshot } from "../../lib/tauri/ipc";
+import "./CostHeader.css";
 import { useSettingsStore } from "../settings/settingsStore";
 import { nanodollarsToUsdDisplay } from "../settings/utils";
 import { useCostStore } from "./costStore";
