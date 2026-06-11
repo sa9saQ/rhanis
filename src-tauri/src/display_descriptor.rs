@@ -130,6 +130,10 @@ fn path_descriptor(raw: &str) -> Option<String> {
 /// root-level `/home` entry named `alice\x` — the modal would describe a
 /// different target than the one being approved (Codex Cloud P2, PR #57).
 fn path_descriptor_for(raw: &str, windows: bool) -> Option<String> {
+    // Device / verbatim paths (`\\?\`, `\\.\`) bypass Win32 path normalization,
+    // so their components keep trailing dots/spaces verbatim — only NON-verbatim
+    // Windows paths get the trailing-trim display below (R-C finding).
+    let verbatim = windows && is_device_path(raw);
     let raw = if windows {
         // `\\?\` / `\\.\` are Windows-only namespaces; on Unix the same bytes
         // are just a (weird) filename and must display as-is.
@@ -138,9 +142,13 @@ fn path_descriptor_for(raw: &str, windows: bool) -> Option<String> {
         std::borrow::Cow::Borrowed(raw)
     };
     let raw = raw.as_ref();
-    let home_form = home_relative(raw, windows);
+    // Win32 strips trailing dots/spaces from every non-verbatim component, so
+    // `payroll.xlsx. ` is really `payroll.xlsx`; mirror that for display (and
+    // for the home match) so the modal names the file the OS actually touches.
+    let trim = windows && !verbatim;
+    let home_form = home_relative(raw, windows, trim);
     let in_home = home_form.is_some();
-    let body = home_form.or_else(|| tail_components(raw, windows))?;
+    let body = home_form.or_else(|| tail_components(raw, windows, trim))?;
     let mut markers = String::new();
     if components(raw, windows).iter().any(|c| is_traversal_component(c, windows)) {
         markers.push_str(" (parent traversal)");
@@ -189,9 +197,9 @@ fn unc_host(raw: &str) -> Option<&str> {
     components(raw, true).first().copied()
 }
 
-fn home_relative(raw: &str, windows: bool) -> Option<String> {
+fn home_relative(raw: &str, windows: bool, trim: bool) -> Option<String> {
     let home = dirs_next::home_dir()?;
-    home_relative_to(raw, &home.to_string_lossy(), windows)
+    home_relative_to_trim(raw, &home.to_string_lossy(), windows, trim)
 }
 
 /// Pure core of [`home_relative`] (unit-testable with fixed fixtures,
@@ -202,7 +210,16 @@ fn home_relative(raw: &str, windows: bool) -> Option<String> {
 /// collapse on both. Both sides must be lexically absolute — otherwise a
 /// RELATIVE arg like `home/user/x` (which resolves against the CWD, not
 /// `/home/user`) could masquerade as `~/x`.
+/// Test-only convenience wrapper with the trim defaulted to the platform
+/// (non-verbatim); production goes straight to [`home_relative_to_trim`] via
+/// [`home_relative`], and the verbatim "no trim" case is exercised by calling
+/// [`home_relative_to_trim`] directly.
+#[cfg(test)]
 fn home_relative_to(raw: &str, home: &str, windows: bool) -> Option<String> {
+    home_relative_to_trim(raw, home, windows, windows)
+}
+
+fn home_relative_to_trim(raw: &str, home: &str, windows: bool, trim: bool) -> Option<String> {
     if !lexically_absolute(raw, windows) || !lexically_absolute(home, windows) {
         return None;
     }
@@ -213,8 +230,8 @@ fn home_relative_to(raw: &str, home: &str, windows: bool) -> Option<String> {
             a == b
         }
     };
-    let home_comps = components(home, windows);
-    let raw_comps = components(raw, windows);
+    let home_comps = display_components(home, windows, trim);
+    let raw_comps = display_components(raw, windows, trim);
     if home_comps.is_empty() || raw_comps.len() < home_comps.len() {
         return None;
     }
@@ -242,6 +259,38 @@ fn components(p: &str, windows: bool) -> Vec<&str> {
     p.split(separators(windows)).filter(|c| !c.is_empty()).collect()
 }
 
+/// Components for DISPLAY / home-matching: like [`components`] but, when
+/// `trim`, each component's trailing dots/spaces are dropped to mirror Win32's
+/// path normalization (`payroll.xlsx. ` → `payroll.xlsx`). A component that is
+/// ALL dots/spaces (`.`, `..`, `.. `) is left intact — those are navigation
+/// segments, handled by [`is_traversal_component`], not filenames.
+fn display_components(p: &str, windows: bool, trim: bool) -> Vec<&str> {
+    p.split(separators(windows))
+        .filter(|c| !c.is_empty())
+        .map(|c| trim_win32_trailing(c, trim))
+        .collect()
+}
+
+fn trim_win32_trailing(c: &str, trim: bool) -> &str {
+    if !trim {
+        return c;
+    }
+    let trimmed = c.trim_end_matches([' ', '.']);
+    if trimmed.is_empty() {
+        c
+    } else {
+        trimmed
+    }
+}
+
+/// A `\\?\` / `\\.\` (or `//?/`) device / verbatim path. Win32 passes these to
+/// the filesystem WITHOUT trailing-dot/space or `.`/`..` normalization.
+fn is_device_path(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    let is_sep = |c: u8| c == b'\\' || c == b'/';
+    b.len() >= 4 && is_sep(b[0]) && is_sep(b[1]) && (b[2] == b'?' || b[2] == b'.') && is_sep(b[3])
+}
+
 /// Strips the Windows verbatim / device namespace prefix (`\\?\`, `\\.\`).
 /// Left in place it would defeat the home match (first component `?` / `.`)
 /// and leak the username through the tail fallback for a file in the home root.
@@ -255,13 +304,7 @@ fn components(p: &str, windows: bool) -> Vec<&str> {
 fn strip_verbatim(raw: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     let is_sep = |c: u8| c == b'\\' || c == b'/';
-    let b = raw.as_bytes();
-    let device_prefix = b.len() >= 4
-        && is_sep(b[0])
-        && is_sep(b[1])
-        && (b[2] == b'?' || b[2] == b'.')
-        && is_sep(b[3]);
-    if !device_prefix {
+    if !is_device_path(raw) {
         return Cow::Borrowed(raw);
     }
     // The first 4 bytes are ASCII (checked above), so slicing is char-safe.
@@ -290,8 +333,8 @@ fn lexically_absolute(p: &str, windows: bool) -> bool {
 /// Last two path components prefixed with `…/` (or the bare name for a
 /// separator-free relative arg). Enough for the human to recognise WHAT is
 /// touched without echoing the full absolute path.
-fn tail_components(raw: &str, windows: bool) -> Option<String> {
-    let comps = components(raw, windows);
+fn tail_components(raw: &str, windows: bool, trim: bool) -> Option<String> {
+    let comps = display_components(raw, windows, trim);
     let had_separator = raw.contains(separators(windows));
     match comps.as_slice() {
         [] => None,
@@ -556,6 +599,43 @@ mod tests {
         // "..x" is an ordinary name on both platforms.
         let d4 = path_descriptor_for(r"C:\data\..x\y", true).expect("d");
         assert!(!d4.contains("(parent traversal)"), "{d4}");
+    }
+
+    #[test]
+    fn windows_trailing_dot_space_is_normalized_for_display() {
+        // Win32 strips trailing dots/spaces, so the modal must name the file
+        // the OS actually touches, not the padded spelling (R-C finding).
+        assert_eq!(
+            home_relative_to(r"C:\Users\Alice\payroll.xlsx. ", r"C:\Users\Alice", true),
+            Some("~/payroll.xlsx".to_string())
+        );
+        // A trailing-junk spelling of an intermediate (home) component still
+        // resolves inside home — must not look out-of-home.
+        assert_eq!(
+            home_relative_to(r"C:\Users\Alice. \secret.txt", r"C:\Users\Alice", true),
+            Some("~/secret.txt".to_string())
+        );
+        // Out-of-home: tail components are normalized too.
+        assert_eq!(
+            path_descriptor_for(r"D:\work\proj. \out.txt. ", true),
+            Some("…/proj/out.txt".to_string())
+        );
+        // Unix does NOT normalize — the trailing space is part of the name.
+        assert_eq!(
+            home_relative_to_trim("/home/u/file. ", "/home/u", false, false),
+            Some("~/file. ".to_string())
+        );
+        // Verbatim Windows paths bypass Win32 normalization — display verbatim.
+        assert_eq!(
+            home_relative_to_trim(r"C:\Users\Alice\file. ", r"C:\Users\Alice", true, false),
+            Some("~/file. ".to_string())
+        );
+        assert_eq!(
+            path_descriptor_for(r"\\?\C:\Users\Alice\payroll.xlsx. ", true)
+                .expect("d")
+                .ends_with("payroll.xlsx. "),
+            true
+        );
     }
 
     #[test]
