@@ -14,8 +14,10 @@ export type ToolPhase = "start" | "progress" | "done" | "error";
  * issues a globally monotonic `sequence` so the UI can order events that arrive
  * out of order, and a unique `eventId` so duplicates can be dropped.
  *
- * Payloads are pre-redacted by the backend: `displaySummary` / `detail` must
- * never contain the API key, absolute paths, or PII (see CLAUDE.md).
+ * Payloads are pre-redacted by the backend: `displaySummary` / `detail` carry
+ * at most a safe target descriptor (home-relative path, first command token,
+ * URL host — koe-whf) and must never contain the API key, raw absolute paths,
+ * or PII (see CLAUDE.md).
  */
 export interface ToolEvent {
   /** Unique per emit. Primary de-duplication key. */

@@ -332,9 +332,11 @@ impl ApprovalGate {
     /// 30s). Consumed by the tool_dispatcher (koe-2gy) for DANGER tools only
     /// (CAUTION is notify-only and never calls this — koe-caution-tier).
     ///
-    /// `display_summary` MUST be pre-redacted by the caller (no key / absolute
-    /// path / PII) — it is shown (after a defensive length cap) in the modal.
-    /// The cap is belt-and-suspenders; redaction remains the caller's job.
+    /// `display_summary` MUST be pre-redacted by the caller — at most the safe
+    /// target descriptor of `display_descriptor` (home-relative path / first
+    /// command token / URL host, koe-whf); never a key, raw absolute path, or
+    /// PII. It is shown (after a defensive length cap) in the modal. The cap is
+    /// belt-and-suspenders; redaction remains the caller's job.
     pub async fn request_approval(
         &self,
         app: &tauri::AppHandle,
