@@ -18,7 +18,9 @@
 //!   component additionally appends an un-elidable `(parent traversal)` marker
 //!   — the tail/middle reductions could otherwise hide it, and a traversal
 //!   attempt is exactly what the human gate must see (the policy/IO layers
-//!   fail closed independently).
+//!   fail closed independently). A Windows UNC target outside the home
+//!   likewise appends `(network: \\server)` — the tail reduction would
+//!   otherwise hide that the operation leaves the machine.
 //! - `run_command`: the first whitespace token only (the executable the
 //!   allow-list will judge), never the full argv (argv may carry secrets). A
 //!   first token bearing a separator under the platform's semantics (never
@@ -75,6 +77,12 @@ fn descriptor(tool: &str, args: &Value) -> Option<String> {
         // Keep these key names in lockstep with `permission_policy::policy_target`
         // — the parity test below locks the two maps together.
         "read_file" | "write_file" | "delete_file" => path_descriptor(str_arg(args, "path")?),
+        // open_url's key is parity-locked against the policy below.
+        // external_upload is not implemented yet — this mapping IS the UX
+        // contract: when the tool lands (koe-p1a) its destination MUST be the
+        // "url" key and join policy_target + the parity test, otherwise the
+        // modal could show a decoy host for the one DANGER op that has no
+        // independent policy/IO backstop (red-team, PR #57).
         "open_url" | "external_upload" => host_descriptor(str_arg(args, "url")?),
         "run_command" => command_descriptor(str_arg(args, "command")?),
         "open_app" => str_arg(args, "name").map(str::to_string),
@@ -125,13 +133,48 @@ fn path_descriptor_for(raw: &str, windows: bool) -> Option<String> {
         std::borrow::Cow::Borrowed(raw)
     };
     let raw = raw.as_ref();
-    let body = home_relative(raw, windows).or_else(|| tail_components(raw, windows))?;
-    let has_traversal = components(raw, windows).contains(&"..");
-    Some(if has_traversal {
-        format!("{body} (parent traversal)")
-    } else {
-        body
-    })
+    let home_form = home_relative(raw, windows);
+    let in_home = home_form.is_some();
+    let mut out = home_form.or_else(|| tail_components(raw, windows))?;
+    if components(raw, windows).iter().any(|c| is_traversal_component(c, windows)) {
+        out.push_str(" (parent traversal)");
+    }
+    // The tail reduction would elide a UNC remote host — the single most
+    // decision-relevant fact for a network target — so it is re-surfaced as
+    // an un-elidable marker. A UNC home (roaming profile) relativizes to `~`
+    // above: that IS the user's home, no marker noise (red-team, PR #57).
+    if windows && !in_home {
+        if let Some(host) = unc_host(raw) {
+            out.push_str(&format!(" (network: \\\\{host})"));
+        }
+    }
+    Some(out)
+}
+
+/// Whole-component parent traversal under the platform's semantics. Win32
+/// strips trailing dots and spaces from component names, so `".. "` (and kin)
+/// resolve like `..`; the windows check is deliberately over-approximate in
+/// the fail-safe direction (display-only over-warning — e.g. `...` errors on
+/// NT rather than traversing, but still marks).
+fn is_traversal_component(c: &str, windows: bool) -> bool {
+    if c == ".." {
+        return true;
+    }
+    windows
+        && c.strip_prefix("..")
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch == ' ' || ch == '.'))
+}
+
+/// Remote host of a UNC-rooted (`\\server\…`) path — Windows semantics only
+/// (the caller gates on the platform flag; on Unix `\\x` is a filename).
+fn unc_host(raw: &str) -> Option<&str> {
+    let mut chars = raw.chars();
+    let two_seps =
+        matches!(chars.next(), Some('/' | '\\')) && matches!(chars.next(), Some('/' | '\\'));
+    if !two_seps {
+        return None;
+    }
+    components(raw, true).first().copied()
 }
 
 fn home_relative(raw: &str, windows: bool) -> Option<String> {
@@ -422,6 +465,44 @@ mod tests {
         // The Windows verbatim namespace is NOT stripped under Unix semantics
         // — the bytes are a (weird) filename and display as-is.
         assert_eq!(path_descriptor_for(r"\\?\C:\x", false), Some(r"\\?\C:\x".to_string()));
+    }
+
+    #[test]
+    fn unc_remote_host_is_surfaced_not_elided() {
+        // The tail reduction would hide the remote host — the single most
+        // decision-relevant fact for a network target (red-team, PR #57).
+        let d = path_descriptor_for(r"\\evil-srv\share\Users\Alice\f.txt", true).expect("d");
+        assert!(d.contains("…/Alice/f.txt"), "{d}");
+        assert!(d.contains(r"(network: \\evil-srv)"), "{d}");
+        // Forward-slash UNC spelling counts on Windows too.
+        let d2 = path_descriptor_for("//evil-srv/share/x", true).expect("d");
+        assert!(d2.contains(r"(network: \\evil-srv)"), "{d2}");
+        // Verbatim UNC normalizes first, then still surfaces the host.
+        let d3 = path_descriptor_for(r"\\?\UNC\evil-srv\share\x", true).expect("d");
+        assert!(d3.contains(r"(network: \\evil-srv)"), "{d3}");
+        // Unix: `\\evil-srv…` is a local filename, not a network root.
+        let d4 = path_descriptor_for(r"\\evil-srv\share\x", false).expect("d");
+        assert!(!d4.contains("(network:"), "{d4}");
+        // A drive-rooted local path never gets the marker.
+        let d5 = path_descriptor_for(r"C:\Users\Alice\f.txt", true).expect("d");
+        assert!(!d5.contains("(network:"), "{d5}");
+    }
+
+    #[test]
+    fn windows_trailing_dot_space_traversal_is_flagged() {
+        // Win32 strips trailing dots/spaces from components, so ".. " escapes
+        // to the parent like ".."; the marker must not be dodged by the
+        // trailing-junk spelling (red-team, PR #57).
+        let d = path_descriptor_for(r"C:\data\.. \x", true).expect("d");
+        assert!(d.contains("(parent traversal)"), "{d}");
+        let d2 = path_descriptor_for(r"C:\data\...\x", true).expect("d");
+        assert!(d2.contains("(parent traversal)"), "{d2}");
+        // Unix: ".. " is a literal directory name — no false flag.
+        let d3 = path_descriptor_for("/tmp/.. /x", false).expect("d");
+        assert!(!d3.contains("(parent traversal)"), "{d3}");
+        // "..x" is an ordinary name on both platforms.
+        let d4 = path_descriptor_for(r"C:\data\..x\y", true).expect("d");
+        assert!(!d4.contains("(parent traversal)"), "{d4}");
     }
 
     #[test]
