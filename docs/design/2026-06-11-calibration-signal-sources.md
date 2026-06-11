@@ -24,7 +24,7 @@
 | C2 | **BYOK API 経路では隠れ状態・logprobs に触れない** | OpenAI Realtime (WebSocket) は内部状態を返さない。SEP（隠れ状態プローブ）は自前ホスト経路（koe-aja、post-M1）でのみ可能 |
 | C3 | **絶対校正より単調・一貫**: 確信度バンドは推定値の単調関数（境界のヒステリシス帯のみ履歴依存を許す、§1） | Li & Steyvers。一貫性が信頼の前提 |
 | C4 | **cold start は保守側**（データ不足 = 低確信扱い） | safe-by-default。財務 tool の楽観 default 禁止と同じ原則 |
-| C5 | **自分の行為の結果のみ記録** + **反復行為の寄与制限**: (i) 同一 tool×同一引数ハッシュの短時間反復は trials 寄与を dedup、(ii) ユーザー発話起点でない自発 tool 連打の寄与に上限 | poisoning 対策。(i)(ii) は confidence farming（自明成功の反復で p̂ を吊り上げ、低確信×重大の警告を黙らせる攻撃）への防御（R-B Phase2） |
+| C5 | **自分の行為の結果のみ記録** + **反復行為の寄与制限**（v1 初期値、508 V6 で調整）: (i) 同一 (tool, 正規化引数ハッシュ) の **10 分窓**内反復は trials/opportunities 寄与 1 回まで（ハッシュは dedup 用のメモリ内のみ、log に保存しない = C8）、(ii) ユーザー発話起点でない自発 dispatch（直近 60s にユーザー turn が無い）の寄与は **セッション×カテゴリ毎 10 件**で cap、(iii) 分母専用行（weak_positive/approved）にも同じ cap を適用 | poisoning 対策。(i)–(iii) は confidence farming（自明成功・自動承認の反復で conf を吊り上げ、低確信×重大の警告を黙らせる攻撃）への防御（R-B Phase2 / R-C） |
 | C6 | **会話文脈に校正ログを載せない**（別テーブル、コスト +1〜2% 以内） | koe-sua.3 既定 |
 | C7 | 主張のスコープ規律: 「校正確信度 = 業界初」ではなく「**消費者×音声×PC秘書で end-user にリアルタイム開示 = 0**」 | 2026-06-10 競合研究（Maven AGI が企業内部向けに実装済）、koe-20f |
 | C8 | **calibration_log に raw のユーザーデータを入れない**: `category`/`signal`/`aux` は **スカラーと列挙のみ**（tool 引数・パス・URL・転写テキスト禁止） | PII 不変条件。`call_id` で会話ジャーナルと join 可能な以上、84w（共有画像）の上流に PII を乗せない（R-B Phase2） |
@@ -77,9 +77,16 @@ conf(cat) = p̂_exec(cat) × (1 − min(r̂_sem(cat), R_CAP))      R_CAP = 0.5
   （v1 初期値、508 で調整）
 - **内部バンド**（校正層の内部状態。**ユーザーに直接出すラベルではない** — 提示は D4）:
   `high: conf ≥ 0.85` / `mid: [0.5, 0.85)` / `low: < 0.5`（半開区間）
-- 境界チラつき: バンド遷移にヒステリシス帯 `±max(0.03, 1/(trials+3))` を設ける
-  （`trials` = 当該カテゴリの実行層 trials と意味層 opportunities の小さい方。低データ域では帯を
-  広げる。帯内のみ履歴依存 = C3 の明示的例外）
+- **no-semantic-evidence gate**（R-C HIGH）: 当該カテゴリ（back-off 込み）の
+  `sem opportunities < N_SEM_MIN = 3` の間は **band 上限 = mid**。実行成功の積み上げだけ
+  （r̂_sem = prior のまま）で `high` に到達する経路を塞ぐ — 「意味適合の証拠なしの高確信」は
+  C4 違反。意味層の機会が 3 件入って初めて high が解禁される
+- 境界チラつき: バンド遷移にヒステリシス帯 `±clamp(1/(trials+3), 0.03, 0.15)` を設ける
+  （`trials` = 実行層 trials と意味層 opportunities の小さい方。ただし意味層が未開始
+  〔opportunities = 0〕のカテゴリでは実行層 trials を使う。低データ域では帯が広がる。
+  帯内のみ履歴依存 = C3 の明示的例外）。実装規則（sua.2 へ）: 初期 band は推定値の素の band /
+  帯は境界の dithering 抑制のみで、推定値が帯を超えて動けば飛び越し遷移（low→high）も即時 /
+  境界テストを sua.2 の受け入れ条件に含める
 - back-off の不連続防止: 子カテゴリは `trials` による shrinkage（親子推定の重み付き平均
   `w = n/(n+N_MIN)`）で滑らかに独立化する。閾値跨ぎのジャンプを作らない
 
@@ -142,8 +149,11 @@ implemented"}` は**成功形**で返る）が混入するため。**recorder se
 | ポリシーブロック（deny-list / allow-list 等） | `policy_block` | ×（重み 0。farming 検知の材料として記録） |
 | 未登録 tool stub | 記録しない | ×（koe-r2o の解消対象。校正の母集団に入れない） |
 
-実コードの分岐順序（v1 時点、`tool_dispatcher.rs`）: classify → deny-list（policy）→
-arguments サイズ検証 → DANGER gate → allow-list（policy）→ registry → 実行。
+実コードの分岐（v1 時点、`tool_dispatcher.rs`。正確な順序の SoT はコード — 本表は
+「どの分岐がどの outcome になるか」の対応のみを規定する）: classify / 呼び出し形成検証
+（tool 名長・arguments サイズ）/ policy 合成（deny-list 優先 → allow-list）/ DANGER gate /
+registry / 実行。**policy により自動許可された行為は `approved` に数えない**（人間シグナル
+ではない — sem 行を作らない）。
 
 ### S2 の精密化: `ApprovalOutcome` は現状 deny と timeout を区別しない
 
@@ -156,8 +166,14 @@ sua.3 の実装要件として「**校正記録用に deny / timeout / チャネ
 
 - 定義: **S3 の訂正ボタンが提示されたターンで、押されず、かつ同一セッション内に後続の明示訂正が
   無かった**もの（= 訂正の機会があったが明示の不満が出なかった打ち切り観測）
-- 書き込み: イベントの不在で定義されるため、**セッション終了時に一括確定（バックフィル）**する
-  （セッション中は pending、終了時に未訂正のものを `weak_positive` として append）
+- 書き込み: イベントの不在で定義されるため、**pending を durable に保持して確定時に insert**
+  する（R-C MEDIUM: メモリ pending はクラッシュで分母行が消え D2 が悲観側に歪む）:
+  - ボタン提示時に **`pending_opportunities` 別テーブル**へ durable に insert
+  - **正常なセッション終了時**のみ、未訂正の pending を `weak_positive` として
+    calibration_log へ insert（calibration_log は insert-only を保つ）
+  - **異常終了（クラッシュ/強制終了）後の再起動時**は、前セッションの残存 pending を
+    `unlabeled` として insert（弱陽性に昇格させない — 訂正前だった可能性を除外できない）。
+    この recovery 行の `signal` = `'session_recovery'`（closed set に含める）
 - 用途: D2 の分母のみ。508 の分布分析で識別できるよう **専用 enum 値として記録**する
   （unlabeled に潰さない — R-B Phase3 HIGH）
 
@@ -172,7 +188,11 @@ outcome ∈ { success_exec, error_exec,            // 実行層（S1）
             unlabeled }
 ```
 
-- 1 行為 = 1 エピソード。キーは `call_id`（thinking-event / tool-event / approval が既に共有）
+- **記録粒度（R-C HIGH）: 1 物理 tool call = 同一 `call_id` で最大 2 行** —
+  `layer='exec'` の実行結果行（success_exec/error_exec）と `layer='sem'` の人間シグナル行
+  （approved/denied/corrected/weak_positive 等）は**別 insert**。例: DANGER を承認して実行成功
+  した行為 = `('sem', approved)` + `('exec', success_exec)` の 2 行。「1 行為 = 1 エピソード」は
+  call_id 単位の概念であって、行は層ごとに分かれる（どちらかを落とすと D1 か D2 が壊れる）
 - 列の決め打ち（sua.3 実装が迷わないために）: `weak_positive` の `signal` =
   `'session_end_backfill'`、`approved`/`denied`/`approval_timeout` の `signal` = `'approval'`。
   重み 0 行の `layer`: `approval_timeout`/`interrupted` = `'sem'`、`policy_block` = `'exec'`
@@ -224,11 +244,14 @@ raw 引数断片は保存しない — allowlist に無いものはすべて `ot
 
 - **FIFO/recency**（E5: fifo 0.78 が最良）。**surprise 保持（|conf−outcome| 大を残す）は禁止**
   （E5: 0.47 で最悪 — 校正ヒストグラムを反転させる）
-- **予算は「学習行」と「観測専用行」で分離**（R-B Phase3）: 学習行（success_exec / error_exec /
-  denied / corrected / weak_positive）はカテゴリ（= tool × tier × layer）毎リング上限 512 行。
-  観測専用行（approval_timeout / policy_block / interrupted / unlabeled）は**別予算**
-  （全体上限 4096 行の共有リング）— 希少な S3 教師行が重み 0 行に押し出されない
-- 全体上限到達時も学習行の eviction は自カテゴリのリングのみ（FIFO）
+- **予算は「学習行」と「観測専用行」で分離**（R-B Phase3）: 学習行はカテゴリ
+  （= tool × tier × layer）毎リング上限 512 行。観測専用行（approval_timeout / policy_block /
+  interrupted / unlabeled）は**別予算**（全体上限 4096 行の共有リング）— 希少な S3 教師行が
+  重み 0 行に押し出されない
+- **sem 学習リングはさらに 2 quota に分割**（R-C MEDIUM）: 明示負例（denied/corrected）と
+  分母専用行（weak_positive/approved）を**各 256 行の独立リング**にする — 押下率の低い
+  ユーザーで大量の weak_positive が希少な明示負例を FIFO で押し出す事故を構造的に防ぐ
+- 全体上限到達時も学習行の eviction は自カテゴリ（自 quota）のリングのみ（FIFO）
 
 ---
 
@@ -252,7 +275,15 @@ CREATE TABLE calibration_log (
 );
 ```
 
-- 行は更新しない（insert のみ）。削除は §3 のリング eviction のみ
+- 行は更新しない（insert のみ）。削除は §3 のリング eviction のみ。
+  `weak_positive` の確定は `pending_opportunities` 別テーブル経由（§2）
+- **C8 は schema で強制する**（R-C HIGH — prose 頼みにしない）:
+  - `layer` / `tier` / `band` / `outcome` / `signal` / `target_class` は **DB の CHECK 制約で
+    列挙値に閉じる** + Rust 側は closed enum（文字列を直接書かない）
+  - `signal` の値集合はこの文書の列挙（`'dispatch' | 'approval' | 'one_tap' | 'barge_in' |
+    'session_end_backfill' | 'session_recovery' | 'sep'`）が SoT — 追加はこの文書の改訂を要する
+  - `aux` は **signal 毎に許可キーと型（数値 / boolean / 小さな列挙のみ）を定義した JSON schema**
+    でバリデートして書く。自由文字列・raw 引数・パス・URL・転写はバリデーション層で拒否
 - **predicted_p と outcome の対が校正曲線の素材** — koe-84w（正直レポート）はこのテーブルの
   週次集計だけで作れる（D4: 集計は内部 band 別。C8 により共有画像経路に PII は乗らない）
 
@@ -271,7 +302,7 @@ CREATE TABLE calibration_log (
 | V3 S4 の相関 | （ゲート済み）interrupted と S3 訂正の共起率 → 重み 0 から昇格するか判定 |
 | V4 カテゴリ分散 | L2 バケット間の成功率分散 → L3 開放の要否 |
 | V5 ログのコスト | 記録経路の遅延/容量が C6（+1〜2%）以内 |
-| V6 farming 耐性 | 同一引数反復・自発連打を試行し、C5(i)(ii) の dedup/上限で p̂_exec が動かないことを確認 |
+| V6 farming 耐性 | 同一引数反復・引数微変動・自発連打・自動承認の量産を試行し、C5(i)–(iii) の dedup/cap の下で **conf(cat) の変動 ≤ 0.05** に収まることを確認（cap 値自体もここで再調整） |
 | V7 意味層の識別力 | corrected/denied を「不適合」クラス、weak_positive/approved を「推定適合」クラスとした **noisy AUROC**（注意: enum 名 `weak_positive` は AUROC 上は「不適合検出の負例」側 — 命名は校正の文脈〔意図適合 = positive〕に従う。打ち切りラベルのノイズを明記の上で参考値として測る。クリーンな sem AUROC は v1 では測定不能 — 構造的制約として記録） |
 
 ---
