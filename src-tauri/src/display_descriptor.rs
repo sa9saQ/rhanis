@@ -52,6 +52,11 @@ use url::Url;
 /// `MAX_SUMMARY_LEN` belt-and-suspenders cap).
 const MAX_DESCRIPTOR_CHARS: usize = 96;
 
+/// Char budget for the UNC host inside the `(network: \\host)` marker. The
+/// host length is attacker-controlled — uncapped it could push the marker
+/// labels (or the body tail) out of the display budget (R-C finding).
+const UNC_HOST_MAX_CHARS: usize = 24;
+
 /// Builds the human-facing summary for a tool call: `run {tool}: {descriptor}`
 /// when a safe descriptor can be derived, plain `run {tool}` otherwise.
 /// Consumed by the tool_dispatcher for the phase events AND the approval
@@ -135,9 +140,10 @@ fn path_descriptor_for(raw: &str, windows: bool) -> Option<String> {
     let raw = raw.as_ref();
     let home_form = home_relative(raw, windows);
     let in_home = home_form.is_some();
-    let mut out = home_form.or_else(|| tail_components(raw, windows))?;
+    let body = home_form.or_else(|| tail_components(raw, windows))?;
+    let mut markers = String::new();
     if components(raw, windows).iter().any(|c| is_traversal_component(c, windows)) {
-        out.push_str(" (parent traversal)");
+        markers.push_str(" (parent traversal)");
     }
     // The tail reduction would elide a UNC remote host — the single most
     // decision-relevant fact for a network target — so it is re-surfaced as
@@ -145,10 +151,16 @@ fn path_descriptor_for(raw: &str, windows: bool) -> Option<String> {
     // above: that IS the user's home, no marker noise (red-team, PR #57).
     if windows && !in_home {
         if let Some(host) = unc_host(raw) {
-            out.push_str(&format!(" (network: \\\\{host})"));
+            markers.push_str(&format!(" (network: \\\\{})", cap_middle(host, UNC_HOST_MAX_CHARS)));
         }
     }
-    Some(out)
+    // Budget the body AROUND the risk markers: with a single whole-string cap
+    // an attacker could pad the path/host until the truncation swallowed the
+    // markers — exactly the part the human must see (R-C finding). Marker
+    // lengths are bounded (19 + 37 chars), so the body keeps ≥ 40 chars and
+    // the total never exceeds MAX_DESCRIPTOR_CHARS.
+    let budget = MAX_DESCRIPTOR_CHARS.saturating_sub(markers.chars().count());
+    Some(format!("{}{markers}", cap_middle(&body, budget)))
 }
 
 /// Whole-component parent traversal under the platform's semantics. Win32
@@ -235,18 +247,30 @@ fn components(p: &str, windows: bool) -> Vec<&str> {
 /// and leak the username through the tail fallback for a file in the home root.
 /// The verbatim UNC form (`\\?\UNC\server\share\…`) is normalized back to
 /// `\\server\share\…` so a UNC home (roaming profile) can still relativize.
+/// Matching is deliberately loose in the fail-safe direction: the prefix
+/// separators may be `/` or `\` (`//?/` normalizes to the device namespace
+/// too) and the `UNC` segment compares ASCII case-insensitively — the NT
+/// object manager resolves `\\?\unc\…` to the same network provider, so a
+/// lowercase spelling must not suppress the network marker (R-C finding).
 fn strip_verbatim(raw: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
-    if let Some(rest) = raw
-        .strip_prefix(r"\\?\UNC\")
-        .or_else(|| raw.strip_prefix(r"\\.\UNC\"))
-    {
-        return Cow::Owned(format!(r"\\{rest}"));
+    let is_sep = |c: u8| c == b'\\' || c == b'/';
+    let b = raw.as_bytes();
+    let device_prefix = b.len() >= 4
+        && is_sep(b[0])
+        && is_sep(b[1])
+        && (b[2] == b'?' || b[2] == b'.')
+        && is_sep(b[3]);
+    if !device_prefix {
+        return Cow::Borrowed(raw);
     }
-    match raw.strip_prefix(r"\\?\").or_else(|| raw.strip_prefix(r"\\.\")) {
-        Some(rest) => Cow::Borrowed(rest),
-        None => Cow::Borrowed(raw),
+    // The first 4 bytes are ASCII (checked above), so slicing is char-safe.
+    let rest = &raw[4..];
+    let rb = rest.as_bytes();
+    if rb.len() >= 4 && rb[..3].eq_ignore_ascii_case(b"UNC") && is_sep(rb[3]) {
+        return Cow::Owned(format!(r"\\{}", &rest[4..]));
     }
+    Cow::Borrowed(rest)
 }
 
 /// Lexically absolute: `/`-rooted on every platform; on Windows also a `\`
@@ -486,6 +510,35 @@ mod tests {
         // A drive-rooted local path never gets the marker.
         let d5 = path_descriptor_for(r"C:\Users\Alice\f.txt", true).expect("d");
         assert!(!d5.contains("(network:"), "{d5}");
+        // Lowercase / mixed-case device-namespace UNC reaches the same network
+        // provider (NT object-manager lookups are case-insensitive) — the
+        // spelling must not suppress the marker (R-C finding).
+        let d6 = path_descriptor_for(r"\\?\unc\evil-srv\share\Users\Alice\f.txt", true)
+            .expect("d");
+        assert!(d6.contains(r"(network: \\evil-srv)"), "{d6}");
+        assert_eq!(strip_verbatim(r"\\.\uNc\srv\share\x"), r"\\srv\share\x");
+        // Forward-slash device-prefix spelling normalizes to the device
+        // namespace too.
+        assert_eq!(strip_verbatim("//?/C:/x"), "C:/x");
+        assert_eq!(strip_verbatim(r"//?/unc/srv/share/x"), r"\\srv/share/x");
+    }
+
+    #[test]
+    fn risk_markers_survive_attacker_length_padding() {
+        // A single whole-string cap would let a padded path/host truncate the
+        // markers away — they are budgeted separately so both always render
+        // in full (R-C finding).
+        let host = format!("{}.example.internal", "a".repeat(80));
+        let p = format!(r"\\{host}\share\safe\.. \{}\{}", "p".repeat(60), "b".repeat(60));
+        let d = path_descriptor_for(&p, true).expect("d");
+        assert!(d.contains("(parent traversal)"), "{d}");
+        assert!(d.contains(r"(network: \\"), "{d}");
+        assert!(d.ends_with(')'), "markers must keep their closing paren: {d}");
+        assert!(
+            d.chars().count() <= MAX_DESCRIPTOR_CHARS,
+            "cap: {} chars",
+            d.chars().count()
+        );
     }
 
     #[test]
