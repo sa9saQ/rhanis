@@ -151,6 +151,21 @@ pub enum ProviderEvent {
     /// (Gemini audio + 16 kHz integration).
     #[allow(dead_code)]
     AudioDelta,
+    /// The user started speaking (OpenAI: `input_audio_buffer.speech_started`,
+    /// server VAD) — the barge-in trigger (koe-bx7). Two reactions, two seams:
+    /// the audio side (cut local playback + suppress stale deltas) happens in
+    /// [`AudioBridge::handle_server_audio`], which sees the same frame via the
+    /// read loop's `audio_handler`; the protocol side — sending the provider's
+    /// [`cancel_frame`] so the in-flight response stops generating server-side —
+    /// is the session loop's job when it receives this event.
+    ///
+    /// Emitted on EVERY user speech start, not only mid-playback: the audio cut
+    /// is a no-op on an empty sink, and a cancel without an active response is
+    /// answered by a benign error frame (see [`cancel_frame`]).
+    ///
+    /// [`AudioBridge::handle_server_audio`]: crate::audio_bridge::AudioBridge::handle_server_audio
+    /// [`cancel_frame`]: RealtimeProvider::cancel_frame
+    SpeechStarted,
     /// Streaming transcript delta / ack / blank transcript / unknown — the loop
     /// continues without action (and records nothing).
     Ignored,
@@ -180,6 +195,20 @@ pub trait RealtimeProvider: Send + Sync + 'static {
     /// in-flight cap check still runs in the loop AFTER this returns a 1-element
     /// `Vec`, and an over-cap `arguments` blob is still dropped here without parsing.
     fn parse_frame(&self, event: &Value) -> Vec<ProviderEvent>;
+    /// The client frame that cancels the in-flight response (barge-in, koe-bx7).
+    /// The session loop sends it when [`ProviderEvent::SpeechStarted`] arrives.
+    ///
+    /// Default `None`: a provider whose server handles interruption entirely on
+    /// its own (or that has no cancel control) needs no frame. OpenAI overrides
+    /// with `response.cancel` — sent UNGATED on every speech start because the
+    /// client does not track response lifecycle; when no response is active
+    /// (or the server's VAD `interrupt_response` already cancelled it) the
+    /// server answers with a benign `error` frame that `parse_frame` maps to
+    /// [`ProviderEvent::Ignored`]. koe-nal (error surfacing) must keep that
+    /// duplicate-cancel error classified as benign.
+    fn cancel_frame(&self) -> Option<Message> {
+        None
+    }
 }
 
 // ---- OpenAI Realtime ---------------------------------------------------------
@@ -238,6 +267,17 @@ impl RealtimeProvider for OpenAiRealtime {
         vec![Message::Text(session_update.to_string().into())]
     }
 
+    fn cancel_frame(&self) -> Option<Message> {
+        // `response.cancel` stops the in-flight response. Sent ungated on every
+        // speech start (see the trait doc): with the GA default server VAD the
+        // server has usually interrupted already, and a cancel with no active
+        // response yields a benign `error` frame (Ignored today; koe-nal keeps
+        // it benign). Static shape — no per-call state, mirrors initial_frames.
+        Some(Message::Text(
+            serde_json::json!({ "type": "response.cancel" }).to_string().into(),
+        ))
+    }
+
     fn parse_frame(&self, event: &Value) -> Vec<ProviderEvent> {
         match event.get("type").and_then(Value::as_str) {
             Some("response.function_call_arguments.done") => {
@@ -293,6 +333,11 @@ impl RealtimeProvider for OpenAiRealtime {
             // loop, so the normalized path ignores them (PR1). PR2 will route
             // Gemini audio through `ProviderEvent::AudioDelta`.
             Some("response.audio.delta") => vec![ProviderEvent::Ignored],
+            // Barge-in trigger (koe-bx7): the user began speaking (server VAD).
+            // The audio cut happens in the `audio_handler` seam (the bridge sees
+            // this same frame); the normalized event tells the session loop to
+            // send `cancel_frame()`.
+            Some("input_audio_buffer.speech_started") => vec![ProviderEvent::SpeechStarted],
             // Finalized user-speech transcription (koe-emd / koe-pbe). The matching
             // `.delta` stream falls through to `_ => Ignored`, so only the completed
             // turn is journalled. This frame carries BOTH the transcript AND a
@@ -672,6 +717,31 @@ mod tests {
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({ "type": "response.created" });
         assert!(matches!(p.parse_frame(&ev).as_slice(), [ProviderEvent::Ignored]));
+    }
+
+    // ---- barge-in (koe-bx7) ----------------------------------------------------
+
+    #[test]
+    fn parse_frame_maps_speech_started() {
+        // The server-VAD speech-start frame is the barge-in trigger: exactly one
+        // normalized SpeechStarted, regardless of extra fields on the wire event.
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "input_audio_buffer.speech_started",
+            "audio_start_ms": 1234,
+            "item_id": "item_1"
+        });
+        assert!(matches!(p.parse_frame(&ev).as_slice(), [ProviderEvent::SpeechStarted]));
+    }
+
+    #[test]
+    fn cancel_frame_is_response_cancel() {
+        let p = OpenAiRealtime::new();
+        let Some(Message::Text(txt)) = p.cancel_frame() else {
+            panic!("expected a text response.cancel frame");
+        };
+        let v: serde_json::Value = serde_json::from_str(txt.as_str()).unwrap();
+        assert_eq!(v["type"], "response.cancel");
     }
 
     // ---- transcript (koe-emd) ------------------------------------------------

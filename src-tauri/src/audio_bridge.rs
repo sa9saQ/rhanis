@@ -47,7 +47,7 @@
 //!
 //! transaction N/A · idempotency_key N/A (real-time audio I/O, not billing).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -384,9 +384,21 @@ pub enum AudioCommand {
     EnqueuePcm(Vec<u8>),
 }
 
-/// **Control** command: stop intent for the audio thread.  Carried on the tiny,
-/// **reliable** CONTROL channel — separate from PCM so a congested playback
-/// queue can never drop a stop.
+/// One playback-sink operation, handed to the closure injected into
+/// [`run_audio_command_loop`].  A single-closure seam (rather than one closure
+/// per operation) because both operations mutate the same sink + queued-bytes
+/// accounting, and two `FnMut` captures of one `&mut` cannot coexist.
+pub enum PlaybackOp {
+    /// Append one decoded PCM payload (the DATA-channel `EnqueuePcm` path).
+    Enqueue(Vec<u8>),
+    /// Barge-in cut (koe-bx7): clear everything queued in the sink, resume it,
+    /// and reset the queued-bytes accounting.  The loop keeps running.
+    Clear,
+}
+
+/// **Control** command: stop / barge-in intent for the audio thread.  Carried on
+/// the tiny, **reliable** CONTROL channel — separate from PCM so a congested
+/// playback queue can never drop a stop (or a barge-in cut).
 ///
 /// The flush/discard decision is encoded in WHICH control is sent (decided at
 /// **send time** by the caller); the receiver does NOT consult the `running`
@@ -405,13 +417,23 @@ pub enum AudioControl {
     /// where the WS write task is aborted first.  Skipping the flush ensures
     /// no tail PCM races onto the WS after the writer abort.
     StopNow,
+    /// **Barge-in playback cut (koe-bx7)** — the only NON-terminal control: the
+    /// user started speaking, so stop the assistant's voice NOW. The audio
+    /// thread (1) discards every `EnqueuePcm` already queued on the DATA
+    /// channel (stale audio of the interrupted response), (2) clears + resumes
+    /// the rodio sink, then (3) keeps running — capture continues, the user IS
+    /// mid-sentence. Travels on CONTROL, not DATA: the cut must win over the
+    /// very PCM flood it is cutting (P1-1 control-first ordering).
+    ClearPlayback,
 }
 
 /// Tiny capacity for the CONTROL channel.  At most one stop control is pending
 /// per session (graceful sends one `FlushThenStop`; immediate sends one
-/// `StopNow`; the cpal error callback may add one `StopNow`).  A capacity of 4
-/// guarantees a single pending control always fits even under idempotent
-/// re-calls, so control is never dropped by PCM congestion.
+/// `StopNow`; the cpal error callback may add one `StopNow`), plus transient
+/// `ClearPlayback` cuts (koe-bx7) that the audio thread consumes within one
+/// ~20 ms loop iteration.  A capacity of 4 keeps a pending stop deliverable
+/// even with a barge-in cut in flight; `send_control_reliably` retries cover
+/// a momentary burst.
 const CONTROL_CHANNEL_CAP: usize = 4;
 
 /// Short bounded timeout for the **reliable** control send on the shutdown path.
@@ -462,6 +484,137 @@ fn send_control_reliably(ctrl_tx: &std::sync::mpsc::SyncSender<AudioControl>, ct
             }
             Err(TrySendError::Disconnected(_)) => return false,
         }
+    }
+}
+
+// ── PlaybackHandle: lock-free playback / barge-in primitive (koe-bx7) ─────────
+
+/// The playback gate is OFF: deltas flow to the sink normally.
+const GATE_OFF: u8 = 0;
+/// The user is speaking (`speech_started` seen): deltas are dropped, and a
+/// `response.created` arriving NOW (e.g. a tool-completion follow-up response)
+/// must NOT lift the gate — the user still has the floor.
+const GATE_SPEAKING: u8 = 1;
+/// The user finished speaking (`speech_stopped` seen): the NEXT
+/// `response.created` — the reply to what the user just said — lifts the gate.
+const GATE_ARMED: u8 = 2;
+
+/// A lock-free handle for the read loop's `audio_handler` seam: playback
+/// enqueueing + the barge-in gate (koe-bx7), WITHOUT acquiring the tokio
+/// `Mutex<AudioBridge>`.
+///
+/// ## Why lock-free matters (same rationale as [`AudioStopHandle`])
+/// The pre-koe-bx7 handler took `try_lock()` and skipped the frame on
+/// contention — acceptable when a miss meant one lossy PCM chunk, but the
+/// barge-in STATE TRANSITIONS (`speech_started` / `speech_stopped` /
+/// `response.created`) now ride this seam: a missed `response.created` would
+/// stick the gate closed for an entire turn (a full response of silence).
+/// The handle clones the channel senders + the gate at `start()` time, so no
+/// frame is ever dropped to mutex contention.
+///
+/// Per-connection: `establish_connection` grabs a fresh handle after each
+/// (re)`start()`. The gate `Arc` is REPLACED on `start()` (not just reset), so
+/// a stale handler from a previous generation cannot pollute the new session's
+/// gate — the same generation discipline as the `running` flag.
+pub struct PlaybackHandle {
+    /// Barge-in gate — one of [`GATE_OFF`] / [`GATE_SPEAKING`] / [`GATE_ARMED`].
+    /// Single writer (the read-loop task drives all transitions in frame order);
+    /// the atomic is for the cross-thread handoff, not for contention.
+    gate: Arc<AtomicU8>,
+    /// DATA-channel sender (lossy PCM → playback).
+    data_tx: std::sync::mpsc::SyncSender<AudioCommand>,
+    /// CONTROL-channel sender (reliable; carries the barge-in cut).
+    ctrl_tx: std::sync::mpsc::SyncSender<AudioControl>,
+}
+
+impl PlaybackHandle {
+    /// The playback half of the read loop's `audio_handler` seam: feeds
+    /// `response.audio.delta` payloads into the playback queue and drives the
+    /// barge-in gate (koe-bx7).  Silently ignores unknown event types or
+    /// malformed base64.
+    ///
+    /// Barge-in protocol:
+    /// - `speech_started` → gate closes; on the OFF→SPEAKING transition ONLY,
+    ///   one `ClearPlayback` cut goes out on CONTROL (idempotent per episode:
+    ///   while the gate is closed no new audio reaches the sink, so repeat
+    ///   speech-starts have nothing left to cut — and an attacker-controlled
+    ///   frame flood cannot occupy the CONTROL channel or block this path;
+    ///   the cut is `try_send`, dropped-if-full, because a full CONTROL channel
+    ///   means a stop is already pending and the cut is moot).
+    /// - `speech_stopped` → the gate arms: the user finished, the NEXT response
+    ///   may speak.
+    /// - `response.created` → lifts the gate ONLY from the armed state. A
+    ///   response created while the user is STILL speaking (tool-completion
+    ///   follow-ups via `response.create`, see koe-z8j) stays suppressed —
+    ///   without this, a mid-speech `response.created` would re-open the gate
+    ///   and the assistant would talk over the user (R-B finding).
+    /// - `response.audio.delta` → enqueued only while the gate is OFF; checked
+    ///   BEFORE base64-decoding so a suppressed straggler flood costs no CPU.
+    ///
+    /// The protocol half of barge-in (sending the provider's `response.cancel`)
+    /// lives in the session loop via [`ProviderEvent::SpeechStarted`].
+    ///
+    /// [`ProviderEvent::SpeechStarted`]: crate::realtime_provider::ProviderEvent::SpeechStarted
+    pub fn handle_server_audio(&self, event: &serde_json::Value) {
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("input_audio_buffer.speech_started") => {
+                let prev = self.gate.swap(GATE_SPEAKING, Ordering::AcqRel);
+                if prev == GATE_OFF {
+                    let _ = self.ctrl_tx.try_send(AudioControl::ClearPlayback);
+                }
+            }
+            Some("input_audio_buffer.speech_stopped") => {
+                // Arm only from SPEAKING — a stray speech_stopped with no
+                // preceding speech_started must not disturb an open gate.
+                let _ = self.gate.compare_exchange(
+                    GATE_SPEAKING,
+                    GATE_ARMED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            Some("response.created") => {
+                // Lift only when armed (user finished speaking). Mid-speech
+                // creations keep the gate closed — see the method doc.
+                let _ = self.gate.compare_exchange(
+                    GATE_ARMED,
+                    GATE_OFF,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            Some("response.audio.delta") => {
+                if self.gate.load(Ordering::Acquire) != GATE_OFF {
+                    // Straggler of an interrupted response — drop pre-decode.
+                    return;
+                }
+                if let Some(pcm_bytes) = decode_audio_delta(event) {
+                    // try_send is non-blocking on the DATA channel; if it is full
+                    // (audio thread overwhelmed) we drop this playback chunk rather
+                    // than blocking the read loop.  Stop control is NEVER on this
+                    // channel, so a full DATA channel cannot drop a stop.
+                    let _ = self.data_tx.try_send(AudioCommand::EnqueuePcm(pcm_bytes));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Builds a handle around fresh test channels — no audio thread, no device
+    /// (the barge-in unit tests assert what reaches each channel).
+    #[cfg(test)]
+    fn new_for_test() -> (
+        Self,
+        std::sync::mpsc::Receiver<AudioCommand>,
+        std::sync::mpsc::Receiver<AudioControl>,
+    ) {
+        let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<AudioCommand>(64);
+        let (ctrl_tx, ctrl_rx) = std::sync::mpsc::sync_channel::<AudioControl>(CONTROL_CHANNEL_CAP);
+        (
+            Self { gate: Arc::new(AtomicU8::new(GATE_OFF)), data_tx, ctrl_tx },
+            data_rx,
+            ctrl_rx,
+        )
     }
 }
 
@@ -582,6 +735,11 @@ pub struct AudioBridge {
     data_tx: Option<std::sync::mpsc::SyncSender<AudioCommand>>,
     /// CONTROL-channel sender (stop intent); `None` before `start()` / after stop.
     ctrl_tx: Option<std::sync::mpsc::SyncSender<AudioControl>>,
+    /// Barge-in gate for the CURRENT session (koe-bx7) — see [`PlaybackHandle`].
+    /// REPLACED (not reset) by each `start()`, so a stale prior-generation
+    /// handler holding the old `Arc` cannot pollute the new session's gate
+    /// (the same generation discipline as the `running` flag).
+    playback_gate: Arc<AtomicU8>,
     /// Join handle for the audio thread; used to reap the previous thread at the
     /// next `start()` and to wait for clean teardown on `stop_immediate()`.
     thread_handle: Option<std::thread::JoinHandle<()>>,
@@ -593,6 +751,7 @@ impl AudioBridge {
             state: Arc::new(AudioBridgeState::new()),
             data_tx: None,
             ctrl_tx: None,
+            playback_gate: Arc::new(AtomicU8::new(GATE_OFF)),
             thread_handle: None,
         }
     }
@@ -668,22 +827,25 @@ impl AudioBridge {
 
         self.data_tx = Some(data_tx);
         self.ctrl_tx = Some(ctrl_tx);
+        // A fresh session starts with the gate OPEN. The Arc is REPLACED (not
+        // stored-into) so a stale prior-generation `PlaybackHandle` keeps its
+        // own dead gate and cannot touch this session's (koe-bx7).
+        self.playback_gate = Arc::new(AtomicU8::new(GATE_OFF));
         self.thread_handle = Some(handle);
         Ok(stop_handle)
     }
 
-    /// Feeds a `response.audio.delta` event JSON into the playback queue.
-    /// Silently ignores unknown event types or malformed base64.
-    pub fn handle_server_audio(&self, event: &serde_json::Value) {
-        if let Some(pcm_bytes) = decode_audio_delta(event) {
-            if let Some(tx) = &self.data_tx {
-                // try_send is non-blocking on the DATA channel; if it is full
-                // (audio thread overwhelmed) we drop this playback chunk rather
-                // than blocking the read loop.  Stop control is NEVER on this
-                // channel, so a full DATA channel cannot drop a stop.
-                let _ = tx.try_send(AudioCommand::EnqueuePcm(pcm_bytes));
-            }
-        }
+    /// Returns the lock-free [`PlaybackHandle`] for the CURRENT session — the
+    /// read loop's `audio_handler` seam (playback enqueueing + barge-in gate,
+    /// koe-bx7).  `None` before `start()`.  Grab it once per connection, AFTER
+    /// a successful `start()` (the same pattern as [`AudioStopHandle`]): the
+    /// handler must never take this bridge's tokio mutex per frame.
+    pub fn playback_handle(&self) -> Option<PlaybackHandle> {
+        Some(PlaybackHandle {
+            gate: Arc::clone(&self.playback_gate),
+            data_tx: self.data_tx.as_ref()?.clone(),
+            ctrl_tx: self.ctrl_tx.as_ref()?.clone(),
+        })
     }
 
     /// Returns `true` while the bridge is actively capturing.
@@ -914,27 +1076,42 @@ enum LoopExit {
 ///   stays lossy/non-blocking; this loop's PCM handling is allowed to block
 ///   briefly on the DATA recv only for low playback latency.
 ///
-/// `on_pcm(bytes) -> bool`: enqueue one PCM payload; return `false` to request a
-/// fail-closed immediate stop (e.g. playback-queue overflow).
+/// `on_playback(op) -> bool`: perform one [`PlaybackOp`] on the sink; return
+/// `false` to request a fail-closed immediate stop (e.g. playback-queue
+/// overflow on `Enqueue`).
 fn run_audio_command_loop<P>(
     data_rx: &std::sync::mpsc::Receiver<AudioCommand>,
     ctrl_rx: &std::sync::mpsc::Receiver<AudioControl>,
     accum: &std::sync::Mutex<ChunkAccumulator>,
     write_tx: &mpsc::Sender<Message>,
     state_flag: &AtomicBool,
-    mut on_pcm: P,
+    mut on_playback: P,
 ) where
-    P: FnMut(Vec<u8>) -> bool,
+    P: FnMut(PlaybackOp) -> bool,
 {
     let exit = 'outer: loop {
         // 1. CONTROL first — check once (non-blocking).  A stop wins immediately
-        //    over any queued PCM (P1-1).  Every `AudioControl` variant is a
-        //    terminal stop, so a single non-blocking check is sufficient: at most
-        //    one control message is ever acted on, and any later one is observed on
-        //    the next iteration's check.  (Empty falls through to the DATA recv.)
+        //    over any queued PCM (P1-1).  The stop variants are terminal, so at
+        //    most one of them is ever acted on and any later one is observed on
+        //    the next iteration's check.  `ClearPlayback` (koe-bx7) is the one
+        //    NON-terminal control: it is handled inline and the loop `continue`s
+        //    straight back to this check, so a stop queued behind a cut is
+        //    honoured before any further PCM.  (Empty falls through to DATA.)
         match ctrl_rx.try_recv() {
             Ok(AudioControl::FlushThenStop) => break 'outer LoopExit::FlushThenStop,
             Ok(AudioControl::StopNow) => break 'outer LoopExit::StopNow,
+            Ok(AudioControl::ClearPlayback) => {
+                // Barge-in cut: drop every PCM payload already queued on the
+                // DATA channel — it is stale audio of the interrupted response
+                // (the bridge suppresses NEW deltas until the next response, so
+                // nothing fresh is discarded here) — then clear + resume the
+                // sink.  Capture is untouched: the user is mid-sentence.
+                while let Ok(AudioCommand::EnqueuePcm(_)) = data_rx.try_recv() {}
+                if !on_playback(PlaybackOp::Clear) {
+                    break 'outer LoopExit::StopNow;
+                }
+                continue;
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => {} // no control pending → DATA
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 // All control senders dropped (process teardown / bridge drop).
@@ -946,7 +1123,7 @@ fn run_audio_command_loop<P>(
         // 2. DATA — block briefly for low latency, then loop back to re-check CONTROL.
         match data_rx.recv_timeout(AUDIO_DATA_RECV_TIMEOUT) {
             Ok(AudioCommand::EnqueuePcm(bytes)) => {
-                if !on_pcm(bytes) {
+                if !on_playback(PlaybackOp::Enqueue(bytes)) {
                     // Playback-queue overflow → fail-closed immediate stop.
                     break 'outer LoopExit::StopNow;
                 }
@@ -1204,15 +1381,28 @@ fn audio_thread_main(
     // ── Two-channel command loop + graceful tail flush (P1-1 / P1-3) ─────────
     // Extracted into `run_audio_command_loop` so the control-vs-PCM multiplexing
     // and the reliable tail delivery are unit-testable WITHOUT any cpal/rodio
-    // hardware.  `enqueue_pcm` (which owns the rodio `sink`) is injected as the
-    // PCM callback.
+    // hardware.  One playback closure handles both ops (it owns the rodio `sink`
+    // borrow + the queued-bytes accounting).
     run_audio_command_loop(
         &data_rx,
         &ctrl_rx,
         &accum,
         &write_tx,
         &state_flag,
-        |bytes: Vec<u8>| enqueue_pcm(bytes, &mut queued_bytes),
+        |op: PlaybackOp| match op {
+            PlaybackOp::Enqueue(bytes) => enqueue_pcm(bytes, &mut queued_bytes),
+            PlaybackOp::Clear => {
+                // Barge-in cut (koe-bx7).  rodio's `Sink::clear()` also PAUSES
+                // the sink, so `play()` must follow for the NEXT response's
+                // audio to be audible.  (The overflow path inside `enqueue_pcm`
+                // deliberately skips `play()` — it stops the whole session
+                // immediately afterwards.)
+                sink.clear();
+                sink.play();
+                queued_bytes = 0;
+                true
+            }
+        },
     );
     // The PCM-enqueue closure captured `&sink` by shared reference; its last use is
     // inside `run_audio_command_loop` above (NLL released the borrow), so teardown
@@ -1853,6 +2043,7 @@ mod tests {
                 // CONTROL first.
                 match ctrl_rx.try_recv() {
                     Ok(AudioControl::FlushThenStop) | Ok(AudioControl::StopNow) => break 'outer,
+                    Ok(AudioControl::ClearPlayback) => {} // non-terminal (koe-bx7)
                     Err(std::sync::mpsc::TryRecvError::Empty) => {} // no control → DATA
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
                 }
@@ -1939,6 +2130,7 @@ mod tests {
             'outer: loop {
                 match ctrl_rx.try_recv() {
                     Ok(AudioControl::FlushThenStop) | Ok(AudioControl::StopNow) => break 'outer,
+                    Ok(AudioControl::ClearPlayback) => {} // non-terminal (koe-bx7)
                     Err(std::sync::mpsc::TryRecvError::Empty) => {} // no control → DATA
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
                 }
@@ -2165,14 +2357,17 @@ mod tests {
 
         let mut flush_then_stop_count = 0usize;
         let mut stop_now_count = 0usize;
+        let mut clear_count = 0usize;
         while let Ok(ctrl) = ctrl_rx.try_recv() {
             match ctrl {
                 AudioControl::FlushThenStop => flush_then_stop_count += 1,
                 AudioControl::StopNow => stop_now_count += 1,
+                AudioControl::ClearPlayback => clear_count += 1,
             }
         }
         assert_eq!(flush_then_stop_count, 0, "(c2) stop() must NOT send FlushThenStop");
         assert_eq!(stop_now_count, 1, "(c2) stop() must send exactly one StopNow");
+        assert_eq!(clear_count, 0, "(c2) stop() must NOT send ClearPlayback");
     }
 
     /// (d) Capture callback stops emitting once `running=false` — purpose 1 of the
@@ -2235,8 +2430,10 @@ mod tests {
                 &accum,
                 &write_tx,
                 &state_flag,
-                |_bytes: Vec<u8>| {
-                    pcm_seen.store(true, Ordering::Release);
+                |op: PlaybackOp| {
+                    if matches!(op, PlaybackOp::Enqueue(_)) {
+                        pcm_seen.store(true, Ordering::Release);
+                    }
                     true // never overflow in these tests
                 },
             );
@@ -2461,6 +2658,7 @@ mod tests {
             match ctrl {
                 AudioControl::FlushThenStop => found_flush = true,
                 AudioControl::StopNow => found_stop_now = true,
+                AudioControl::ClearPlayback => {} // not part of the stop paths
             }
         }
         assert!(!found_flush, "stop_immediate must NOT enqueue FlushThenStop");
@@ -2487,9 +2685,193 @@ mod tests {
             match ctrl {
                 AudioControl::FlushThenStop => found_flush_then_stop = true,
                 AudioControl::StopNow => found_stop_now = true,
+                AudioControl::ClearPlayback => {} // not part of the stop paths
             }
         }
         assert!(found_flush_then_stop, "stop_graceful must enqueue FlushThenStop");
         assert!(!found_stop_now, "stop_graceful must NOT enqueue StopNow");
+    }
+
+    // ── Barge-in (koe-bx7): ClearPlayback + delta suppression ──────────────────
+
+    /// Drives the REAL `run_audio_command_loop` with a pre-loaded barge-in:
+    /// stale PCM already queued on DATA and a `ClearPlayback` on CONTROL.
+    /// Control-first ordering (P1-1) makes this deterministic: the cut must
+    /// (1) discard ALL stale DATA without enqueueing it, (2) perform exactly one
+    /// `Clear` op, (3) keep the loop ALIVE for the next response's audio, and
+    /// (4) still honour a later StopNow.
+    #[test]
+    fn clear_playback_cuts_stale_audio_and_keeps_loop_alive() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<AudioCommand>(8);
+            let (ctrl_tx, ctrl_rx) =
+                std::sync::mpsc::sync_channel::<AudioControl>(CONTROL_CHANNEL_CAP);
+            let accum = Arc::new(std::sync::Mutex::new(ChunkAccumulator::new()));
+            let (write_tx, _write_rx) = mpsc::channel::<Message>(8);
+            let state_flag = Arc::new(AtomicBool::new(true));
+
+            let ops: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ops_for_loop = Arc::clone(&ops);
+
+            // Pre-load: 3 stale PCM payloads (the interrupted response), THEN the
+            // barge-in cut on CONTROL. The loop checks CONTROL first, so the cut
+            // runs before any stale payload can be enqueued.
+            for _ in 0..3 {
+                data_tx
+                    .try_send(AudioCommand::EnqueuePcm(vec![0u8; 4]))
+                    .expect("pre-load PCM");
+            }
+            assert!(send_control_reliably(&ctrl_tx, AudioControl::ClearPlayback));
+
+            let accum_for_loop = Arc::clone(&accum);
+            let flag_for_loop = Arc::clone(&state_flag);
+            let handle = std::thread::spawn(move || {
+                run_audio_command_loop(
+                    &data_rx,
+                    &ctrl_rx,
+                    &accum_for_loop,
+                    &write_tx,
+                    &flag_for_loop,
+                    |op: PlaybackOp| {
+                        ops_for_loop.lock().unwrap().push(match op {
+                            PlaybackOp::Enqueue(_) => "enqueue".into(),
+                            PlaybackOp::Clear => "clear".into(),
+                        });
+                        true
+                    },
+                );
+            });
+
+            // Deadline-polled wait (no fixed sleep — loaded CI must not flake).
+            let wait_for_ops = |expected: usize| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    if ops.lock().unwrap().len() >= expected {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+
+            // The cut runs first (control-first, P1-1) — and because the drain
+            // happens BEFORE the Clear op inside the same control handling, once
+            // "clear" is visible the stale PCM is already gone for good.
+            wait_for_ops(1);
+            {
+                let seen = ops.lock().unwrap().clone();
+                assert_eq!(
+                    seen,
+                    vec!["clear".to_string()],
+                    "the cut must clear once and discard ALL stale PCM (got {seen:?})"
+                );
+            }
+
+            // The loop is still alive: fresh audio (the NEXT response) plays.
+            data_tx
+                .try_send(AudioCommand::EnqueuePcm(vec![1u8; 4]))
+                .expect("post-cut PCM");
+            wait_for_ops(2);
+            {
+                let seen = ops.lock().unwrap().clone();
+                assert_eq!(
+                    seen,
+                    vec!["clear".to_string(), "enqueue".to_string()],
+                    "ClearPlayback must NOT stop the loop — fresh PCM still enqueues"
+                );
+            }
+
+            // A stop queued after a cut is still honoured.
+            assert!(send_control_reliably(&ctrl_tx, AudioControl::StopNow));
+            assert!(
+                join_within(handle, 2),
+                "StopNow after ClearPlayback must still stop the loop"
+            );
+        });
+    }
+
+    /// `PlaybackHandle` barge-in gate (koe-bx7), full protocol walk:
+    /// speech_started closes the gate + cuts ONCE; a mid-speech
+    /// `response.created` (tool-completion follow-up) must NOT reopen it;
+    /// speech_stopped arms the release; the next `response.created` reopens.
+    #[test]
+    fn playback_gate_full_barge_in_protocol() {
+        let (handle, data_rx, ctrl_rx) = PlaybackHandle::new_for_test();
+
+        let delta = serde_json::json!({ "type": "response.audio.delta", "delta": "AAAA" });
+        let speech_started = serde_json::json!({ "type": "input_audio_buffer.speech_started" });
+        let speech_stopped = serde_json::json!({ "type": "input_audio_buffer.speech_stopped" });
+        let created = serde_json::json!({ "type": "response.created" });
+
+        // Normal playback before the barge-in.
+        handle.handle_server_audio(&delta);
+        assert!(
+            matches!(data_rx.try_recv(), Ok(AudioCommand::EnqueuePcm(_))),
+            "pre-barge-in delta must reach the DATA channel"
+        );
+
+        // The user starts speaking: exactly one ClearPlayback, stragglers dropped.
+        handle.handle_server_audio(&speech_started);
+        assert!(
+            matches!(ctrl_rx.try_recv(), Ok(AudioControl::ClearPlayback)),
+            "speech_started must send ClearPlayback on the CONTROL channel"
+        );
+        handle.handle_server_audio(&delta);
+        assert!(
+            data_rx.try_recv().is_err(),
+            "a straggler delta after speech_started must be suppressed"
+        );
+
+        // A VAD re-trigger while already speaking must NOT send a second cut
+        // (one cut per episode — flood-proof CONTROL occupancy).
+        handle.handle_server_audio(&speech_started);
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "a repeat speech_started must not send another ClearPlayback"
+        );
+
+        // A response created WHILE the user is still speaking (tool-completion
+        // follow-up, koe-z8j) must NOT reopen the gate: no talk-over.
+        handle.handle_server_audio(&created);
+        handle.handle_server_audio(&delta);
+        assert!(
+            data_rx.try_recv().is_err(),
+            "a mid-speech response.created must NOT lift the suppression"
+        );
+
+        // The user finishes; the NEXT response is the reply — it plays.
+        handle.handle_server_audio(&speech_stopped);
+        handle.handle_server_audio(&created);
+        handle.handle_server_audio(&delta);
+        assert!(
+            matches!(data_rx.try_recv(), Ok(AudioCommand::EnqueuePcm(_))),
+            "the reply's audio (created AFTER speech_stopped) must play"
+        );
+
+        // A fresh barge-in episode cuts again (the gate transition re-fires).
+        handle.handle_server_audio(&speech_started);
+        assert!(
+            matches!(ctrl_rx.try_recv(), Ok(AudioControl::ClearPlayback)),
+            "a new barge-in episode must send a new ClearPlayback"
+        );
+        assert!(ctrl_rx.try_recv().is_err(), "no further control expected");
+    }
+
+    /// A stray `speech_stopped` with no preceding `speech_started` must not
+    /// disturb an open gate (deltas keep flowing).
+    #[test]
+    fn playback_gate_ignores_stray_speech_stopped() {
+        let (handle, data_rx, _ctrl_rx) = PlaybackHandle::new_for_test();
+        handle.handle_server_audio(
+            &serde_json::json!({ "type": "input_audio_buffer.speech_stopped" }),
+        );
+        handle.handle_server_audio(
+            &serde_json::json!({ "type": "response.audio.delta", "delta": "AAAA" }),
+        );
+        assert!(
+            matches!(data_rx.try_recv(), Ok(AudioCommand::EnqueuePcm(_))),
+            "a stray speech_stopped must not close or arm the gate"
+        );
     }
 }

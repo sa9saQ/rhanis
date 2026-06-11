@@ -619,6 +619,10 @@ where
     // once per dropped frame — a sustained flood must not turn the fail-soft drop
     // into a stderr-backpressure DoS (koe-wj2 R-C / Codex).
     let mut cap_warned = false;
+    // Barge-in cancel fallback latch (koe-bx7): at most ONE parked background
+    // send per connection when the write channel is momentarily full — see
+    // handle_event's SpeechStarted arm.
+    let cancel_pending = Arc::new(AtomicBool::new(false));
     // Same latch discipline for journal-channel drops (koe-emd / CR): surface a
     // dropped conversation record once per episode without a per-drop flood.
     let mut journal_drop_warned = false;
@@ -713,9 +717,10 @@ where
                         };
                         audio_handler(&event);
                         match handle_text(
-                            &event, &provider, &write_tx, &cost, &recorder, &rec_tx,
-                            &dispatcher, &mut dispatch_tasks, &mut cap_warned,
-                            &mut journal_drop_warned, &emit_cost, &emit_thinking,
+                            &event, &provider, &cancel_pending, &write_tx, &cost,
+                            &recorder, &rec_tx, &dispatcher, &mut dispatch_tasks,
+                            &mut cap_warned, &mut journal_drop_warned, &emit_cost,
+                            &emit_thinking,
                         ).await {
                             LoopAction::Continue => {}
                             // Carry the terminal error reason out to finalize so it
@@ -899,7 +904,7 @@ async fn establish_connection(
     // is FATAL (a new socket will not restore a missing mic); abort the writer so the
     // just-opened WS is torn down promptly (no idle OpenAI session charging the
     // user's quota).
-    let (mic_running, stop_handle) = {
+    let (mic_running, stop_handle, playback) = {
         let mut bridge = audio.lock().await;
         let stop_handle = match bridge.start(write_tx.clone()) {
             Ok(h) => h,
@@ -908,18 +913,22 @@ async fn establish_connection(
                 return Err(ConnectError::Fatal("audio device unavailable"));
             }
         };
-        // Grab the running flag AFTER a successful start so the read loop polls the
-        // flag the cpal error_callback sets.
+        // Grab the running flag + playback handle AFTER a successful start so
+        // the read loop polls the flag the cpal error_callback sets and the
+        // handler drives THIS generation's channels/gate.
         let running = bridge.running_flag();
-        (running, stop_handle)
+        let playback = bridge.playback_handle();
+        (running, stop_handle, playback)
     };
 
-    // Audio playback handler: `try_lock` so a racing stop just skips one chunk rather
-    // than blocking the read loop (mirrors the pre-koe-byf inline closure).
-    let audio_for_handler = Arc::clone(&audio);
+    // Audio playback handler — LOCK-FREE via PlaybackHandle (koe-bx7). The old
+    // `try_lock` version skipped a frame under contention; that was fine when a
+    // miss cost one lossy PCM chunk, but the barge-in gate transitions
+    // (speech_started / speech_stopped / response.created) now ride this seam,
+    // and a missed transition would stick the gate for a whole turn.
     let audio_handler: Box<dyn Fn(&Value) + Send> = Box::new(move |event: &Value| {
-        if let Ok(bridge) = audio_for_handler.try_lock() {
-            bridge.handle_server_audio(event);
+        if let Some(p) = &playback {
+            p.handle_server_audio(event);
         }
     });
     let stop_audio: Box<dyn Fn(bool) + Send> = Box::new(move |graceful: bool| {
@@ -1380,6 +1389,7 @@ fn enqueue_record(
 async fn handle_text<EC, ET>(
     event: &Value,
     provider: &Arc<dyn RealtimeProvider>,
+    cancel_pending: &Arc<AtomicBool>,
     write_tx: &mpsc::Sender<Message>,
     cost: &Arc<TokioMutex<CostTracker>>,
     recorder: &Arc<dyn RecorderAdapter>,
@@ -1398,6 +1408,8 @@ where
     for ev in provider.parse_frame(event) {
         if let LoopAction::Stop(reason) = handle_event(
             ev,
+            provider,
+            cancel_pending,
             write_tx,
             cost,
             recorder,
@@ -1425,6 +1437,10 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn handle_event<EC, ET>(
     ev: ProviderEvent,
+    provider: &Arc<dyn RealtimeProvider>,
+    // Latch for the barge-in cancel's parked-fallback send (koe-bx7) — see the
+    // SpeechStarted arm. Per-connection (a run_read_loop local).
+    cancel_pending: &Arc<AtomicBool>,
     write_tx: &mpsc::Sender<Message>,
     cost: &Arc<TokioMutex<CostTracker>>,
     recorder: &Arc<dyn RecorderAdapter>,
@@ -1687,6 +1703,46 @@ where
                 },
                 journal_drop_warned,
             );
+            LoopAction::Continue
+        }
+        // Barge-in (koe-bx7): the user started speaking. The AUDIO half — cutting
+        // local playback + closing the delta gate — already happened when the
+        // read loop fed this same frame to `audio_handler` (which runs BEFORE the
+        // normalized dispatch, so the cut is not delayed behind this match). The
+        // PROTOCOL half is here: tell the server to stop generating the in-flight
+        // response.
+        //
+        // Delivery discipline (R-B + CR cross-finding): NOT `.send().await` —
+        // this is the read loop's own task, and an awaited send on a full write
+        // channel (writer stalled by a hostile / zero-window peer, channel
+        // filled by mic PCM) would freeze the WHOLE loop — budget gate, session
+        // timeout, shutdown — indefinitely. But NOT a bare lossy `try_send`
+        // either — the channel is legitimately full of mic PCM under load, and
+        // a silently dropped cancel leaves the server generating (and billing)
+        // a response the user already interrupted. So: fast-path `try_send`,
+        // and on `Full` park ONE latched background task that delivers the
+        // cancel when capacity frees (flood-capped: while one is parked, repeat
+        // speech-starts skip — the parked cancel already covers them; `Closed`
+        // means the connection is tearing down and the cancel is moot). The
+        // duplicate-cancel benign `error` reply stays Ignored by parse_frame —
+        // koe-nal must keep it classified benign.
+        ProviderEvent::SpeechStarted => {
+            if let Some(frame) = provider.cancel_frame() {
+                match write_tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(frame)) => {
+                        if !cancel_pending.swap(true, Ordering::AcqRel) {
+                            let tx = write_tx.clone();
+                            let pending = Arc::clone(cancel_pending);
+                            tokio::spawn(async move {
+                                let _ = tx.send(frame).await;
+                                pending.store(false, Ordering::Release);
+                            });
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            }
             LoopAction::Continue
         }
         // PR1: OpenAI's parse_frame never emits AudioDelta (the audio_handler seam
@@ -3298,6 +3354,7 @@ mod tests {
         handle_text(
             usage,
             provider,
+            &Arc::new(AtomicBool::new(false)),
             &write_tx,
             cost,
             recorder,
@@ -3569,6 +3626,7 @@ mod tests {
         let r1 = handle_text(
             &ten_dollars,
             &provider,
+            &Arc::new(AtomicBool::new(false)),
             &write_tx,
             &cost,
             &recorder,
@@ -3596,6 +3654,7 @@ mod tests {
         let r2 = handle_text(
             &ten_dollars,
             &provider,
+            &Arc::new(AtomicBool::new(false)),
             &write_tx,
             &cost,
             &recorder,
@@ -3661,6 +3720,7 @@ mod tests {
         let result = handle_text(
             &ten_dollars,
             &provider,
+            &Arc::new(AtomicBool::new(false)),
             &write_tx,
             &cost,
             &recorder,
@@ -4340,6 +4400,140 @@ mod tests {
         assert_eq!(calls[1], "response.done");
     }
 
+    /// Barge-in (koe-bx7), protocol half: a server `speech_started` frame makes
+    /// the loop send the provider's `response.cancel` on write_tx — exactly once
+    /// — and the same frame ALSO reaches `audio_handler` (the seam on which the
+    /// audio bridge cuts playback; that half is asserted in audio_bridge tests).
+    #[tokio::test]
+    async fn speech_started_sends_response_cancel_and_reaches_audio_handler() {
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, mut write_rx) = mpsc::channel::<Message>(8);
+        let (_sd, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        let audio_calls: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let audio_calls_clone = Arc::clone(&audio_calls);
+        let audio_handler = move |event: &serde_json::Value| {
+            if let Some(t) = event.get("type").and_then(serde_json::Value::as_str) {
+                audio_calls_clone.lock().unwrap().push(t.to_string());
+            }
+        };
+
+        let stream = futures_util::stream::iter(vec![Ok(Message::Text(
+            serde_json::json!({
+                "type": "input_audio_buffer.speech_started",
+                "audio_start_ms": 120,
+                "item_id": "item_7"
+            })
+            .to_string()
+            .into(),
+        ))]);
+        run_read_loop(
+            stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            audio_handler,
+            Arc::new(AtomicBool::new(true)), // mic always running in tests
+            |_| {}, // no-op stop_audio (no device in test)
+            None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
+        )
+        .await;
+
+        // Exactly one response.cancel went out on the WS write channel.
+        let Some(Message::Text(txt)) = write_rx.recv().await else {
+            panic!("expected a response.cancel frame on write_tx");
+        };
+        let v: serde_json::Value = serde_json::from_str(txt.as_str()).unwrap();
+        assert_eq!(v["type"], "response.cancel");
+        assert!(
+            write_rx.try_recv().is_err(),
+            "exactly ONE cancel per speech_started"
+        );
+
+        // The same frame reached the audio seam (where the bridge cuts playback).
+        assert_eq!(
+            audio_calls.lock().unwrap().as_slice(),
+            ["input_audio_buffer.speech_started"]
+        );
+    }
+
+    /// Barge-in cancel delivery when the write channel is FULL (koe-bx7, CR
+    /// finding): the cancel must not be silently dropped — a parked background
+    /// task delivers it once capacity frees — and the read loop itself must not
+    /// block (the loop finishes processing the stream regardless).
+    #[tokio::test]
+    async fn speech_started_cancel_survives_a_full_write_channel() {
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        // Capacity 1, pre-filled: the loop's fast-path try_send hits Full.
+        let (write_tx, mut write_rx) = mpsc::channel::<Message>(1);
+        write_tx
+            .try_send(Message::Text("occupies-the-only-slot".to_string().into()))
+            .expect("pre-fill");
+        let (_sd, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        let stream = futures_util::stream::iter(vec![Ok(Message::Text(
+            serde_json::json!({ "type": "input_audio_buffer.speech_started" })
+                .to_string()
+                .into(),
+        ))]);
+        run_read_loop(
+            stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {},
+            Arc::new(AtomicBool::new(true)), // mic always running in tests
+            |_| {}, // no-op stop_audio (no device in test)
+            None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
+        )
+        .await;
+
+        // The loop finished (it did not block on the full channel). Draining the
+        // pre-fill frees capacity; the parked task then delivers the cancel.
+        // Bounded recv so a delivery regression fails fast instead of hanging
+        // the suite (R-C finding).
+        const RECV_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+        let Ok(Some(Message::Text(first))) =
+            tokio::time::timeout(RECV_BOUND, write_rx.recv()).await
+        else {
+            panic!("expected the pre-filled frame");
+        };
+        assert_eq!(first.as_str(), "occupies-the-only-slot");
+        let Ok(Some(Message::Text(second))) =
+            tokio::time::timeout(RECV_BOUND, write_rx.recv()).await
+        else {
+            panic!("expected the parked response.cancel to be delivered within 2s");
+        };
+        let v: serde_json::Value = serde_json::from_str(second.as_str()).unwrap();
+        assert_eq!(v["type"], "response.cancel");
+    }
+
     /// Verifies that when the cpal error_callback fires (mic_running goes false),
     /// the read loop detects it via the interval poll, emits "mic device lost",
     /// and exits fail-closed without a trailing idle.
@@ -4766,6 +4960,7 @@ mod tests {
         let action = handle_text(
             frame,
             provider,
+            &Arc::new(AtomicBool::new(false)),
             &write_tx,
             cost,
             recorder,
