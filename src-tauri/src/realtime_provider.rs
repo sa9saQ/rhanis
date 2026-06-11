@@ -154,7 +154,7 @@ pub enum ProviderEvent {
     /// The user started speaking (OpenAI: `input_audio_buffer.speech_started`,
     /// server VAD) — the barge-in trigger (koe-bx7). Two reactions, two seams:
     /// the audio side (cut local playback + suppress stale deltas) happens in
-    /// [`AudioBridge::handle_server_audio`], which sees the same frame via the
+    /// [`PlaybackHandle::handle_server_audio`], which sees the same frame via the
     /// read loop's `audio_handler`; the protocol side — sending the provider's
     /// [`cancel_frame`] so the in-flight response stops generating server-side —
     /// is the session loop's job when it receives this event.
@@ -163,7 +163,7 @@ pub enum ProviderEvent {
     /// is a no-op on an empty sink, and a cancel without an active response is
     /// answered by a benign error frame (see [`cancel_frame`]).
     ///
-    /// [`AudioBridge::handle_server_audio`]: crate::audio_bridge::AudioBridge::handle_server_audio
+    /// [`PlaybackHandle::handle_server_audio`]: crate::audio_bridge::PlaybackHandle::handle_server_audio
     /// [`cancel_frame`]: RealtimeProvider::cancel_frame
     SpeechStarted,
     /// Streaming transcript delta / ack / blank transcript / unknown — the loop

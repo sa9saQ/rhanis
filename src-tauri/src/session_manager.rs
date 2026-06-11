@@ -52,6 +52,17 @@ use crate::tool_dispatcher::MAX_TOOL_NAME_LEN;
 /// Hard session cap (also a coarse cost backstop). Mirrors CLAUDE.md's 30 min.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const WRITE_CHANNEL_CAP: usize = 32;
+/// Freshness bound for the PARKED barge-in cancel (koe-bx7, Codex Cloud P2).
+/// The write channel is FIFO and can be full of mic PCM during the user's
+/// utterance; a cancel delivered after the backlog drains may arrive AFTER the
+/// server has already interrupted the old response and created the reply — and
+/// an unqualified `response.cancel` would then cancel the reply itself. So the
+/// parked send delivers within this bound or drops: past it the barge-in
+/// window has passed (server VAD interrupted the old response long ago), and a
+/// channel that stays full this long means a stalled writer / dying connection
+/// — the cost of the one uncancelled response stays bounded by the budget cap.
+/// The durable fix (active response_id tracking + targeted cancel) is koe-460.
+const CANCEL_PARK_BOUND: Duration = Duration::from_secs(1);
 /// Upper bound on concurrently in-flight tool dispatches (DoS guard, koe-wj2).
 ///
 /// A hostile / compromised model server could stream `function_call` frames for
@@ -1735,7 +1746,14 @@ where
                             let tx = write_tx.clone();
                             let pending = Arc::clone(cancel_pending);
                             tokio::spawn(async move {
-                                let _ = tx.send(frame).await;
+                                // Deliver within the freshness bound or DROP —
+                                // a stale cancel can kill the reply itself
+                                // (see CANCEL_PARK_BOUND).
+                                let _ = tokio::time::timeout(
+                                    CANCEL_PARK_BOUND,
+                                    tx.send(frame),
+                                )
+                                .await;
                                 pending.store(false, Ordering::Release);
                             });
                         }
@@ -4532,6 +4550,63 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(second.as_str()).unwrap();
         assert_eq!(v["type"], "response.cancel");
+    }
+
+    /// The parked cancel is FRESHNESS-BOUNDED (koe-bx7, Codex Cloud P2): if the
+    /// write channel stays full past CANCEL_PARK_BOUND, the parked cancel is
+    /// DROPPED — a late unqualified `response.cancel` could cancel the NEXT
+    /// response (the reply to the barge-in) instead of the interrupted one.
+    #[tokio::test]
+    async fn parked_cancel_is_dropped_once_stale() {
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, mut write_rx) = mpsc::channel::<Message>(1);
+        write_tx
+            .try_send(Message::Text("occupies-the-only-slot".to_string().into()))
+            .expect("pre-fill");
+        let (_sd, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        let stream = futures_util::stream::iter(vec![Ok(Message::Text(
+            serde_json::json!({ "type": "input_audio_buffer.speech_started" })
+                .to_string()
+                .into(),
+        ))]);
+        run_read_loop(
+            stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {},
+            Arc::new(AtomicBool::new(true)), // mic always running in tests
+            |_| {}, // no-op stop_audio (no device in test)
+            None, // no write task to abort in unit tests
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
+        )
+        .await;
+
+        // Hold the channel full PAST the freshness bound, THEN drain.
+        tokio::time::sleep(CANCEL_PARK_BOUND + Duration::from_millis(300)).await;
+        let Some(Message::Text(first)) = write_rx.recv().await else {
+            panic!("expected the pre-filled frame");
+        };
+        assert_eq!(first.as_str(), "occupies-the-only-slot");
+        // The parked task timed out and dropped its sender — with every sender
+        // gone the channel closes WITHOUT delivering a stale cancel.
+        assert!(
+            write_rx.recv().await.is_none(),
+            "a stale parked cancel (past CANCEL_PARK_BOUND) must be dropped, not delivered"
+        );
     }
 
     /// Verifies that when the cpal error_callback fires (mic_running goes false),
