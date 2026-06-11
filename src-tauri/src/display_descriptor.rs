@@ -8,11 +8,12 @@
 //!
 //! - path tools (`read_file` / `write_file` / `delete_file`): home-relative
 //!   path (`~/Documents/x.txt`) so the home prefix (and with it the OS
-//!   username) is never echoed; matching is lexical and component-wise, with
-//!   platform-aware separators — on Windows `/` and `\` both split (mixed
-//!   `C:/Users/…` or doubled (`//home/…`) separators still relativize), while
-//!   on Unix `\` is a regular filename character and never splits (folding it
-//!   would describe a different file than the one the filesystem touches).
+//!   username) is never echoed; matching is lexical and component-wise, and
+//!   doubled separators (`//home/…`) collapse on both platforms. Separators
+//!   are platform-aware — on Windows `/` and `\` both split (mixed
+//!   `C:/Users/…` spellings still relativize), while on Unix `\` is a regular
+//!   filename character and never splits (folding it would describe a
+//!   different file than the one the filesystem touches).
 //!   Outside the home dir only the last two components (`…/dir/file`). A `..`
 //!   component additionally appends an un-elidable `(parent traversal)` marker
 //!   — the tail/middle reductions could otherwise hide it, and a traversal
@@ -20,9 +21,9 @@
 //!   fail closed independently).
 //! - `run_command`: the first whitespace token only (the executable the
 //!   allow-list will judge), never the full argv (argv may carry secrets). A
-//!   separator-bearing first token (never run — the allow-list rejects it) is
-//!   displayed through the path rules above so an absolute token cannot leak
-//!   the username either.
+//!   first token bearing a separator under the platform's semantics (never
+//!   run — the allow-list rejects it) is displayed through the path rules
+//!   above so an absolute token cannot leak the username either.
 //! - `open_url` / `external_upload`: the host only, via the SAME parser the
 //!   permission policy matches against ([`crate::permission_policy::url_host`]):
 //!   IDN → punycode (anti-homograph), userinfo cannot spoof the host, and the
@@ -107,8 +108,10 @@ fn path_descriptor(raw: &str) -> Option<String> {
     path_descriptor_for(raw, cfg!(windows))
 }
 
-/// Pure core of [`path_descriptor`] (both platforms unit-testable from Linux
-/// CI). Separator semantics MUST follow the platform the tool will run on: on
+/// Platform-explicit core of [`path_descriptor`] (both separator branches
+/// unit-testable from Linux CI; NOT pure — the home prefix still comes from
+/// the real environment via [`home_relative`]). Separator semantics MUST
+/// follow the platform the tool will run on: on
 /// Unix `\` is a valid filename character, and folding it as a separator would
 /// let `/home/alice\x` display as `~/x` while the filesystem touches a
 /// root-level `/home` entry named `alice\x` — the modal would describe a
@@ -258,8 +261,9 @@ fn command_descriptor(raw: &str) -> Option<String> {
     command_descriptor_for(raw, cfg!(windows))
 }
 
-/// Pure core of [`command_descriptor`]: the separator probe (path-shaped vs
-/// plain token) follows the same platform semantics as the path rules.
+/// Platform-explicit core of [`command_descriptor`]: the separator probe
+/// (path-shaped vs plain token) follows the same platform semantics as the
+/// path rules.
 fn command_descriptor_for(raw: &str, windows: bool) -> Option<String> {
     let tok = raw.split_whitespace().next()?;
     let eq = tok.find('=');
@@ -415,6 +419,33 @@ mod tests {
         // A drive-lettered token is not absolute on Unix either — it is a
         // relative filename and must not enter the home/tail path rules.
         assert_eq!(home_relative_to(r"C:\Users\alice\x.txt", "/home/alice", false), None);
+        // The Windows verbatim namespace is NOT stripped under Unix semantics
+        // — the bytes are a (weird) filename and display as-is.
+        assert_eq!(path_descriptor_for(r"\\?\C:\x", false), Some(r"\\?\C:\x".to_string()));
+    }
+
+    #[test]
+    fn command_separator_probe_is_platform_aware() {
+        // Windows: the backslash makes the token path-shaped — the separator
+        // precedes the '=', so the path rules win over value masking.
+        assert_eq!(command_descriptor_for(r"C:\dir\x=y", true), Some("…/dir/x=y".to_string()));
+        // Unix: no '/' present, so the '='-mask branch applies.
+        assert_eq!(
+            command_descriptor_for(r"C:\dir\x=y", false),
+            Some(r"C:\dir\x=…".to_string())
+        );
+        // Unix: a backslash-only '='-free token is the literal filename the
+        // allow-list judges — shown verbatim (model-supplied; the allow-list
+        // rejects separator-bearing tokens on both platforms, so it never runs).
+        assert_eq!(
+            command_descriptor_for(r"C:\Users\alice\tool.exe", false),
+            Some(r"C:\Users\alice\tool.exe".to_string())
+        );
+        // Windows: the same token goes through the path rules instead.
+        assert_eq!(
+            command_descriptor_for(r"C:\Users\alice\tool.exe", true),
+            Some("…/alice/tool.exe".to_string())
+        );
     }
 
     // ---- home_relative_to: pure fixtures (incl. the Windows fold from Linux) ----
@@ -585,7 +616,7 @@ mod tests {
             match policy_target(tool, &args) {
                 PolicyTarget::Path(p) => {
                     let d = descriptor(tool, &args).expect("path descriptor");
-                    let base = p.rsplit(['/', '\\']).next().unwrap();
+                    let base = *components(p, cfg!(windows)).last().unwrap();
                     assert!(d.contains(base), "{tool}: {d} must derive from policy path {p}");
                     assert!(!d.contains("real-host"), "{tool}: {d} shows a decoy key");
                 }
