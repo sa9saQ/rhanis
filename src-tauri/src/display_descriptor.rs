@@ -8,8 +8,11 @@
 //!
 //! - path tools (`read_file` / `write_file` / `delete_file`): home-relative
 //!   path (`~/Documents/x.txt`) so the home prefix (and with it the OS
-//!   username) is never echoed; matching is lexical and component-wise, so
-//!   mixed (`C:/Users/…`) or doubled (`//home/…`) separators still relativize.
+//!   username) is never echoed; matching is lexical and component-wise, with
+//!   platform-aware separators — on Windows `/` and `\` both split (mixed
+//!   `C:/Users/…` or doubled (`//home/…`) separators still relativize), while
+//!   on Unix `\` is a regular filename character and never splits (folding it
+//!   would describe a different file than the one the filesystem touches).
 //!   Outside the home dir only the last two components (`…/dir/file`). A `..`
 //!   component additionally appends an un-elidable `(parent traversal)` marker
 //!   — the tail/middle reductions could otherwise hide it, and a traversal
@@ -101,10 +104,26 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// tail/middle reductions can drop a `..` segment, its presence is also
 /// surfaced as an explicit suffix marker that survives truncation (tail-kept).
 fn path_descriptor(raw: &str) -> Option<String> {
-    let raw = strip_verbatim(raw);
+    path_descriptor_for(raw, cfg!(windows))
+}
+
+/// Pure core of [`path_descriptor`] (both platforms unit-testable from Linux
+/// CI). Separator semantics MUST follow the platform the tool will run on: on
+/// Unix `\` is a valid filename character, and folding it as a separator would
+/// let `/home/alice\x` display as `~/x` while the filesystem touches a
+/// root-level `/home` entry named `alice\x` — the modal would describe a
+/// different target than the one being approved (Codex Cloud P2, PR #57).
+fn path_descriptor_for(raw: &str, windows: bool) -> Option<String> {
+    let raw = if windows {
+        // `\\?\` / `\\.\` are Windows-only namespaces; on Unix the same bytes
+        // are just a (weird) filename and must display as-is.
+        strip_verbatim(raw)
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
     let raw = raw.as_ref();
-    let body = home_relative(raw).or_else(|| tail_components(raw))?;
-    let has_traversal = raw.split(['/', '\\']).any(|c| c == "..");
+    let body = home_relative(raw, windows).or_else(|| tail_components(raw, windows))?;
+    let has_traversal = components(raw, windows).contains(&"..");
     Some(if has_traversal {
         format!("{body} (parent traversal)")
     } else {
@@ -112,31 +131,32 @@ fn path_descriptor(raw: &str) -> Option<String> {
     })
 }
 
-fn home_relative(raw: &str) -> Option<String> {
+fn home_relative(raw: &str, windows: bool) -> Option<String> {
     let home = dirs_next::home_dir()?;
-    home_relative_to(raw, &home.to_string_lossy(), cfg!(windows))
+    home_relative_to(raw, &home.to_string_lossy(), windows)
 }
 
 /// Pure core of [`home_relative`] (unit-testable with fixed fixtures,
-/// including the Windows case-fold branch from Linux CI). Component-wise
-/// lexical prefix match: separators may be `/` or `\`, duplicates collapse,
-/// and on Windows (`fold_ascii_case`) components compare case-insensitively.
-/// Both sides must be lexically absolute — otherwise a RELATIVE arg like
-/// `home/user/x` (which resolves against the CWD, not `/home/user`) could
-/// masquerade as `~/x`.
-fn home_relative_to(raw: &str, home: &str, fold_ascii_case: bool) -> Option<String> {
-    if !lexically_absolute(raw) || !lexically_absolute(home) {
+/// including the Windows branch from Linux CI). Component-wise lexical prefix
+/// match under the `windows` flag's platform semantics: on Windows separators
+/// may be `/` or `\` and components compare ASCII case-insensitively; on Unix
+/// only `/` separates and the comparison is exact. Duplicate separators
+/// collapse on both. Both sides must be lexically absolute — otherwise a
+/// RELATIVE arg like `home/user/x` (which resolves against the CWD, not
+/// `/home/user`) could masquerade as `~/x`.
+fn home_relative_to(raw: &str, home: &str, windows: bool) -> Option<String> {
+    if !lexically_absolute(raw, windows) || !lexically_absolute(home, windows) {
         return None;
     }
     let eq = |a: &str, b: &str| {
-        if fold_ascii_case {
+        if windows {
             a.eq_ignore_ascii_case(b)
         } else {
             a == b
         }
     };
-    let home_comps = components(home);
-    let raw_comps = components(raw);
+    let home_comps = components(home, windows);
+    let raw_comps = components(raw, windows);
     if home_comps.is_empty() || raw_comps.len() < home_comps.len() {
         return None;
     }
@@ -150,8 +170,18 @@ fn home_relative_to(raw: &str, home: &str, fold_ascii_case: bool) -> Option<Stri
     Some(format!("~/{}", rest.join("/")))
 }
 
-fn components(p: &str) -> Vec<&str> {
-    p.split(['/', '\\']).filter(|c| !c.is_empty()).collect()
+/// Path separators under the given platform semantics: `\` separates on
+/// Windows but is a regular filename character on Unix.
+fn separators(windows: bool) -> &'static [char] {
+    if windows {
+        &['/', '\\']
+    } else {
+        &['/']
+    }
+}
+
+fn components(p: &str, windows: bool) -> Vec<&str> {
+    p.split(separators(windows)).filter(|c| !c.is_empty()).collect()
 }
 
 /// Strips the Windows verbatim / device namespace prefix (`\\?\`, `\\.\`).
@@ -173,21 +203,26 @@ fn strip_verbatim(raw: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Lexically absolute: rooted (`/`, `\`) or drive-lettered (`C:`). Display
-/// classification only — never used for IO.
-fn lexically_absolute(p: &str) -> bool {
+/// Lexically absolute: `/`-rooted on every platform; on Windows also a `\`
+/// root or a drive letter (`C:`) — neither of which roots a Unix path.
+/// Display classification only — never used for IO.
+fn lexically_absolute(p: &str, windows: bool) -> bool {
+    if p.starts_with('/') {
+        return true;
+    }
+    if !windows {
+        return false;
+    }
     let b = p.as_bytes();
-    p.starts_with('/')
-        || p.starts_with('\\')
-        || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+    p.starts_with('\\') || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
 }
 
 /// Last two path components prefixed with `…/` (or the bare name for a
 /// separator-free relative arg). Enough for the human to recognise WHAT is
 /// touched without echoing the full absolute path.
-fn tail_components(raw: &str) -> Option<String> {
-    let comps = components(raw);
-    let had_separator = raw.contains(['/', '\\']);
+fn tail_components(raw: &str, windows: bool) -> Option<String> {
+    let comps = components(raw, windows);
+    let had_separator = raw.contains(separators(windows));
     match comps.as_slice() {
         [] => None,
         [only] if !had_separator => Some((*only).to_string()),
@@ -220,9 +255,15 @@ fn host_descriptor(raw: &str) -> Option<String> {
 /// `--opt=value` first token can carry a secret the model is trying to surface
 /// (R-C finding).
 fn command_descriptor(raw: &str) -> Option<String> {
+    command_descriptor_for(raw, cfg!(windows))
+}
+
+/// Pure core of [`command_descriptor`]: the separator probe (path-shaped vs
+/// plain token) follows the same platform semantics as the path rules.
+fn command_descriptor_for(raw: &str, windows: bool) -> Option<String> {
     let tok = raw.split_whitespace().next()?;
     let eq = tok.find('=');
-    let sep = tok.find(['/', '\\']);
+    let sep = tok.find(separators(windows));
     match (eq, sep) {
         // The first '=' precedes any separator (NAME=value, --opt=value,
         // --path=/home/…): everything after '=' is a VALUE — it may carry a
@@ -231,7 +272,7 @@ fn command_descriptor(raw: &str) -> Option<String> {
         (Some(e), Some(s)) if e < s => Some(format!("{}=…", &tok[..e])),
         (Some(e), None) => Some(format!("{}=…", &tok[..e])),
         // Separator first (/tmp/a=b/cmd): a path-shaped token → path rules.
-        (_, Some(_)) => path_descriptor(tok),
+        (_, Some(_)) => path_descriptor_for(tok, windows),
         (None, None) => Some(tok.to_string()),
     }
 }
@@ -343,8 +384,37 @@ mod tests {
 
     #[test]
     fn windows_style_path_splits_on_backslash() {
-        let s = run_summary("write_file", &json!({ "path": r"D:\work\proj\out.txt" }));
-        assert_eq!(s, "run write_file: …/proj/out.txt");
+        // Windows semantics via the explicit flag (runnable from Linux CI).
+        assert_eq!(
+            path_descriptor_for(r"D:\work\proj\out.txt", true),
+            Some("…/proj/out.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn unix_backslash_is_a_filename_char_not_a_separator() {
+        // On Unix `\` does not separate: /home/alice\Documents\report.txt is
+        // a ROOT-LEVEL /home entry named "alice\Documents\report.txt" — shown
+        // as ~/Documents/report.txt it would describe a different file than
+        // the one the filesystem touches (Codex Cloud P2, PR #57).
+        assert_eq!(
+            home_relative_to(r"/home/alice\Documents\report.txt", "/home/alice", false),
+            None
+        );
+        assert_eq!(
+            path_descriptor_for(r"/home/alice\Documents\report.txt", false),
+            Some(r"…/home/alice\Documents\report.txt".to_string())
+        );
+        // `\..\` is NOT a traversal under Unix semantics (the `..` sits inside
+        // a filename) — no false traversal flag…
+        assert_eq!(path_descriptor_for(r"/tmp/a\..\x", false), Some(r"…/tmp/a\..\x".to_string()));
+        // …while the same spelling under Windows semantics IS one.
+        assert!(path_descriptor_for(r"C:\tmp\a\..\x", true)
+            .expect("descriptor")
+            .contains("(parent traversal)"));
+        // A drive-lettered token is not absolute on Unix either — it is a
+        // relative filename and must not enter the home/tail path rules.
+        assert_eq!(home_relative_to(r"C:\Users\alice\x.txt", "/home/alice", false), None);
     }
 
     // ---- home_relative_to: pure fixtures (incl. the Windows fold from Linux) ----
