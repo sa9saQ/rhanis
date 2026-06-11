@@ -102,6 +102,7 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// surfaced as an explicit suffix marker that survives truncation (tail-kept).
 fn path_descriptor(raw: &str) -> Option<String> {
     let raw = strip_verbatim(raw);
+    let raw = raw.as_ref();
     let body = home_relative(raw).or_else(|| tail_components(raw))?;
     let has_traversal = raw.split(['/', '\\']).any(|c| c == "..");
     Some(if has_traversal {
@@ -156,10 +157,20 @@ fn components(p: &str) -> Vec<&str> {
 /// Strips the Windows verbatim / device namespace prefix (`\\?\`, `\\.\`).
 /// Left in place it would defeat the home match (first component `?` / `.`)
 /// and leak the username through the tail fallback for a file in the home root.
-fn strip_verbatim(raw: &str) -> &str {
-    raw.strip_prefix(r"\\?\")
-        .or_else(|| raw.strip_prefix(r"\\.\"))
-        .unwrap_or(raw)
+/// The verbatim UNC form (`\\?\UNC\server\share\…`) is normalized back to
+/// `\\server\share\…` so a UNC home (roaming profile) can still relativize.
+fn strip_verbatim(raw: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if let Some(rest) = raw
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| raw.strip_prefix(r"\\.\UNC\"))
+    {
+        return Cow::Owned(format!(r"\\{rest}"));
+    }
+    match raw.strip_prefix(r"\\?\").or_else(|| raw.strip_prefix(r"\\.\")) {
+        Some(rest) => Cow::Borrowed(rest),
+        None => Cow::Borrowed(raw),
+    }
 }
 
 /// Lexically absolute: rooted (`/`, `\`) or drive-lettered (`C:`). Display
@@ -204,13 +215,25 @@ fn host_descriptor(raw: &str) -> Option<String> {
 /// of the argv NEVER appears (it can carry tokens/keys as arguments). A token
 /// with a path separator is never executed (the allow-list rejects it) but it
 /// is still shown — through the path rules, so an absolute first token cannot
-/// leak the home prefix / username into the modal.
+/// leak the home prefix / username into the modal. An `=`-bearing token has
+/// its value side masked (`KEY=…`): a `NAME=value` env assignment or
+/// `--opt=value` first token can carry a secret the model is trying to surface
+/// (R-C finding).
 fn command_descriptor(raw: &str) -> Option<String> {
     let tok = raw.split_whitespace().next()?;
-    if tok.contains(['/', '\\']) {
-        return path_descriptor(tok);
+    let eq = tok.find('=');
+    let sep = tok.find(['/', '\\']);
+    match (eq, sep) {
+        // The first '=' precedes any separator (NAME=value, --opt=value,
+        // --path=/home/…): everything after '=' is a VALUE — it may carry a
+        // secret or a username-bearing path — so it is always masked, never
+        // path-displayed ('=' is ASCII, so the byte slice is char-safe).
+        (Some(e), Some(s)) if e < s => Some(format!("{}=…", &tok[..e])),
+        (Some(e), None) => Some(format!("{}=…", &tok[..e])),
+        // Separator first (/tmp/a=b/cmd): a path-shaped token → path rules.
+        (_, Some(_)) => path_descriptor(tok),
+        (None, None) => Some(tok.to_string()),
     }
-    Some(tok.to_string())
 }
 
 // ---- display hygiene ----------------------------------------------------------
@@ -232,14 +255,20 @@ fn is_display_hostile(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            // soft hyphen | Arabic letter mark | Hangul fillers | Mongolian VS
-            '\u{00AD}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{180E}'
+            // combining grapheme joiner | soft hyphen | Arabic letter mark
+            '\u{034F}' | '\u{00AD}' | '\u{061C}'
+            // Hangul fillers (conjoining + compat + halfwidth)
+            | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
+            // Mongolian variation selectors + vowel separator
+            | '\u{180B}'..='\u{180E}'
             // zero-width + bidi marks | bidi embedding/override | line/para sep
             | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2028}' | '\u{2029}'
-            // bidi isolates | word joiner + invisible operators | Hangul filler
-            | '\u{2066}'..='\u{2069}' | '\u{2060}'..='\u{2064}' | '\u{3164}'
-            // variation selectors | BOM/ZWNBSP | interlinear | tag block
-            | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+            // word joiner + invisible operators | bidi isolates | deprecated format
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{206A}'..='\u{206F}'
+            // variation selectors (BMP + supplement) | BOM/ZWNBSP | interlinear
+            | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}' | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            // tag block (invisible "ASCII smuggling")
             | '\u{E0000}'..='\u{E007F}'
         )
 }
@@ -358,9 +387,24 @@ mod tests {
         assert_eq!(strip_verbatim(r"\\?\C:\Users\Alice\f.txt"), r"C:\Users\Alice\f.txt");
         assert_eq!(strip_verbatim(r"\\.\C:\x"), r"C:\x");
         assert_eq!(strip_verbatim("/home/user/x"), "/home/user/x");
+        // Verbatim UNC normalizes back to plain UNC (R-C finding).
+        assert_eq!(strip_verbatim(r"\\?\UNC\srv\share\x"), r"\\srv\share\x");
         // The stripped form home-relativizes (the un-stripped one would not).
         assert_eq!(
-            home_relative_to(strip_verbatim(r"\\?\C:\Users\Alice\f.txt"), r"C:\Users\Alice", true),
+            home_relative_to(
+                strip_verbatim(r"\\?\C:\Users\Alice\f.txt").as_ref(),
+                r"C:\Users\Alice",
+                true
+            ),
+            Some("~/f.txt".to_string())
+        );
+        // A UNC home (roaming profile) relativizes through the normalization.
+        assert_eq!(
+            home_relative_to(
+                strip_verbatim(r"\\?\UNC\srv\share\Users\Alice\f.txt").as_ref(),
+                r"\\srv\share\Users\Alice",
+                true
+            ),
             Some("~/f.txt".to_string())
         );
     }
@@ -410,6 +454,31 @@ mod tests {
     fn command_shows_first_token_only() {
         let s = run_summary("run_command", &json!({ "command": "ls -la /home/user/.ssh" }));
         assert_eq!(s, "run run_command: ls");
+    }
+
+    #[test]
+    fn command_env_assignment_value_is_masked() {
+        // `NAME=value` first token: the value side may be a secret (R-C HIGH).
+        let s = run_summary(
+            "run_command",
+            &json!({ "command": "OPENAI_API_KEY=sk-secret-123 ls -la" }),
+        );
+        assert_eq!(s, "run run_command: OPENAI_API_KEY=…");
+        // option=value form is masked too.
+        let s2 = run_summary("run_command", &json!({ "command": "--password=hunter2" }));
+        assert_eq!(s2, "run run_command: --password=…");
+        // env assignment whose value is a path must not fall into path display.
+        let s3 = run_summary("run_command", &json!({ "command": "FOO=/usr/bin/x ls" }));
+        assert_eq!(s3, "run run_command: FOO=…");
+        // any '='-before-separator token is masked, even non-env forms whose
+        // value embeds a path (R-C round 2: --path=/home/user/secret).
+        let s4 = run_summary("run_command", &json!({ "command": "--path=/home/user/secret ls" }));
+        assert_eq!(s4, "run run_command: --path=…");
+        let s5 = run_summary("run_command", &json!({ "command": "--token=abc/def" }));
+        assert_eq!(s5, "run run_command: --token=…");
+        // …but a path merely containing '=' (separator first) gets the path rules.
+        let s6 = run_summary("run_command", &json!({ "command": "/tmp/a=b/cmd x" }));
+        assert_eq!(s6, "run run_command: …/a=b/cmd");
     }
 
     #[test]
@@ -504,6 +573,13 @@ mod tests {
             &json!({ "name": "a\u{2060}b\u{00AD}c\u{E0041}d\u{FE0F}" }),
         );
         assert_eq!(s, "run open_app: a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}");
+        // R-C round 2 additions: CGJ / Mongolian VS / deprecated format /
+        // VS supplement / halfwidth Hangul filler.
+        let s2 = run_summary(
+            "open_app",
+            &json!({ "name": "v\u{034F}w\u{180B}x\u{206A}y\u{E0100}z\u{FFA0}" }),
+        );
+        assert_eq!(s2, "run open_app: v\u{FFFD}w\u{FFFD}x\u{FFFD}y\u{FFFD}z\u{FFFD}");
     }
 
     #[test]
