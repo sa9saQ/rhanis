@@ -680,10 +680,14 @@ fn mask_key_material(s: &str) -> String {
                     continue;
                 }
             }
-            // Google API key (koe-31u multi-provider).
+            // Google API key (koe-31u multi-provider). Same 4-char threshold
+            // rationale as `sk-`: the prefix is distinctive, and a
+            // provider-redacted fragment ("AIza...WXYZ") is still key material
+            // (Codex R-C round 3 — threshold 30 left the redacted tail
+            // unmasked).
             if let Some(after) = match_prefix(&chars, i, "AIza", false) {
                 let (j, counted) = consume_body(after, true);
-                if counted >= 30 {
+                if counted >= 4 {
                     out.push_str("AIza***");
                     i = j;
                     continue;
@@ -1169,15 +1173,18 @@ mod tests {
     fn parse_frame_server_error_masks_provider_redacted_fragment() {
         // Codex P2 (PR #61): a provider-redacted fragment ("sk-...abcd") is
         // still key material — the un-hidden tail must not reach the WebView.
+        // Same policy for Google keys ("AIza...WXYZ", Codex R-C round 3).
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({
             "type": "error",
-            "error": { "message": "Incorrect API key provided: sk-...WXYZ" }
+            "error": { "message": "Incorrect API key provided: sk-...WXYZ (google: AIza...QRST)" }
         });
         match p.parse_frame(&ev).as_slice() {
             [ProviderEvent::ServerError { message, .. }] => {
                 assert!(!message.contains("WXYZ"), "redacted tail must be masked: {message:?}");
                 assert!(message.contains("sk-***"), "mask marker expected: {message:?}");
+                assert!(!message.contains("QRST"), "AIza redacted tail must be masked: {message:?}");
+                assert!(message.contains("AIza***"), "AIza mask marker expected: {message:?}");
             }
             _ => panic!("expected exactly one ServerError"),
         }
