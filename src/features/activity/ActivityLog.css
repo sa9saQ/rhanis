@@ -279,6 +279,15 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.koe-log-detail {
+  color: var(--muted);
+  font-size: 12px;
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 14em;
+}
 
 @keyframes koe-spin {
   to {
