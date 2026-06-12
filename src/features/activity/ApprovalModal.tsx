@@ -183,7 +183,13 @@ export function ApprovalModal() {
           </span>
         </div>
 
-        <p className="koe-approval-summary">{current.displaySummary}</p>
+        {/* displaySummary carries a model-influenced target descriptor
+            (koe-whf) — monospace marks it as DATA, not UI chrome, so an
+            instruction-like filename ("safe-click-approve.txt") reads as a
+            filename, never as the app speaking. */}
+        <p className="koe-approval-summary">
+          <code>{current.displaySummary}</code>
+        </p>
 
         {ipcError && (
           <p className="koe-approval-error" role="alert">

@@ -17,10 +17,12 @@
 //! the whole flow is unit-testable in WSL without a live Tauri handle or socket.
 //! Production wires [`AppDispatchIo`] (real `AppHandle` + `ApprovalGate`).
 //!
-//! Redaction: `displaySummary`/`detail` are tool-name-derived fixed strings —
-//! the args and tool output never appear there (no key/path/PII). Tool output is
-//! hard-capped ([`MAX_TOOL_OUTPUT_LEN`]) as defense-in-depth on top of each
-//! tool's own redaction.
+//! Redaction: `displaySummary` is `run {tool}` plus a SAFE target descriptor
+//! (home-relative path / first command token / URL host — koe-whf, see
+//! [`crate::display_descriptor`]); raw args and tool output never appear there
+//! (no key / full absolute path / PII). Tool output is hard-capped
+//! ([`MAX_TOOL_OUTPUT_LEN`]) as defense-in-depth on top of each tool's own
+//! redaction.
 //!
 //! transaction N/A · idempotency_key N/A (in-process tool routing, not billing).
 
@@ -39,6 +41,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::approval_gate::{classify, ApprovalGate, ApprovalOutcome, ApprovalRisk};
+use crate::display_descriptor::run_summary;
 use crate::events::SequenceCounter;
 use crate::permission_policy::{decide, PolicyDecision, PolicyProvider};
 use crate::realtime_types::{
@@ -254,18 +257,26 @@ async fn dispatch_impl(
     }
     let risk = classify(&name);
 
+    // One safe, human-meaningful summary per call (koe-whf): the SAME string is
+    // shown in every phase event AND the approval modal, and it derives from the
+    // SAME parsed `args` the policy and the tool consume (no display/exec skew).
+    // Computing it before the args-size check below is safe: production frames
+    // are already bounded upstream (parse_frame caps args_raw), derivation is
+    // one O(n) scan, and the descriptor itself is capped to ~96 chars.
+    let summary = run_summary(&name, &args);
+
     // (2) phase=start. CAUTION rides a non-blocking note here; it never waits.
     let start_detail = match risk {
         ApprovalRisk::Caution => Some("caution: notified, running without approval".to_string()),
         _ => None,
     };
-    io.emit_tool_event(make_event(&seq, &name, &call_id, "start", start_summary(&name), start_detail));
+    io.emit_tool_event(make_event(&seq, &name, &call_id, "start", summary.clone(), start_detail));
 
     // (3) run_command shell DENY_LIST — before the gate, before execution.
     if name == "run_command" && command_is_denied(&args) {
         io.emit_tool_event(make_event(
             &seq, &name, &call_id, "error",
-            start_summary(&name), Some("blocked by security policy".to_string()),
+            summary.clone(), Some("blocked by security policy".to_string()),
         ));
         return function_call_output(&call_id, error_output("command blocked by security policy"));
     }
@@ -274,7 +285,7 @@ async fn dispatch_impl(
     if args_too_large(&args) {
         io.emit_tool_event(make_event(
             &seq, &name, &call_id, "error",
-            start_summary(&name), Some("arguments too large".to_string()),
+            summary.clone(), Some("arguments too large".to_string()),
         ));
         return function_call_output(&call_id, error_output("arguments too large"));
     }
@@ -295,15 +306,16 @@ async fn dispatch_impl(
     if must_gate {
         // The approval-required event is always DANGER-tier: requiring confirmation
         // IS the danger UX, and the frontend `ApprovalRisk` union only carries
-        // CAUTION/DANGER (never SAFE). The redacted summary never includes the
-        // path/url. A decline blocks the tool (fail-closed).
+        // CAUTION/DANGER (never SAFE). The summary carries only the safe target
+        // descriptor (home-relative path / first token / host — koe-whf), never
+        // the raw args. A decline blocks the tool (fail-closed).
         let outcome = io
-            .request_approval(name.clone(), ApprovalRisk::Danger, start_summary(&name))
+            .request_approval(name.clone(), ApprovalRisk::Danger, summary.clone())
             .await;
         if outcome == ApprovalOutcome::Declined {
             io.emit_tool_event(make_event(
                 &seq, &name, &call_id, "error",
-                start_summary(&name), Some("declined by operator".to_string()),
+                summary.clone(), Some("declined by operator".to_string()),
             ));
             return function_call_output(&call_id, error_output("user declined"));
         }
@@ -317,7 +329,7 @@ async fn dispatch_impl(
     if name == "run_command" && !crate::tools::command_is_allowed(&args) {
         io.emit_tool_event(make_event(
             &seq, &name, &call_id, "error",
-            start_summary(&name), Some("command not in allow list".to_string()),
+            summary.clone(), Some("command not in allow list".to_string()),
         ));
         return function_call_output(&call_id, error_output("command not permitted"));
     }
@@ -332,7 +344,7 @@ async fn dispatch_impl(
     match result {
         Ok(output) => {
             let output = cap_output(output);
-            io.emit_tool_event(make_event(&seq, &name, &call_id, "done", start_summary(&name), None));
+            io.emit_tool_event(make_event(&seq, &name, &call_id, "done", summary.clone(), None));
             function_call_output(&call_id, output)
         }
         Err(_err) => {
@@ -340,7 +352,7 @@ async fn dispatch_impl(
             // path/PII); a fixed message goes to both the UI and the model.
             io.emit_tool_event(make_event(
                 &seq, &name, &call_id, "error",
-                start_summary(&name), Some("tool failed".to_string()),
+                summary.clone(), Some("tool failed".to_string()),
             ));
             function_call_output(&call_id, error_output("tool execution failed"))
         }
@@ -368,12 +380,6 @@ fn make_event(
         detail,
         progress: None,
     }
-}
-
-/// Redacted, fixed summary for the UI — derived only from the (trusted) tool
-/// name. Never includes args, paths, keys, or output.
-fn start_summary(tool: &str) -> String {
-    format!("run {tool}")
 }
 
 /// Wraps a fixed error phrase as the JSON string `output` the Realtime API wants.
@@ -463,20 +469,29 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Records emitted events and returns a fixed approval outcome.
+    /// Records emitted events + approval-request summaries and returns a fixed
+    /// approval outcome.
     struct MockIo {
         events: Mutex<Vec<ToolEvent>>,
+        approvals: Mutex<Vec<String>>,
         approval: ApprovalOutcome,
     }
     impl MockIo {
         fn new(approval: ApprovalOutcome) -> Arc<Self> {
-            Arc::new(Self { events: Mutex::new(Vec::new()), approval })
+            Arc::new(Self {
+                events: Mutex::new(Vec::new()),
+                approvals: Mutex::new(Vec::new()),
+                approval,
+            })
         }
         fn phases(&self) -> Vec<String> {
             self.events.lock().unwrap().iter().map(|e| e.phase.clone()).collect()
         }
         fn summaries(&self) -> Vec<String> {
             self.events.lock().unwrap().iter().map(|e| e.display_summary.clone()).collect()
+        }
+        fn approval_summaries(&self) -> Vec<String> {
+            self.approvals.lock().unwrap().clone()
         }
     }
     impl DispatchIo for MockIo {
@@ -487,8 +502,9 @@ mod tests {
             &self,
             _tool: String,
             _risk: ApprovalRisk,
-            _summary: String,
+            summary: String,
         ) -> BoxFuture<'static, ApprovalOutcome> {
+            self.approvals.lock().unwrap().push(summary);
             let outcome = self.approval;
             Box::pin(async move { outcome })
         }
@@ -656,6 +672,78 @@ mod tests {
         assert_eq!(io.phases(), vec!["start", "error"]);
         let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
         assert!(out.contains("too large"));
+    }
+
+    // ---- koe-whf: safe target descriptors in the gate + the log ----
+
+    #[tokio::test]
+    async fn approval_summary_shows_home_relative_target() {
+        let io = MockIo::new(ApprovalOutcome::Approved);
+        let home = dirs_next::home_dir().expect("test env has a home dir");
+        let p = home.join("Documents").join("report.txt");
+        let _ = run(
+            &io,
+            Arc::new(ToolRegistry::new()),
+            call("delete_file", serde_json::json!({ "path": p.to_string_lossy() })),
+        )
+        .await;
+        let approvals = io.approval_summaries();
+        assert_eq!(approvals.len(), 1, "DANGER must gate exactly once");
+        assert!(approvals[0].contains("report.txt"), "{}", approvals[0]);
+        assert!(approvals[0].contains('~'), "{}", approvals[0]);
+        let home_s = home.to_string_lossy().to_string();
+        assert!(
+            !approvals[0].contains(&home_s),
+            "modal must not echo the raw home prefix: {}",
+            approvals[0]
+        );
+        // The phase events tell the SAME story as the modal.
+        for s in io.summaries() {
+            assert!(s.contains("report.txt"), "{s}");
+            assert!(!s.contains(&home_s), "{s}");
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_summary_shows_command_first_token_only() {
+        let io = MockIo::new(ApprovalOutcome::Approved);
+        let _ = run(
+            &io,
+            Arc::new(ToolRegistry::new()),
+            call("run_command", serde_json::json!({ "command": "ls -la /home/user/secret-dir" })),
+        )
+        .await;
+        let approvals = io.approval_summaries();
+        assert_eq!(approvals.len(), 1);
+        assert!(approvals[0].contains("ls"), "{}", approvals[0]);
+        assert!(
+            !approvals[0].contains("secret-dir"),
+            "argv beyond the first token must not leak: {}",
+            approvals[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn url_summary_shows_host_only() {
+        // Empty policy → strict URL default → open_url is gated; Approved → runs.
+        let io = MockIo::new(ApprovalOutcome::Approved);
+        let _ = run(
+            &io,
+            Arc::new(ToolRegistry::new()),
+            call(
+                "open_url",
+                serde_json::json!({ "url": "https://user:tok-123@site.example/cb?key=apikey" }),
+            ),
+        )
+        .await;
+        let approvals = io.approval_summaries();
+        assert_eq!(approvals.len(), 1);
+        assert!(approvals[0].contains("site.example"), "{}", approvals[0]);
+        for s in io.summaries().iter().chain(approvals.iter()) {
+            assert!(!s.contains("apikey"), "query must not leak: {s}");
+            assert!(!s.contains("tok-123"), "userinfo must not leak: {s}");
+            assert!(!s.contains("/cb"), "path must not leak: {s}");
+        }
     }
 
     #[tokio::test]

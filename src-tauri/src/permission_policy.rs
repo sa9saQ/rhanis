@@ -123,7 +123,11 @@ pub trait PolicyProvider: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// What the policy reasons about for a given tool call.
-enum PolicyTarget<'a> {
+///
+/// `pub(crate)`: display_descriptor's parity test (koe-whf) locks its tool →
+/// arg-key map to this one, so the modal can never show a different string
+/// than the policy judges.
+pub(crate) enum PolicyTarget<'a> {
     /// A filesystem path the folder allow/deny lists apply to.
     Path(&'a str),
     /// A URL the host allow/deny lists apply to.
@@ -141,7 +145,7 @@ enum PolicyTarget<'a> {
 ///   gate. The most dangerous send path must stay human-confirmed.
 /// - `run_command` is governed by its own shell DENY/ALLOW list + the DANGER gate
 ///   (unchanged by this layer), so it is not a folder/url target.
-fn policy_target<'a>(tool: &str, args: &'a Value) -> PolicyTarget<'a> {
+pub(crate) fn policy_target<'a>(tool: &str, args: &'a Value) -> PolicyTarget<'a> {
     match tool {
         "read_file" | "write_file" | "delete_file" => match args.get("path").and_then(Value::as_str)
         {
@@ -302,7 +306,10 @@ fn evaluate_url(policy: &PermissionPolicy, raw: &str) -> PolicyDecision {
 /// crate applies IDNA (so an IDN host is punycode/ASCII) and parses the authority
 /// correctly, so `https://openai.com@evil.com/` yields host `evil.com` (the
 /// userinfo cannot spoof the host).
-fn url_host(raw: &str) -> Option<Host<String>> {
+///
+/// `pub(crate)`: display_descriptor (koe-whf) derives the human-shown host
+/// through this SAME parser, so the modal displays exactly what the policy judges.
+pub(crate) fn url_host(raw: &str) -> Option<Host<String>> {
     let u = Url::parse(raw).ok()?;
     match u.scheme() {
         "http" | "https" => {}

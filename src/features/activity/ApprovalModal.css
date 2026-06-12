@@ -67,6 +67,14 @@
   color: var(--text);
 }
 
+/* The summary is model-influenced data (a target descriptor, koe-whf): render
+   it as code so persuasive text inside a filename cannot pass as UI chrome. */
+.koe-approval-summary code {
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+
 .koe-approval-error {
   margin: 0 0 14px;
   font-size: 13px;

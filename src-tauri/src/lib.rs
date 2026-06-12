@@ -1,6 +1,7 @@
 mod approval_gate;
 mod audio_bridge;
 mod cost_tracker;
+mod display_descriptor;
 mod events;
 mod permission_policy;
 mod realtime_provider;
