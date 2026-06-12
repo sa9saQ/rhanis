@@ -238,7 +238,8 @@ struct Connection {
     /// Stops this connection's audio bridge: `true` = graceful (flush tail),
     /// `false` = immediate (discard tail).
     stop_audio: Box<dyn Fn(bool) + Send>,
-    /// Intercepts server `response.audio.delta` frames for playback.
+    /// Intercepts server audio-delta frames (GA/beta wire names, see
+    /// `audio_bridge::is_audio_delta_type`) for playback.
     audio_handler: Box<dyn Fn(&Value) + Send>,
     /// Abort handle for this connection's write task (aborted on abnormal exit so
     /// queued PCM is not flushed after the decision to stop).
@@ -569,7 +570,8 @@ fn disclosure_for_tool(tool_name: &str) -> Option<(&'static str, Option<&'static
 /// closure `F` so it runs with no live socket and no `AppHandle` in tests.
 ///
 /// `audio_handler`: a closure called for every server text frame so the
-/// audio bridge can intercept `response.audio.delta` events.  Injected rather
+/// audio bridge can intercept audio-delta events (GA/beta wire names, see
+/// `audio_bridge::is_audio_delta_type`).  Injected rather
 /// than taking a direct `Arc<AudioBridge>` reference so the tests can provide
 /// a no-op without a live audio device.
 ///
@@ -737,7 +739,7 @@ where
                             continue;
                         }
                         // Parse the frame ONCE: the audio bridge gets first look
-                        // (so `response.audio.delta` reaches the playback queue),
+                        // (so audio deltas reach the playback queue),
                         // then the normalized dispatch path. Unparseable frames are
                         // ignored and the loop continues (no double serde parse).
                         let Ok(event) = serde_json::from_str::<serde_json::Value>(txt.as_str())
@@ -785,7 +787,8 @@ where
                         break;
                     }
                     // Binary/ping/pong/frame — ignored; all audio arrives as text
-                    // `response.audio.delta` events on the OpenAI Realtime API.
+                    // audio-delta events (GA `response.output_audio.delta` /
+                    // beta `response.audio.delta`) on the OpenAI Realtime API.
                     Some(Ok(_)) => {}
                     // A WS/IO transport error (connection reset / 5xx mid-stream /
                     // protocol error) — a RECOVERABLE drop: tear this connection down

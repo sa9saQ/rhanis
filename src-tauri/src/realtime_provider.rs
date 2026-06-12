@@ -146,9 +146,11 @@ pub enum ProviderEvent {
     /// [`Usage`]: ProviderEvent::Usage
     Transcript { role: TranscriptRole, text: String },
     /// Server audio output. PR1's OpenAI impl never emits this — the
-    /// `audio_handler` closure in `run_read_loop` already consumes
-    /// `response.audio.delta`. Declared as the forward type contract for PR2
-    /// (Gemini audio + 16 kHz integration).
+    /// `audio_handler` closure in `run_read_loop` already consumes the
+    /// audio-delta frames (GA `response.output_audio.delta` / beta
+    /// `response.audio.delta`, see `audio_bridge::is_audio_delta_type`).
+    /// Declared as the forward type contract for PR2 (Gemini audio + 16 kHz
+    /// integration).
     #[allow(dead_code)]
     AudioDelta,
     /// The user started speaking (OpenAI: `input_audio_buffer.speech_started`,
@@ -330,9 +332,18 @@ impl RealtimeProvider for OpenAiRealtime {
                 None => vec![ProviderEvent::Ignored],
             },
             // Audio deltas are consumed by the `audio_handler` seam in the read
-            // loop, so the normalized path ignores them (PR1). PR2 will route
-            // Gemini audio through `ProviderEvent::AudioDelta`.
-            Some("response.audio.delta") => vec![ProviderEvent::Ignored],
+            // loop, so the normalized path ignores them (PR1). This arm uses
+            // the SAME `audio_bridge::is_audio_delta_type` predicate as that
+            // seam, so it matches both wire names (GA
+            // `response.output_audio.delta` / superseded beta
+            // `response.audio.delta`, koe-bd7) and cannot drift from the
+            // seam's match. Today this equals the `_ => Ignored` catch-all,
+            // but pinning the names keeps audio frames out of any future
+            // non-Ignored catch-all (e.g. unknown-frame logging). PR2 will
+            // route Gemini audio through `ProviderEvent::AudioDelta`.
+            Some(t) if crate::audio_bridge::is_audio_delta_type(t) => {
+                vec![ProviderEvent::Ignored]
+            }
             // Barge-in trigger (koe-bx7): the user began speaking (server VAD).
             // The audio cut happens in the `audio_handler` seam (the bridge sees
             // this same frame); the normalized event tells the session loop to
@@ -709,6 +720,17 @@ mod tests {
         // The audio_handler seam consumes audio.delta; the normalized path skips it.
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({ "type": "response.audio.delta", "delta": "AAAA" });
+        assert!(matches!(p.parse_frame(&ev).as_slice(), [ProviderEvent::Ignored]));
+    }
+
+    #[test]
+    fn parse_frame_ga_audio_delta_is_ignored() {
+        // GA wire name (koe-bd7): like the beta name above, the GA
+        // `response.output_audio.delta` is consumed by the audio_handler seam;
+        // the normalized path must keep ignoring it (pinned explicitly so a
+        // future non-Ignored catch-all cannot change this silently).
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({ "type": "response.output_audio.delta", "delta": "AAAA" });
         assert!(matches!(p.parse_frame(&ev).as_slice(), [ProviderEvent::Ignored]));
     }
 

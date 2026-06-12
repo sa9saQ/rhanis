@@ -9,7 +9,7 @@
 //! device rate / format        mono 24 kHz PCM16         input_audio_buffer.append
 //!
 //! session_manager             conversion seam            rodio OutputStream
-//! write loop rx  →  response.audio.delta  →  PlaybackQueue  →  rodio Sink
+//! write loop rx  →  audio delta (GA/beta)  →  PlaybackQueue  →  rodio Sink
 //! base64 PCM16                i16 decode                       speaker
 //! ```
 //!
@@ -56,7 +56,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 // ── Audio payload size guard ──────────────────────────────────────────────────
 
-/// Maximum decoded byte size of a single `response.audio.delta` payload.
+/// Maximum decoded byte size of a single audio-delta payload (either wire
+/// name, see [`is_audio_delta_type`]).
 /// A server-supplied delta exceeding this limit is silently dropped rather than
 /// allocated.  256 KiB ≈ 5.46 seconds of 24kHz PCM16 mono — far beyond any
 /// realistic single delta packet.  Equivalent to `MAX_TOOL_OUTPUT_LEN` in
@@ -121,7 +122,7 @@ pub fn f32_slice_to_pcm16_le(samples: &[f32]) -> Vec<u8> {
 /// Pairs of bytes are parsed as i16 LE; integer min (`−32768`) maps to
 /// −1.0 (exactly representable as f32 from the division below).
 ///
-/// Used by the playback path to decode the `response.audio.delta` base64 blob.
+/// Used by the playback path to decode the audio-delta base64 blob.
 pub fn pcm16_le_to_f32(bytes: &[u8]) -> Vec<f32> {
     let pairs = bytes.len() / 2; // truncate any trailing odd byte
     let mut out = Vec::with_capacity(pairs);
@@ -195,12 +196,30 @@ pub fn build_audio_append_frame(pcm16_bytes: &[u8]) -> Message {
     Message::Text(json.to_string().into())
 }
 
-/// Decodes the base64 payload from a `response.audio.delta` server event,
-/// returning the raw PCM16 LE bytes.  Returns `None` if the event type is
-/// wrong, the `delta` field is absent / not a valid base64 string, or the
-/// decoded byte length would exceed [`MAX_AUDIO_DELTA_BYTES`] (DoS guard).
+/// Whether `event_type` is an assistant audio-delta frame, under either wire
+/// name: the GA Realtime event is `response.output_audio.delta`; the
+/// superseded beta interface used `response.audio.delta` (koe-bd7). Matching
+/// only the beta name leaves the assistant silent on a GA handshake while
+/// every other path (transcript, usage) keeps working. Decode, the barge-in
+/// gate, and `parse_frame`'s pinned Ignored arm all route through this single
+/// predicate so the sites cannot diverge; once koe-ef8 (Windows E2E) pins the
+/// live wire name, the unused arm can be dropped here in one place. Mirrors
+/// the transcript dual-name match in `realtime_provider::parse_frame`.
+pub(crate) fn is_audio_delta_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.audio.delta" | "response.output_audio.delta"
+    )
+}
+
+/// Decodes the base64 payload from an assistant audio-delta server event
+/// (GA `response.output_audio.delta` or beta `response.audio.delta`, see
+/// [`is_audio_delta_type`]), returning the raw PCM16 LE bytes.  Returns
+/// `None` if the event type is wrong, the `delta` field is absent / not a
+/// valid base64 string, or the decoded byte length would exceed
+/// [`MAX_AUDIO_DELTA_BYTES`] (DoS guard).
 pub fn decode_audio_delta(event_json: &serde_json::Value) -> Option<Vec<u8>> {
-    if event_json.get("type")?.as_str()? != "response.audio.delta" {
+    if !is_audio_delta_type(event_json.get("type")?.as_str()?) {
         return None;
     }
     let b64 = event_json.get("delta")?.as_str()?;
@@ -529,9 +548,10 @@ pub struct PlaybackHandle {
 
 impl PlaybackHandle {
     /// The playback half of the read loop's `audio_handler` seam: feeds
-    /// `response.audio.delta` payloads into the playback queue and drives the
-    /// barge-in gate (koe-bx7).  Silently ignores unknown event types or
-    /// malformed base64.
+    /// audio-delta payloads (GA `response.output_audio.delta` / beta
+    /// `response.audio.delta`, see [`is_audio_delta_type`]) into the playback
+    /// queue and drives the barge-in gate (koe-bx7).  Silently ignores unknown
+    /// event types or malformed base64.
     ///
     /// Barge-in protocol:
     /// - `speech_started` → gate closes; on the OFF→SPEAKING transition ONLY,
@@ -548,8 +568,9 @@ impl PlaybackHandle {
     ///   follow-ups via `response.create`, see koe-z8j) stays suppressed —
     ///   without this, a mid-speech `response.created` would re-open the gate
     ///   and the assistant would talk over the user (R-B finding).
-    /// - `response.audio.delta` → enqueued only while the gate is OFF; checked
-    ///   BEFORE base64-decoding so a suppressed straggler flood costs no CPU.
+    /// - audio delta (either wire name) → enqueued only while the gate is OFF;
+    ///   checked BEFORE base64-decoding so a suppressed straggler flood costs
+    ///   no CPU.
     ///
     /// The protocol half of barge-in (sending the provider's `response.cancel`)
     /// lives in the session loop via [`ProviderEvent::SpeechStarted`].
@@ -583,7 +604,7 @@ impl PlaybackHandle {
                     Ordering::Acquire,
                 );
             }
-            Some("response.audio.delta") => {
+            Some(t) if is_audio_delta_type(t) => {
                 if self.gate.load(Ordering::Acquire) != GATE_OFF {
                     // Straggler of an interrupted response — drop pre-decode.
                     return;
@@ -1667,6 +1688,21 @@ mod tests {
             "delta": b64,
         });
         let decoded = decode_audio_delta(&event).expect("decode ok");
+        assert_eq!(decoded, pcm);
+    }
+
+    #[test]
+    fn decode_audio_delta_round_trips_ga_name() {
+        // GA wire name (koe-bd7): `response.output_audio.delta` must decode the
+        // same as the superseded beta `response.audio.delta`, or a GA handshake
+        // leaves the assistant silent while every other test stays green.
+        let pcm: Vec<u8> = vec![0x01, 0x00, 0x02, 0x00];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&pcm);
+        let event = serde_json::json!({
+            "type": "response.output_audio.delta",
+            "delta": b64,
+        });
+        let decoded = decode_audio_delta(&event).expect("GA-name decode ok");
         assert_eq!(decoded, pcm);
     }
 
@@ -2856,6 +2892,39 @@ mod tests {
             "a new barge-in episode must send a new ClearPlayback"
         );
         assert!(ctrl_rx.try_recv().is_err(), "no further control expected");
+    }
+
+    /// GA wire name (koe-bd7): the barge-in gate must treat
+    /// `response.output_audio.delta` exactly like the beta name — enqueued
+    /// while the gate is OFF, suppressed pre-decode once the user speaks.
+    /// (The gate transitions themselves are name-independent; this mirrors
+    /// the name-dependent halves of `playback_gate_full_barge_in_protocol`.)
+    #[test]
+    fn playback_gate_handles_ga_audio_delta_name() {
+        let (handle, data_rx, ctrl_rx) = PlaybackHandle::new_for_test();
+
+        let ga_delta =
+            serde_json::json!({ "type": "response.output_audio.delta", "delta": "AAAA" });
+        let speech_started = serde_json::json!({ "type": "input_audio_buffer.speech_started" });
+
+        // Gate OFF: a GA-named delta must reach the DATA channel.
+        handle.handle_server_audio(&ga_delta);
+        assert!(
+            matches!(data_rx.try_recv(), Ok(AudioCommand::EnqueuePcm(_))),
+            "GA-named delta must enqueue while the gate is OFF"
+        );
+
+        // Barge-in: a GA-named straggler must be suppressed like the beta name.
+        handle.handle_server_audio(&speech_started);
+        assert!(
+            matches!(ctrl_rx.try_recv(), Ok(AudioControl::ClearPlayback)),
+            "speech_started must still cut playback"
+        );
+        handle.handle_server_audio(&ga_delta);
+        assert!(
+            data_rx.try_recv().is_err(),
+            "a GA-named straggler after speech_started must be suppressed"
+        );
     }
 
     /// A stray `speech_stopped` with no preceding `speech_started` must not
