@@ -49,6 +49,32 @@ describe("ActivityLog", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  it("surfaces a provider/server error without flipping the session status (koe-nal)", () => {
+    render(<ActivityLog />);
+    act(() => {
+      useActivityStore.getState().setSessionStatus({ state: "connected", sequence: 1 });
+      useActivityStore.getState().ingestProviderError({
+        eventId: "p1",
+        sequence: 1,
+        code: "unknown_parameter",
+        message: "Unknown parameter: 'session.bogus'.",
+        timestamp: 1000,
+      });
+    });
+    // The error row is visible (code + message rendered as plain text)…
+    expect(
+      screen.getByText(/サーバーエラー \(unknown_parameter\): Unknown parameter/),
+    ).toBeInTheDocument();
+    // …but the session is NOT shown as dead: still conversing, no terminal alert.
+    expect(screen.getByText("会話")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps the provider-error live region mounted (empty) for reliable announcement", () => {
+    render(<ActivityLog />);
+    expect(screen.getByRole("list", { name: "サーバーエラー" })).toBeInTheDocument();
+  });
+
   it("shows the pending-approval badge", () => {
     render(<ActivityLog />);
     act(() => {

@@ -8,14 +8,24 @@ import { useShallow } from "zustand/react/shallow";
 import {
   selectActiveActions,
   selectDisplayStatus,
+  selectRecentProviderErrors,
   selectRecentThinking,
   useActivityStore,
 } from "./activityStore";
-import type { ActionState, DisplayStatus, ThinkingEvent, ToolEvent } from "./types";
+import type {
+  ActionState,
+  DisplayStatus,
+  ProviderErrorEvent,
+  ThinkingEvent,
+  ToolEvent,
+} from "./types";
 import "./ActivityLog.css";
 
 /** How many recent disclosures the thinking trace shows at once. */
 const THINKING_VISIBLE = 3;
+
+/** How many recent provider/server errors the error strip shows at once (koe-nal). */
+const PROVIDER_ERRORS_VISIBLE = 3;
 
 /** Japanese label + dot tone for each derived status. */
 const STATUS_META: Record<DisplayStatus, { label: string; tone: string }> = {
@@ -79,6 +89,24 @@ function ThinkingRow({ thought }: { thought: ThinkingEvent }) {
   );
 }
 
+/**
+ * One non-benign provider/server error (koe-nal) — e.g. a rejected
+ * `session.update`, after which tools / 記録 silently stop working. The backend
+ * pre-sanitizes + caps `code` / `message`, so they render as plain text.
+ */
+function ProviderErrorRow({ error }: { error: ProviderErrorEvent }) {
+  return (
+    <li className="koe-provider-error-row">
+      <span className="koe-provider-error-glyph" aria-hidden>
+        ⚠
+      </span>
+      <span className="koe-provider-error-text">
+        サーバーエラー{error.code ? ` (${error.code})` : ""}: {error.message}
+      </span>
+    </li>
+  );
+}
+
 const PHASE_GLYPH: Record<ToolEvent["phase"], string> = {
   start: "▶",
   progress: "…",
@@ -104,6 +132,7 @@ export function ActivityLog({ className }: { className?: string } = {}) {
   // contents so the component doesn't re-render (and loop) every tick.
   const active = useActivityStore(useShallow(selectActiveActions));
   const thinking = useActivityStore(useShallow(selectRecentThinking));
+  const providerErrors = useActivityStore(useShallow(selectRecentProviderErrors));
   const events = useActivityStore((s) => s.events);
   const pendingApprovals = useActivityStore((s) => s.approvalQueue.length);
   const lastError = useActivityStore((s) => s.lastError);
@@ -134,6 +163,16 @@ export function ActivityLog({ className }: { className?: string } = {}) {
           {lastError}
         </p>
       )}
+
+      {/* Provider/server errors (koe-nal): a rejected session.update etc. —
+          surfaced WITHOUT ending the session (session-status error is the
+          terminal contract). Always mounted for the same assistive-tech
+          reliability as the thinking window below. */}
+      <ul className="koe-provider-errors" aria-label="サーバーエラー" aria-live="polite">
+        {providerErrors.slice(0, PROVIDER_ERRORS_VISIBLE).map((e) => (
+          <ProviderErrorRow key={e.eventId} error={e} />
+        ))}
+      </ul>
 
       {/* Thinking window (glass-box M1, koe-sua.1): what koe is about to do,
           disclosed BEFORE the tool runs so a silent pause reads as deliberation.

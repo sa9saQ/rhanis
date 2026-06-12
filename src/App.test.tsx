@@ -11,6 +11,7 @@ vi.mock("./lib/tauri/ipc", () => ({
   onToolEvent: vi.fn().mockResolvedValue(() => {}),
   // Thinking-event wiring (glass-box M1, koe-sua.1) — useActivityEvents subscribes.
   onThinkingEvent: vi.fn().mockResolvedValue(() => {}),
+  onProviderError: vi.fn().mockResolvedValue(() => {}),
   onApprovalRequired: vi.fn().mockResolvedValue(() => {}),
   onSessionStatus: vi.fn().mockResolvedValue(() => {}),
   // Cost snapshot wiring (koe-9xi) — useCostEvents subscribes + pulls on mount.

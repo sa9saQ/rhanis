@@ -11,6 +11,7 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   CostSnapshot,
+  ProviderErrorEvent,
   SessionStatusEvent,
   ThinkingEvent,
   ToolEvent,
@@ -36,6 +37,8 @@ export const EVENT = {
   sessionStatus: "session-status",
   // Live monthly cost snapshot pushed on each usage frame (koe-9xi).
   costUpdate: "cost-update",
+  // Non-benign server error surfaced mid-session (koe-nal).
+  providerError: "provider-error",
 } as const;
 
 /** Backend command names. */
@@ -88,6 +91,16 @@ export function onApprovalRequired(
   handler: (request: ApprovalRequest) => void,
 ): Promise<UnlistenFn> {
   return listen<ApprovalRequest>(EVENT.approvalRequired, (e) => handler(e.payload));
+}
+
+/**
+ * Subscribe to non-benign provider/server errors (koe-nal) — e.g. a rejected
+ * `session.update`. Returns an unlisten function.
+ */
+export function onProviderError(
+  handler: (event: ProviderErrorEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<ProviderErrorEvent>(EVENT.providerError, (e) => handler(e.payload));
 }
 
 /** Subscribe to session connection-status changes. Returns an unlisten function. */

@@ -14,6 +14,7 @@ const startSessionIpc = vi.fn();
 vi.mock("../../lib/tauri/ipc", () => ({
   onToolEvent: vi.fn().mockResolvedValue(() => {}),
   onThinkingEvent: vi.fn().mockResolvedValue(() => {}),
+  onProviderError: vi.fn().mockResolvedValue(() => {}),
   onApprovalRequired: vi.fn().mockResolvedValue(() => {}),
   onSessionStatus: vi.fn().mockResolvedValue(() => {}),
   onCostUpdate: vi.fn().mockResolvedValue(() => {}),

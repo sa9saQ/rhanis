@@ -18,6 +18,7 @@ import type {
   ActionState,
   ApprovalRequest,
   DisplayStatus,
+  ProviderErrorEvent,
   SessionConnState,
   SessionStatusEvent,
   ThinkingEvent,
@@ -44,6 +45,13 @@ export const THINKING_CAP = 50;
  */
 export const MAX_ACTIONS = 256;
 
+/**
+ * Max number of provider/server errors retained (koe-nal). Small: these are
+ * rare, high-signal rows ("session.update rejected"), not a stream — but a
+ * misbehaving server must still not grow the list without limit.
+ */
+export const PROVIDER_ERROR_CAP = 20;
+
 interface ActivityState {
   connState: SessionConnState;
   /** Sticky error message; cleared when a *newer* non-error status arrives. */
@@ -63,6 +71,24 @@ interface ActivityState {
   thinking: ThinkingEvent[];
   /** De-duplication set of seen thinking `eventId`s, bounded to the retained window. */
   seenThinkingIds: Set<string>;
+  /**
+   * Non-benign provider/server errors (koe-nal), ordered ascending by
+   * `sequence`, capped at {@link PROVIDER_ERROR_CAP}. Sticky across a session
+   * (an error explaining why tools went quiet must outlive the moment), cleared
+   * when a NEW session starts connecting.
+   */
+  providerErrors: ProviderErrorEvent[];
+  /** De-duplication set of seen provider-error `eventId`s, bounded to the window. */
+  seenProviderErrorIds: Set<string>;
+  /**
+   * The `session-status` sequence at the last clear-on-connecting. Tauri
+   * channels are independent, so an error EMITTED by the old session (below
+   * the backend's generation gate) can still be DELIVERED after the new
+   * session's `connecting` cleared the strip — its lower sequence identifies
+   * it as stale (the backend stamps the shared counter at emit time), and
+   * `ingestProviderError` drops it (koe-nal R-C).
+   */
+  providerErrorClearSequence: number;
   /** Highest `sequence` seen across all tool events. */
   lastSequence: number;
   /** Highest `sequence` seen across session-status events (own counter space). */
@@ -70,6 +96,7 @@ interface ActivityState {
 
   ingestToolEvent: (event: ToolEvent) => void;
   ingestThinkingEvent: (event: ThinkingEvent) => void;
+  ingestProviderError: (event: ProviderErrorEvent) => void;
   setSessionStatus: (status: SessionStatusEvent) => void;
   enqueueApproval: (request: ApprovalRequest) => void;
   dequeueApproval: (approvalId: string) => void;
@@ -94,6 +121,9 @@ function initialState() {
     approvalQueue: [] as ApprovalRequest[],
     thinking: [] as ThinkingEvent[],
     seenThinkingIds: new Set<string>(),
+    providerErrors: [] as ProviderErrorEvent[],
+    seenProviderErrorIds: new Set<string>(),
+    providerErrorClearSequence: -1,
     lastSequence: 0,
     // -1 so a backend whose status sequence starts at 0 is not ignored.
     lastSessionSequence: -1,
@@ -249,6 +279,29 @@ export const useActivityStore = create<ActivityState>((set) => ({
       return { ...state, thinking, seenThinkingIds };
     }),
 
+  // Same dedup/order/cap discipline as the thinking trace (koe-nal). No action
+  // correlation: a provider error is session-scoped, not tied to a tool call.
+  ingestProviderError: (event) =>
+    set((state) => {
+      if (state.seenProviderErrorIds.has(event.eventId)) {
+        return state; // duplicate — ignore
+      }
+      // A late-DELIVERED error from before the last clear-on-connecting is
+      // stale (old session) — drop it so it cannot pollute the new session's
+      // strip (see providerErrorClearSequence).
+      if (event.sequence <= state.providerErrorClearSequence) {
+        return state;
+      }
+      const providerErrors = [...state.providerErrors, event].sort(
+        (a, b) => a.sequence - b.sequence,
+      );
+      if (providerErrors.length > PROVIDER_ERROR_CAP) {
+        providerErrors.splice(0, providerErrors.length - PROVIDER_ERROR_CAP);
+      }
+      const seenProviderErrorIds = new Set(providerErrors.map((e) => e.eventId));
+      return { ...state, providerErrors, seenProviderErrorIds };
+    }),
+
   setSessionStatus: (status) =>
     set((state) => {
       // Ignore stale status: a late `connected` must not clear a newer `error`.
@@ -265,12 +318,28 @@ export const useActivityStore = create<ActivityState>((set) => ({
         status.state === "idle" ||
         status.state === "error" ||
         status.state === "reconnecting";
+      // Provider errors are stickier than the thinking window: they explain why
+      // tools went quiet, so they survive idle/error/reconnecting as post-mortem
+      // context and clear only when the operator starts a NEW session
+      // (`connecting`). Reconnects also re-send session.update, but the strip is
+      // deliberately kept across them — a re-rejected update simply emits a
+      // fresh row (new eventId/sequence), so nothing stale accumulates (koe-nal).
+      const clearProviderErrors = status.state === "connecting";
       return {
         ...state,
         connState: status.state,
         lastError: status.state === "error" ? (status.error ?? "unknown error") : null,
         lastSessionSequence: status.sequence,
         ...(clearThinking ? { thinking: [], seenThinkingIds: new Set<string>() } : {}),
+        ...(clearProviderErrors
+          ? {
+              providerErrors: [],
+              seenProviderErrorIds: new Set<string>(),
+              // Everything emitted up to this status is the OLD session's —
+              // drop it even if its delivery straggles in after this clear.
+              providerErrorClearSequence: status.sequence,
+            }
+          : {}),
       };
     }),
 
@@ -307,6 +376,15 @@ export function selectActiveActions(state: ActivityState): ActionState[] {
  */
 export function selectRecentThinking(state: ActivityState): ThinkingEvent[] {
   return [...state.thinking].reverse();
+}
+
+/**
+ * Recent provider/server errors, newest first (koe-nal) — for the ActivityLog's
+ * error strip. The view slices the head; the store keeps the rest within
+ * {@link PROVIDER_ERROR_CAP}.
+ */
+export function selectRecentProviderErrors(state: ActivityState): ProviderErrorEvent[] {
+  return [...state.providerErrors].reverse();
 }
 
 /**

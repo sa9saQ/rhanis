@@ -410,7 +410,10 @@ fn command_descriptor_for(raw: &str, windows: bool) -> Option<String> {
 /// model-supplied string can neither reorder/hide its rendering in the modal /
 /// ActivityLog (display spoofing) nor be silently laundered into a clean
 /// descriptor — the replacement marks make tampering visible to the human.
-fn sanitize_display(s: &str) -> String {
+/// `pub(crate)`: `realtime_provider::parse_frame` applies the same hygiene to
+/// server-controlled error code/message strings before they ride a UI payload
+/// (koe-nal).
+pub(crate) fn sanitize_display(s: &str) -> String {
     s.chars()
         .map(|c| if is_display_hostile(c) { '\u{FFFD}' } else { c })
         .collect()

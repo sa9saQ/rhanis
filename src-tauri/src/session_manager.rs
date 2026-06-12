@@ -89,6 +89,10 @@ const MAX_INFLIGHT_DISPATCHES: usize = 64;
 /// Consecutive cost-snapshot save failures tolerated before stopping fail-closed
 /// (a persistent failure means a restart could lose the running total).
 const MAX_SNAPSHOT_SAVE_FAILURES: u32 = 3;
+/// Per-session cap on surfaced `provider-error` emits (koe-nal R-C): a hostile
+/// provider spamming distinct non-benign error frames must not flood the
+/// WebView with Tauri events. The UI strip retains only the last 20.
+const MAX_PROVIDER_ERROR_EMITS: u64 = 50;
 
 /// WebSocket frame/message size limits (DoS guard).
 /// Max message: 512 KiB — comfortably above the largest legitimate Realtime
@@ -527,10 +531,7 @@ impl ThinkingEvent {
             None => ("ツールを使おうとしています".to_string(), None),
         };
         let tool = disclosure.map(|_| tool_name.to_string());
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+        let timestamp = now_epoch_ms();
         ThinkingEvent {
             event_id: format!("think-{sequence}"),
             action_id: call_id.to_string(),
@@ -542,6 +543,52 @@ impl ThinkingEvent {
             timestamp,
         }
     }
+}
+
+/// A non-benign provider/server error surfaced to the UI on the `provider-error`
+/// channel (koe-nal). Field names are camelCased to match `ProviderErrorEvent`
+/// in `src/features/activity/types.ts`. `code` / `message` arrive PRE-sanitized
+/// and length-capped from `parse_frame` (server-controlled strings never ride a
+/// payload raw — control/bidi chars are already U+FFFD); no key / path / PII is
+/// in scope here. Deliberately NOT a `session-status` emit: that channel's
+/// `error` state is the TERMINAL contract (types.ts), and a mid-session error
+/// frame does not end the session — whether specific codes should fail-stop is
+/// decided from live payloads in koe-ef8.
+/// transaction N/A · idempotency_key N/A (display-only disclosure, not billing).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderErrorEvent {
+    event_id: String,
+    sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    message: String,
+    timestamp: i64,
+}
+
+impl ProviderErrorEvent {
+    /// `sequence` shares the global counter (same ordering/dedup discipline as
+    /// `ThinkingEvent` / tool events); `event_id` derives from it — uniqueness is
+    /// all the display-only dedup needs (never echoed back like an approval id).
+    fn new(code: Option<&str>, message: &str, sequence: u64) -> Self {
+        ProviderErrorEvent {
+            event_id: format!("perr-{sequence}"),
+            sequence,
+            code: code.map(str::to_string),
+            message: message.to_string(),
+            timestamp: now_epoch_ms(),
+        }
+    }
+}
+
+/// Epoch milliseconds for event payload timestamps, saturating instead of
+/// panicking on clock weirdness (pre-1970 → 0, absurd future → i64::MAX). One
+/// place so every event type shares the same fallback policy.
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// Maps an ALLOWLISTED tool NAME to a redacted, human-safe disclosure: the action
@@ -603,7 +650,7 @@ fn disclosure_for_tool(tool_name: &str) -> Option<(&'static str, Option<&'static
 /// when its `AbortHandle::abort()` is called.  This meant already-queued PCM
 /// could still be flushed after an abnormal stop.
 #[allow(clippy::too_many_arguments)]
-async fn run_read_loop<S, F, EC, ET, A, SA>(
+async fn run_read_loop<S, F, EC, ET, EP, A, SA>(
     mut stream: S,
     provider: Arc<dyn RealtimeProvider>,
     write_tx: mpsc::Sender<Message>,
@@ -631,12 +678,18 @@ async fn run_read_loop<S, F, EC, ET, A, SA>(
     // `emit` / `emit_cost`. The tool ARGUMENTS are deliberately NOT passed — the
     // closure derives a safe disclosure from the name alone (verifiable-action-first).
     emit_thinking: ET,
+    // Non-benign server error emitter (koe-nal): called with the pre-sanitized
+    // (code, message) of a surfaced `error` frame so `start_session` can push a
+    // `provider-error` event to the UI. Injected for the same AppHandle-free
+    // unit-testability as `emit` / `emit_cost` / `emit_thinking`.
+    emit_provider_error: EP,
 ) -> ConnectionOutcome
 where
     S: Stream<Item = Result<Message, WsError>> + Unpin,
     F: Fn(&str, Option<&str>),
     EC: Fn(u32, u64, BudgetConfig),
     ET: Fn(&str, &str),
+    EP: Fn(Option<&str>, &str),
     A: Fn(&serde_json::Value),
     SA: Fn(bool), // true = graceful (flush tail), false = immediate (discard tail)
 {
@@ -657,6 +710,8 @@ where
     // Same latch discipline for journal-channel drops (koe-emd / CR): surface a
     // dropped conversation record once per episode without a per-drop flood.
     let mut journal_drop_warned = false;
+    // And for the benign-cancel suppression log (koe-nal): once per connection.
+    let mut benign_err_warned = false;
     let deadline = tokio::time::sleep(SESSION_TIMEOUT);
     tokio::pin!(deadline);
     // Interval-based poll for cpal device loss (error_callback sets running=false).
@@ -750,8 +805,9 @@ where
                         match handle_text(
                             &event, &provider, &cancel_pending, &write_tx, &cost,
                             &recorder, &rec_tx, &dispatcher, &mut dispatch_tasks,
-                            &mut cap_warned, &mut journal_drop_warned, &emit_cost,
-                            &emit_thinking,
+                            &mut cap_warned, &mut journal_drop_warned,
+                            &mut benign_err_warned, &emit_cost,
+                            &emit_thinking, &emit_provider_error,
                         ).await {
                             LoopAction::Continue => {}
                             // Carry the terminal error reason out to finalize so it
@@ -1027,7 +1083,7 @@ async fn slot_ownership(
 /// [`run_read_loop`]. `start_session` passes an `establish_connection` closure, real
 /// emitters, and OS-CSPRNG [`jitter_factor`].
 #[allow(clippy::too_many_arguments)]
-async fn run_session_supervised<C, Fut, F, EC, ET, J>(
+async fn run_session_supervised<C, Fut, F, EC, ET, EP, J>(
     mut connect: C,
     provider: Arc<dyn RealtimeProvider>,
     cost: Arc<TokioMutex<CostTracker>>,
@@ -1040,18 +1096,20 @@ async fn run_session_supervised<C, Fut, F, EC, ET, J>(
     latest_generation: Arc<AtomicU64>,
     emit_cost: EC,
     emit_thinking: ET,
+    emit_provider_error: EP,
     cfg: ReconnectConfig,
     jitter: J,
 ) where
     C: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<Connection, ConnectError>> + Send + 'static,
     // `Sync` (not just `Send`): the spawned `run_read_loop` borrows `&emit*` across
-    // `.await` points, so `&F`/`&EC`/`&ET` must be `Send` ⇒ the closures must be
-    // `Sync`. The live emitters (AppHandle + `Arc<SequenceCounter>`) and the test
+    // `.await` points, so `&F`/`&EC`/`&ET`/`&EP` must be `Send` ⇒ the closures must
+    // be `Sync`. The live emitters (AppHandle + `Arc<SequenceCounter>`) and the test
     // no-op closures all satisfy this.
     F: Fn(&str, Option<&str>) + Clone + Send + Sync + 'static,
     EC: Fn(u32, u64, BudgetConfig) + Clone + Send + Sync + 'static,
     ET: Fn(&str, &str) + Clone + Send + Sync + 'static,
+    EP: Fn(Option<&str>, &str) + Clone + Send + Sync + 'static,
     J: Fn() -> f64 + Send + 'static,
 {
     // Consecutive failed attempts. Reset to 0 ONLY when a connection stayed up at
@@ -1181,6 +1239,7 @@ async fn run_session_supervised<C, Fut, F, EC, ET, J>(
                     conn.writer_abort,
                     emit_cost.clone(),
                     emit_thinking.clone(),
+                    emit_provider_error.clone(),
                 ));
 
                 let mut forwarded = false;
@@ -1428,7 +1487,7 @@ fn enqueue_record(
 /// transcript FIRST, so the turn is journalled before a `Usage` budget gate could
 /// stop the loop. The first `Stop` short-circuits the rest of the frame's events.
 #[allow(clippy::too_many_arguments)]
-async fn handle_text<EC, ET>(
+async fn handle_text<EC, ET, EP>(
     event: &Value,
     provider: &Arc<dyn RealtimeProvider>,
     cancel_pending: &Arc<AtomicBool>,
@@ -1440,12 +1499,17 @@ async fn handle_text<EC, ET>(
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
+    // Latch: the benign-cancel suppression logs ONCE per connection (same
+    // anti-stderr-flood discipline as `cap_warned`, koe-nal R-B).
+    benign_err_warned: &mut bool,
     emit_cost: &EC,
     emit_thinking: &ET,
+    emit_provider_error: &EP,
 ) -> LoopAction
 where
     EC: Fn(u32, u64, BudgetConfig),
     ET: Fn(&str, &str),
+    EP: Fn(Option<&str>, &str),
 {
     for ev in provider.parse_frame(event) {
         if let LoopAction::Stop(reason) = handle_event(
@@ -1460,8 +1524,10 @@ where
             dispatch_tasks,
             cap_warned,
             journal_drop_warned,
+            benign_err_warned,
             emit_cost,
             emit_thinking,
+            emit_provider_error,
         )
         .await
         {
@@ -1477,7 +1543,7 @@ where
 /// logic; an ASR `Usage` flows through it identically, so there is no second cost
 /// path to keep in sync.)
 #[allow(clippy::too_many_arguments)]
-async fn handle_event<EC, ET>(
+async fn handle_event<EC, ET, EP>(
     ev: ProviderEvent,
     provider: &Arc<dyn RealtimeProvider>,
     // Latch for the barge-in cancel's parked-fallback send (koe-bx7) — see the
@@ -1491,12 +1557,17 @@ async fn handle_event<EC, ET>(
     dispatch_tasks: &mut tokio::task::JoinSet<()>,
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
+    // Latch: the benign-cancel suppression logs ONCE per connection (same
+    // anti-stderr-flood discipline as `cap_warned`, koe-nal R-B).
+    benign_err_warned: &mut bool,
     emit_cost: &EC,
     emit_thinking: &ET,
+    emit_provider_error: &EP,
 ) -> LoopAction
 where
     EC: Fn(u32, u64, BudgetConfig),
     ET: Fn(&str, &str),
+    EP: Fn(Option<&str>, &str),
 {
     match ev {
         ProviderEvent::FunctionCall(pending) => {
@@ -1766,8 +1837,8 @@ where
         // cancel when capacity frees (flood-capped: while one is parked, repeat
         // speech-starts skip — the parked cancel already covers them; `Closed`
         // means the connection is tearing down and the cancel is moot). The
-        // duplicate-cancel benign `error` reply stays Ignored by parse_frame —
-        // koe-nal must keep it classified benign.
+        // duplicate-cancel `error` reply arrives as ServerError{benign:true}
+        // (koe-nal) and is suppressed from the UI by the arm below.
         ProviderEvent::SpeechStarted => {
             if let Some(frame) = provider.cancel_frame() {
                 match write_tx.try_send(frame) {
@@ -1791,6 +1862,37 @@ where
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {}
                 }
+            }
+            LoopAction::Continue
+        }
+        // Server-reported error frame (koe-nal). Before this arm, error frames
+        // fell into the Ignored catch-all: a rejected session.update silently
+        // disabled tools / ASR / journaling / thinking-events while audio kept
+        // flowing (the koe-emd/pbe/sua.1 live-failure scenarios all converge
+        // here). code/message arrive pre-sanitized + capped from parse_frame.
+        ProviderEvent::ServerError { code, message, benign } => {
+            if benign {
+                // The expected barge-in cancel race (koe-bx7): response.cancel
+                // is sent ungated on every speech start, so "no active response"
+                // answers are steady-state noise — logged to stderr ONCE per
+                // connection (latched like `cap_warned`: a hostile server
+                // spamming benign-classified frames must not turn suppression
+                // into a stderr-flood, koe-nal R-B), never alarming the
+                // operator. The first occurrence carries code+message — the
+                // live wire shape is exactly the koe-ef8 evidence the narrow
+                // `is_benign_cancel_error` classifier waits on.
+                if !*benign_err_warned {
+                    *benign_err_warned = true;
+                    eprintln!(
+                        "[session] benign provider error (suppressed from UI; logged once per connection): code={code:?} message={message}"
+                    );
+                }
+            } else {
+                // Surface, but do NOT stop the session: `session-status: error`
+                // is the TERMINAL contract (types.ts) and a mid-session error
+                // frame is not necessarily fatal. Whether specific codes should
+                // fail-stop is decided from live payloads in koe-ef8.
+                emit_provider_error(code.as_deref(), &message);
             }
             LoopAction::Continue
         }
@@ -1913,6 +2015,40 @@ pub async fn start_session(
         let _ = app_for_thinking.emit("thinking-event", payload);
     };
 
+    // Non-benign server error emitter (koe-nal): pushes a `provider-error` so a
+    // rejected session.update (tools/ASR silently dead) is visible in the
+    // ActivityLog instead of swallowed. code/message are pre-sanitized + capped
+    // in parse_frame — no key / path / PII.
+    let app_for_perr = app.clone();
+    let seq_for_perr = Arc::clone(&seq.0);
+    let latest_for_perr = Arc::clone(&session.1);
+    // Per-SESSION emit budget (R-C): a hostile provider spamming DISTINCT
+    // non-benign errors must not turn the strip into an unbounded Tauri-event /
+    // WebView-render flood. The UI keeps only the last 20 anyway; 50 emits is
+    // ample for every legitimate failure pattern.
+    let perr_emit_count = Arc::new(AtomicU64::new(0));
+    let emit_provider_error = move |code: Option<&str>, message: &str| {
+        use tauri::Emitter;
+        if perr_emit_count.load(Ordering::Relaxed) >= MAX_PROVIDER_ERROR_EMITS {
+            return;
+        }
+        perr_emit_count.fetch_add(1, Ordering::Relaxed);
+        // Handover staleness gate (R-B): stop_session does NOT await the old
+        // read loop, so a buffered error frame from the OLD session can surface
+        // AFTER a new session's `connecting` cleared the strip — and it would
+        // stick there for the new session's whole lifetime (a false "tools
+        // dead" alarm in the trust surface). Emit only while OUR start is still
+        // the latest (`latest == generation + 1` — the same arithmetic as
+        // `slot_ownership` / `finalize_session_slot`). The frontend cannot do
+        // this check: the shared counter is stamped at emit time, so a stale
+        // emit sorts AFTER the new session's status events.
+        if latest_for_perr.load(Ordering::Relaxed) != generation + 1 {
+            return;
+        }
+        let payload = ProviderErrorEvent::new(code, message, seq_for_perr.next());
+        let _ = app_for_perr.emit("provider-error", payload);
+    };
+
     // Connect factory (koe-byf): builds ONE fresh connection per (re)connect. Captures
     // only `'static` Arcs so the supervisor and each call's future are `Send + 'static`.
     // The provider is resolved once (a session does not switch voice provider
@@ -1955,6 +2091,7 @@ pub async fn start_session(
         latest_generation,
         emit_cost,
         emit_thinking,
+        emit_provider_error,
         ReconnectConfig::default(),
         jitter_factor,
     ));
@@ -2264,7 +2401,7 @@ mod tests {
             |_graceful: bool| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},));
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},));
 
         // Let A's loop reach its select and park on the pending stream.
         tokio::task::yield_now().await;
@@ -2328,7 +2465,7 @@ mod tests {
             |_| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         assert_eq!(
@@ -2380,7 +2517,7 @@ mod tests {
             |_| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         assert_eq!(
@@ -2435,7 +2572,7 @@ mod tests {
             |_| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         assert_eq!(
@@ -2484,7 +2621,7 @@ mod tests {
             |_| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         assert!(
@@ -2538,7 +2675,7 @@ mod tests {
             |_| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         let emitted: Vec<_> = log.lock().unwrap().clone();
@@ -2582,7 +2719,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -2677,6 +2814,7 @@ mod tests {
             None,
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
             emit_thinking,
+            |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -2745,6 +2883,7 @@ mod tests {
             None,
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
             emit_thinking,
+            |_c: Option<&str>, _m: &str| {},
         )
         .await;
         assert!(
@@ -2770,6 +2909,31 @@ mod tests {
         // The calibration label (koe-sua.2) is never fabricated in M1.
         assert!(v.get("confidence").is_none());
         assert!(v["timestamp"].is_i64());
+    }
+
+    #[test]
+    fn provider_error_payload_is_camelcased_and_omits_absent_code() {
+        // The serialized payload matches `ProviderErrorEvent` in
+        // src/features/activity/types.ts: camelCase keys, and an absent code
+        // DROPS from the JSON (to match `code?: string` — `null` would render
+        // as the string "null"-ish truthiness bugs downstream).
+        let with_code = serde_json::to_value(ProviderErrorEvent::new(
+            Some("unknown_parameter"),
+            "Unknown parameter: 'session.bogus'.",
+            9,
+        ))
+        .unwrap();
+        assert_eq!(with_code["eventId"], "perr-9");
+        assert_eq!(with_code["sequence"], 9);
+        assert_eq!(with_code["code"], "unknown_parameter");
+        assert_eq!(with_code["message"], "Unknown parameter: 'session.bogus'.");
+        assert!(with_code["timestamp"].is_i64());
+
+        let without_code = serde_json::to_value(ProviderErrorEvent::new(None, "m", 10)).unwrap();
+        assert!(
+            without_code.get("code").is_none(),
+            "absent code must be omitted, not null"
+        );
     }
 
     #[test]
@@ -2864,7 +3028,7 @@ mod tests {
             |_| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         let recorded = events.lock().unwrap();
@@ -3011,7 +3175,7 @@ mod tests {
             |_| {},
             None,
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -3094,7 +3258,7 @@ mod tests {
             |_| {},
             None,
             move |m: u32, u: u64, b: BudgetConfig| sink.lock().unwrap().push((m, u, b)),
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -3179,7 +3343,7 @@ mod tests {
             |_| {},
             None,
             move |m: u32, u: u64, b: BudgetConfig| sink.lock().unwrap().push((m, u, b)),
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -3267,7 +3431,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -3321,7 +3485,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -3399,7 +3563,7 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let (mut cap_warned, mut journal_drop_warned) = (false, false);
+        let (mut cap_warned, mut journal_drop_warned, mut benign_err_warned) = (false, false, false);
         handle_text(
             usage,
             provider,
@@ -3412,8 +3576,10 @@ mod tests {
             &mut dispatch_tasks,
             &mut cap_warned,
             &mut journal_drop_warned,
+            &mut benign_err_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
-        &|_ci: &str, _tn: &str| {},)
+        &|_ci: &str, _tn: &str| {},
+        &|_c: Option<&str>, _m: &str| {},)
         .await
     }
 
@@ -3669,7 +3835,7 @@ mod tests {
         let mut dispatch_tasks = tokio::task::JoinSet::new();
         // The carry + failure count now live in the SHARED `cost` tracker (so they
         // survive between frames AND across a reconnect — koe-byf), not in locals.
-        let (mut cap_warned, mut journal_drop_warned) = (false, false);
+        let (mut cap_warned, mut journal_drop_warned, mut benign_err_warned) = (false, false, false);
 
         // Frame 1: add fails; the $10 is carried, gate sees only $10 (< $15 cap).
         let r1 = handle_text(
@@ -3684,8 +3850,10 @@ mod tests {
             &mut dispatch_tasks,
             &mut cap_warned,
             &mut journal_drop_warned,
+            &mut benign_err_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
-        &|_ci: &str, _tn: &str| {},)
+        &|_ci: &str, _tn: &str| {},
+        &|_c: Option<&str>, _m: &str| {},)
         .await;
         assert!(
             matches!(r1, LoopAction::Continue),
@@ -3712,8 +3880,10 @@ mod tests {
             &mut dispatch_tasks,
             &mut cap_warned,
             &mut journal_drop_warned,
+            &mut benign_err_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
-        &|_ci: &str, _tn: &str| {},)
+        &|_ci: &str, _tn: &str| {},
+        &|_c: Option<&str>, _m: &str| {},)
         .await;
         assert!(
             matches!(r2, LoopAction::Stop("monthly budget exceeded")),
@@ -3756,7 +3926,7 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let (mut cap_warned, mut journal_drop_warned) = (false, false);
+        let (mut cap_warned, mut journal_drop_warned, mut benign_err_warned) = (false, false, false);
         // Pre-seed the SHARED tracker's carry with unpersisted $5 left over from an
         // EARLIER month (tracker_month - 1). koe-byf moved the carry into CostTracker
         // so it survives reconnects; tests seed/assert it there instead of a local.
@@ -3778,8 +3948,10 @@ mod tests {
             &mut dispatch_tasks,
             &mut cap_warned,
             &mut journal_drop_warned,
+            &mut benign_err_warned,
         &|_mo: u32, _us: u64, _bg: BudgetConfig| {},
-        &|_ci: &str, _tn: &str| {},)
+        &|_ci: &str, _tn: &str| {},
+        &|_c: Option<&str>, _m: &str| {},)
         .await;
         assert!(
             matches!(result, LoopAction::Continue),
@@ -3876,7 +4048,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
         assert!(log.lock().unwrap().iter().any(|(s, _)| s == "idle"));
@@ -3999,7 +4171,7 @@ mod tests {
             |_| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         // Both journal writes (the transcript + the tool turn) were actually
@@ -4063,7 +4235,7 @@ mod tests {
             |_| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         assert!(
@@ -4116,7 +4288,7 @@ mod tests {
             |_| {},
             None,
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         // The recoverable disconnect returns `Reconnect` and emits NO terminal status
@@ -4169,7 +4341,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
         assert_eq!(outcome, ConnectionOutcome::Reconnect);
@@ -4231,6 +4403,7 @@ mod tests {
             None,
             |_m: u32, _u: u64, _b: BudgetConfig| {},
             |_c: &str, _t: &str| {},
+            |_c: Option<&str>, _m: &str| {},
         )
         .await;
         assert_eq!(outcome, ConnectionOutcome::Reconnect);
@@ -4285,7 +4458,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
         assert_eq!(disp.calls.lock().unwrap().as_slice(), ["write_note"]);
@@ -4325,7 +4498,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
         assert!(log
@@ -4373,7 +4546,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
         // The unparseable frame was skipped and the following valid call dispatched.
@@ -4438,7 +4611,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -4447,6 +4620,91 @@ mod tests {
         assert_eq!(calls.len(), 2, "expected 2 audio_handler calls, got {}", calls.len());
         assert_eq!(calls[0], "response.audio.delta");
         assert_eq!(calls[1], "response.done");
+    }
+
+    /// Drives `run_read_loop` over `frames` collecting every surfaced
+    /// (code, message) from the provider-error emitter (koe-nal).
+    async fn collect_provider_errors(
+        frames: Vec<serde_json::Value>,
+    ) -> Vec<(Option<String>, String)> {
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, _rx) = mpsc::channel::<Message>(8);
+        let (_sd, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+        let errors: Arc<StdMutex<Vec<(Option<String>, String)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&errors);
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            Arc::new(NoopDispatcher) as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {}, // no-op audio_handler (no device in test)
+            Arc::new(AtomicBool::new(true)),
+            |_| {}, // no-op stop_audio (no device in test)
+            None,
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {},
+            move |code: Option<&str>, message: &str| {
+                sink.lock()
+                    .unwrap()
+                    .push((code.map(str::to_string), message.to_string()));
+            },
+        )
+        .await;
+        Arc::try_unwrap(errors).unwrap().into_inner().unwrap()
+    }
+
+    /// koe-nal: a non-benign server `error` frame is surfaced through the
+    /// provider-error emitter with its sanitized code + message, and the loop
+    /// CONTINUES — frames after the error are still processed (the session is
+    /// not torn down by a mid-session error frame).
+    #[tokio::test]
+    async fn server_error_frame_surfaces_provider_error_and_continues() {
+        let errors = collect_provider_errors(vec![
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "unknown_parameter",
+                    "message": "Unknown parameter: 'session.bogus'."
+                }
+            }),
+            // A frame AFTER the error — the loop must still be alive to see it
+            // (it parses to Ignored; reaching the end of the stream cleanly is
+            // the liveness proof).
+            serde_json::json!({ "type": "response.created" }),
+        ])
+        .await;
+        assert_eq!(errors.len(), 1, "exactly one provider-error must surface");
+        assert_eq!(errors[0].0.as_deref(), Some("unknown_parameter"));
+        assert_eq!(errors[0].1, "Unknown parameter: 'session.bogus'.");
+    }
+
+    /// koe-nal + koe-bx7: the benign barge-in cancel race ("no active response"
+    /// answers to the ungated `response.cancel`) is steady-state noise — it must
+    /// NOT reach the provider-error emitter (no user-facing alarm).
+    #[tokio::test]
+    async fn benign_cancel_error_is_suppressed_from_ui() {
+        let errors = collect_provider_errors(vec![serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "response_cancel_not_active",
+                "message": "Cancellation failed: no active response found."
+            }
+        })])
+        .await;
+        assert!(errors.is_empty(), "benign cancel noise must not surface: {errors:?}");
     }
 
     /// Barge-in (koe-bx7), protocol half: a server `speech_started` frame makes
@@ -4497,7 +4755,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -4559,7 +4817,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -4622,7 +4880,7 @@ mod tests {
             |_| {}, // no-op stop_audio (no device in test)
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -4676,7 +4934,7 @@ mod tests {
             move |_| { sac.store(true, Ordering::SeqCst); },
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
         let events = log.lock().unwrap();
@@ -4726,7 +4984,7 @@ mod tests {
             move |_| { sc.store(true, Ordering::SeqCst); },
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
         let events = log.lock().unwrap();
@@ -4780,7 +5038,7 @@ mod tests {
             |_| {},
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
         // The oversized frame was dropped but the following valid dispatch fired.
@@ -4829,7 +5087,7 @@ mod tests {
             |_| {},
             None, // no write task to abort in unit tests
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
         // Oversized args must be dropped — the tool must NOT be dispatched.
@@ -4896,7 +5154,7 @@ mod tests {
             move |_| { sc.store(true, Ordering::SeqCst); },
             Some(abort_handle),
         |_month: u32, _used: u64, _budget: BudgetConfig| {},
-        |_call_id: &str, _tool: &str| {},)
+        |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},)
         .await;
 
         // Verify the emitted events show an abnormal exit.
@@ -4982,7 +5240,7 @@ mod tests {
             |_| {},
             None, // normal close: don't pass AbortHandle so writer runs to completion
             |_month: u32, _used: u64, _budget: BudgetConfig| {},
-            |_call_id: &str, _tool: &str| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
         )
         .await;
 
@@ -5062,7 +5320,7 @@ mod tests {
         let (rec_tx, _rec_rx) = mpsc::channel::<ConversationRecord>(8);
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
-        let (mut cap_warned, mut journal_drop_warned) = (false, false);
+        let (mut cap_warned, mut journal_drop_warned, mut benign_err_warned) = (false, false, false);
         let action = handle_text(
             frame,
             provider,
@@ -5075,8 +5333,10 @@ mod tests {
             &mut dispatch_tasks,
             &mut cap_warned,
             &mut journal_drop_warned,
+            &mut benign_err_warned,
             &move |mo: u32, us: u64, bg: BudgetConfig| sink.lock().unwrap().push((mo, us, bg)),
             &|_call_id: &str, _tool: &str| {},
+            &|_c: Option<&str>, _m: &str| {},
         )
         .await;
         (action, emits)
@@ -5271,6 +5531,7 @@ mod tests {
             latest,
             |_m: u32, _u: u64, _b: BudgetConfig| {},
             |_c: &str, _t: &str| {},
+            |_c: Option<&str>, _m: &str| {},
             cfg,
             || 0.0_f64,
         )
@@ -5676,6 +5937,7 @@ mod tests {
             latest,
             |_m: u32, _u: u64, _b: BudgetConfig| {},
             |_c: &str, _t: &str| {},
+            |_c: Option<&str>, _m: &str| {},
             fast_reconnect_cfg(5),
             || 0.0_f64,
         )
@@ -5871,6 +6133,7 @@ mod tests {
             latest,
             |_m: u32, _u: u64, _b: BudgetConfig| {},
             |_c: &str, _t: &str| {},
+            |_c: Option<&str>, _m: &str| {},
             fast_reconnect_cfg(5),
             || 0.0_f64,
         ));
@@ -5920,6 +6183,7 @@ mod tests {
             latest,
             |_m: u32, _u: u64, _b: BudgetConfig| {},
             |_c: &str, _t: &str| {},
+            |_c: Option<&str>, _m: &str| {},
             fast_reconnect_cfg(5),
             || 0.0_f64,
         ));
