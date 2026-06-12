@@ -130,10 +130,12 @@ fn path_descriptor(raw: &str) -> Option<String> {
 /// root-level `/home` entry named `alice\x` — the modal would describe a
 /// different target than the one being approved (Codex Cloud P2, PR #57).
 fn path_descriptor_for(raw: &str, windows: bool) -> Option<String> {
-    // Device / verbatim paths (`\\?\`, `\\.\`) bypass Win32 path normalization,
-    // so their components keep trailing dots/spaces verbatim — only NON-verbatim
-    // Windows paths get the trailing-trim display below (R-C finding).
-    let verbatim = windows && is_device_path(raw);
+    // ONLY the `\\?\` "root local device" form bypasses Win32 path
+    // canonicalization (trailing dots/spaces passed through verbatim); `\\.\`
+    // "local device" paths ARE canonicalized, so they must still get the
+    // trailing-trim display below (MS docs + Project Zero Win32→NT analysis,
+    // R-C round 3). Both prefixes are still stripped for display.
+    let verbatim = windows && skips_path_normalization(raw);
     let raw = if windows {
         // `\\?\` / `\\.\` are Windows-only namespaces; on Unix the same bytes
         // are just a (weird) filename and must display as-is.
@@ -283,12 +285,23 @@ fn trim_win32_trailing(c: &str, trim: bool) -> &str {
     }
 }
 
-/// A `\\?\` / `\\.\` (or `//?/`) device / verbatim path. Win32 passes these to
-/// the filesystem WITHOUT trailing-dot/space or `.`/`..` normalization.
+/// A `\\?\` / `\\.\` (or `//?/`, `//./`) device prefix — stripped for display
+/// because the prefix itself is not a meaningful path component. Covers both
+/// the root-local-device (`?`) and local-device (`.`) forms.
 fn is_device_path(raw: &str) -> bool {
     let b = raw.as_bytes();
     let is_sep = |c: u8| c == b'\\' || c == b'/';
     b.len() >= 4 && is_sep(b[0]) && is_sep(b[1]) && (b[2] == b'?' || b[2] == b'.') && is_sep(b[3])
+}
+
+/// The `\\?\` "root local device" prefix (or `//?/`) — the ONLY Win32 form
+/// that disables path canonicalization, so trailing dots/spaces and `.`/`..`
+/// reach the filesystem verbatim. `\\.\` "local device" paths ARE canonicalized
+/// (trailing dot/space removed), so they are deliberately excluded here.
+fn skips_path_normalization(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    let is_sep = |c: u8| c == b'\\' || c == b'/';
+    b.len() >= 4 && is_sep(b[0]) && is_sep(b[1]) && b[2] == b'?' && is_sep(b[3])
 }
 
 /// Strips the Windows verbatim / device namespace prefix (`\\?\`, `\\.\`).
@@ -636,6 +649,15 @@ mod tests {
                 .ends_with("payroll.xlsx. "),
             true
         );
+        // …but \\.\ (local device) IS canonicalized by Win32, so its trailing
+        // junk must be trimmed for display (R-C round 3, verified vs MS docs +
+        // Project Zero Win32→NT path analysis).
+        let dev = path_descriptor_for(r"\\.\C:\Users\Alice\payroll.xlsx. ", true).expect("d");
+        assert!(dev.contains("payroll.xlsx"), "{dev}");
+        assert!(!dev.contains("payroll.xlsx. "), "{dev}");
+        assert!(!skips_path_normalization(r"\\.\C:\x"));
+        assert!(skips_path_normalization(r"\\?\C:\x"));
+        assert!(skips_path_normalization("//?/C:/x"));
     }
 
     #[test]
