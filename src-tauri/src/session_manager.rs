@@ -272,6 +272,17 @@ struct ReconnectConfig {
     /// no usage, then drops) is bounded — after this many reconnects the session fails
     /// closed. Bounds worst-case billable session-opens per start (R-B Critical).
     max_total_reconnects: u32,
+    /// Per-attempt ceiling on how long ONE (re)connect may take before it is abandoned
+    /// as a recoverable failure (koe-9wb). Without this, a TLS/proxy/firewall handshake
+    /// that blackholes the socket hangs until the OS TCP timeout (often 1-3 min), and
+    /// the supervisor stays in `connecting` (= UI "準備中"/loading) the whole time with
+    /// no escape but a user stop. Wrapping each attempt in this timeout turns a hang
+    /// into a `Recoverable("connection timeout")` that rides the SAME bounded backoff →
+    /// `max_attempts`/`max_total_reconnects` → fail-closed path as any transient drop
+    /// (never infinite, never `Fatal`). The frontend escape hatch (koe-5fs) covers the
+    /// per-attempt wait; this bounds the worst case at the source. Injectable so tests
+    /// use a tiny value.
+    connect_timeout: Duration,
 }
 
 impl Default for ReconnectConfig {
@@ -289,6 +300,13 @@ impl Default for ReconnectConfig {
             cap: Duration::from_secs(30),
             min_healthy_uptime: Duration::from_secs(10),
             max_total_reconnects: 20,
+            // 15s: long enough to tolerate a genuinely slow-but-real handshake (congested
+            // wifi / mobile tethering) without false-positiving it as a hang, short enough
+            // that a true blackhole surfaces a retry / fail-closed in a bounded window
+            // instead of waiting out the OS TCP timeout. Aligns with the koe-5fs frontend
+            // "slow connect" watchdog (~12-15s) so the UI shows the escape hatch around the
+            // same time the backend abandons the attempt.
+            connect_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -1107,13 +1125,23 @@ async fn run_session_supervised<C, Fut, F, EC, ET, J>(
             }
         }
 
-        // Race connect against the master stop so a user `stop_session` is responsive
-        // even while a (re)connect is hanging (no per-attempt timeout; OS TCP timeout
-        // bounds the worst case). If the user stops mid-connect, abandon the attempt
-        // and finalize idle — the dropped connect future releases its socket/write
-        // task, and stop_session (which fired master) stops the audio bridge.
+        // Bound each (re)connect two ways (koe-9wb + koe-byf):
+        //   1. `cfg.connect_timeout` caps how long ONE attempt may hang. A blackholed
+        //      TLS/proxy/firewall handshake would otherwise stall until the OS TCP
+        //      timeout (1-3 min) with the UI stuck in `connecting` (= "準備中"). On
+        //      timeout we map to `Recoverable("connection timeout")` so the attempt
+        //      rides the SAME bounded backoff → max_attempts/max_total → fail-closed
+        //      path as any transient drop (never infinite, never `Fatal`).
+        //   2. Race against the master stop so a user `stop_session` stays responsive
+        //      even while an attempt is mid-flight. If the user stops mid-connect,
+        //      abandon the attempt and finalize idle — the dropped connect future
+        //      releases its socket/write task, and stop_session (which fired master)
+        //      stops the audio bridge.
         let connected = tokio::select! {
-            res = connect() => res,
+            res = tokio::time::timeout(cfg.connect_timeout, connect()) => match res {
+                Ok(r) => r,
+                Err(_elapsed) => Err(ConnectError::Recoverable("connection timeout")),
+            },
             _ = &mut master_shutdown => {
                 finalize_session_slot(&session, generation, &latest_generation, None, &emit).await;
                 return;
@@ -5202,6 +5230,11 @@ mod tests {
             cap: Duration::from_millis(1),
             min_healthy_uptime: Duration::ZERO,
             max_total_reconnects: 1_000,
+            // Large on purpose: the hang-based tests here end an attempt via the master
+            // stop (not the timeout), so this must NOT fire first. The connect-timeout
+            // path has its own config with a tiny value
+            // (`supervisor_fails_closed_on_connect_timeout`).
+            connect_timeout: Duration::from_secs(30),
         }
     }
 
@@ -5419,6 +5452,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_fails_closed_on_connect_timeout() {
+        // koe-9wb: a connect that HANGS past `connect_timeout` (a blackholed
+        // TLS/proxy/firewall handshake) must NOT leave the session stuck in `connecting`
+        // (= UI "準備中") forever. Each hung attempt is abandoned at the timeout, mapped
+        // to a RECOVERABLE failure, and rides the SAME backoff → max_attempts →
+        // fail-closed path as any transient drop. Without the timeout (the pre-koe-9wb
+        // behavior) this connect would never resolve and the supervisor would never
+        // surface `reconnecting` or fail closed — the symptom-4 hang.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        // Every connect hangs forever — never Ok, never Err — modelling a handshake that
+        // blackholes. The ONLY thing that ends an attempt is `connect_timeout`.
+        let connect = move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<Connection, ConnectError>>()
+        };
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        const GEN: u64 = 31;
+        let slot: Arc<TokioMutex<Option<ActiveSession>>> =
+            Arc::new(TokioMutex::new(Some(fake_active_session(GEN))));
+        let latest = Arc::new(AtomicU64::new(GEN + 1));
+        let cfg = ReconnectConfig {
+            max_attempts: 3,
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(1),
+            min_healthy_uptime: Duration::ZERO,
+            max_total_reconnects: 1_000, // not the guard under test here
+            // Tiny → a hung connect trips it fast (the path under test). No real time is
+            // saved by going smaller; this keeps the test well under a second.
+            connect_timeout: Duration::from_millis(5),
+        };
+        let (master_tx, master_rx) = oneshot::channel();
+        let log = run_supervisor_collecting(
+            connect,
+            cost,
+            Arc::clone(&slot),
+            GEN,
+            latest,
+            master_rx,
+            cfg,
+        )
+        .await;
+        drop(master_tx);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "max_attempts(3) + 1 final hung attempt, each abandoned at connect_timeout"
+        );
+        let e = log.lock().unwrap();
+        assert_eq!(
+            e.iter().filter(|(s, _)| s == "reconnecting").count(),
+            3,
+            "one reconnecting per retry after a timed-out attempt: {e:?}"
+        );
+        assert!(
+            e.iter().any(|(s, err)| s == "error" && err.as_deref() == Some("reconnect failed")),
+            "a persistently hung connect fails closed (not infinite 準備中): {e:?}"
+        );
+        assert!(!e.iter().any(|(s, _)| s == "connected"), "a hung connect never connects");
+        assert!(slot.lock().await.is_none(), "slot cleared on fail-closed");
+    }
+
+    #[tokio::test]
     async fn supervisor_fails_closed_on_flapping_short_connections() {
         // CRITICAL (R-B): a server that completes the handshake/setup then drops almost
         // immediately (no usage frame → the budget gate never fires) must NOT reconnect
@@ -5449,6 +5549,7 @@ mod tests {
             // No in-test connection lasts this long, so NONE counts as "healthy".
             min_healthy_uptime: Duration::from_secs(3600),
             max_total_reconnects: 1_000, // not the guard under test here
+            connect_timeout: Duration::from_secs(30), // connects resolve instantly here
         };
         let (master_tx, master_rx) = oneshot::channel();
         let log = run_supervisor_collecting(
@@ -5504,6 +5605,7 @@ mod tests {
             cap: Duration::from_millis(1),
             min_healthy_uptime: Duration::ZERO, // every drop resets `attempt`
             max_total_reconnects: 3,            // the guard under test
+            connect_timeout: Duration::from_secs(30), // connects resolve instantly here
         };
         let (master_tx, master_rx) = oneshot::channel();
         let log = run_supervisor_collecting(
