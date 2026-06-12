@@ -577,18 +577,19 @@ const SERVER_ERROR_CODE_MAX_CHARS: usize = 64;
 /// rides an event payload.
 const SERVER_ERROR_MESSAGE_MAX_CHARS: usize = 200;
 
-/// Display-hygienes a server-controlled string before it may reach the UI:
-/// key-shaped substrings are masked FIRST (on the uncapped string, so a cap
-/// cannot split a key out of pattern reach), then control / invisible-bidi
-/// chars become U+FFFD (same discipline as the approval-modal descriptors,
-/// `display_descriptor::sanitize_display`), then the result is capped to
-/// `max_chars` characters (char-boundary safe).
+/// Display-hygienes a server-controlled string before it may reach the UI.
+/// Order matters (CodeRabbit Major, PR #61): hygiene FIRST — every control /
+/// invisible-bidi char collapses to U+FFFD (`display_descriptor::
+/// sanitize_display`) — then key masking SECOND, treating U+FFFD as
+/// transparent, so a server interleaving invisible chars inside a key
+/// (`s\u{202E}k-…`) cannot split the pattern out of the mask's reach; the cap
+/// runs LAST so truncation cannot cut a key out of detection either.
 fn sanitize_server_text(s: &str, max_chars: usize) -> String {
-    let sanitized = crate::display_descriptor::sanitize_display(&mask_key_material(s));
-    if sanitized.chars().count() > max_chars {
-        sanitized.chars().take(max_chars).collect()
+    let masked = mask_key_material(&crate::display_descriptor::sanitize_display(s));
+    if masked.chars().count() > max_chars {
+        masked.chars().take(max_chars).collect()
     } else {
-        sanitized
+        masked
     }
 }
 
@@ -603,61 +604,116 @@ fn sanitize_server_text(s: &str, max_chars: usize) -> String {
 /// - `sk-` + 8+ key chars (OpenAI-style secret keys)
 /// - `AIza` + 30+ key chars (Google API keys, koe-31u multi-provider)
 /// - `Bearer ` + 8+ non-space (echoed Authorization header)
+/// The replacement char `sanitize_display` leaves where a display-hostile char
+/// was. Key DETECTION treats it as TRANSPARENT (skipped, not counted): a
+/// server interleaving invisible/bidi chars inside a key — `s\u{202E}k-…`,
+/// `sk-proj\u{200B}…` — has them collapsed to U+FFFD by the hygiene pass, and
+/// the mask must still see the key through them (CodeRabbit Major, PR #61).
+/// Requires `mask_key_material` to run AFTER `sanitize_display`.
+const MASK_TRANSPARENT: char = '\u{FFFD}';
+
 fn mask_key_material(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let is_key_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    // Punctuation a provider uses when it PARTIALLY redacts a key itself
+    // ("sk-...abcd", "sk-proj-********abcd") — the un-hidden tail is still key
+    // material and must not reach the WebView (Codex P2, PR #61).
+    let is_redaction_char = |c: char| matches!(c, '*' | '.' | '…');
     // A match only starts at a word boundary so prose like "task-12345678" is
     // not laundered into a mask (false positives are harmless but noisy).
     let at_boundary =
         |i: usize, chars: &[char]| i == 0 || !chars[i - 1].is_ascii_alphanumeric();
+
+    /// Matches `pattern` at `chars[from..]` (ASCII-case-insensitively when
+    /// `ci`), skipping transparent chars between pattern chars; returns the
+    /// index just past the match.
+    fn match_prefix(chars: &[char], from: usize, pattern: &str, ci: bool) -> Option<usize> {
+        let mut i = from;
+        for p in pattern.chars() {
+            while i < chars.len() && chars[i] == MASK_TRANSPARENT {
+                i += 1;
+            }
+            let c = *chars.get(i)?;
+            let matched = if ci { c.to_ascii_lowercase() == p } else { c == p };
+            if !matched {
+                return None;
+            }
+            i += 1;
+        }
+        Some(i)
+    }
+
+    // Consumes a key body at `chars[from..]`: key chars (and redaction
+    // punctuation when `redaction`) count toward the caller's threshold;
+    // transparent chars are consumed into the masked span without counting.
+    let consume_body = |from: usize, redaction: bool| -> (usize, usize) {
+        let mut j = from;
+        let mut counted = 0usize;
+        while j < chars.len() {
+            let c = chars[j];
+            if c == MASK_TRANSPARENT {
+                j += 1;
+            } else if is_key_char(c) || (redaction && is_redaction_char(c)) {
+                counted += 1;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        (j, counted)
+    };
+
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < chars.len() {
-        if at_boundary(i, &chars) && chars[i..].starts_with(&['s', 'k', '-']) {
-            let mut j = i + 3;
-            while j < chars.len() && is_key_char(chars[j]) {
-                j += 1;
-            }
-            if j - (i + 3) >= 8 {
-                out.push_str("sk-***");
-                i = j;
-                continue;
-            }
-        }
-        if at_boundary(i, &chars) && chars[i..].starts_with(&['A', 'I', 'z', 'a']) {
-            let mut j = i + 4;
-            while j < chars.len() && is_key_char(chars[j]) {
-                j += 1;
-            }
-            if j - (i + 4) >= 30 {
-                out.push_str("AIza***");
-                i = j;
-                continue;
-            }
-        }
-        // "Bearer" is an HTTP auth scheme — case-insensitive by spec, and the
-        // echoing server controls the whitespace, so accept any case + 1..n
-        // ASCII whitespace before the token (R-C).
-        if at_boundary(i, &chars)
-            && i + 6 <= chars.len()
-            && chars[i..i + 6]
-                .iter()
-                .zip("bearer".chars())
-                .all(|(c, b)| c.to_ascii_lowercase() == b)
-        {
-            let mut t = i + 6;
-            while t < chars.len() && chars[t].is_whitespace() {
-                t += 1;
-            }
-            if t > i + 6 {
-                let mut j = t;
-                while j < chars.len() && !chars[j].is_whitespace() {
-                    j += 1;
-                }
-                if j - t >= 8 {
-                    out.push_str("Bearer ***");
+        if at_boundary(i, &chars) {
+            // OpenAI-style secret key. The 4-char body threshold (not 8)
+            // deliberately also catches provider-redacted FRAGMENTS like
+            // "sk-...abcd" — once the distinctive prefix matched, masking a
+            // short prose token is a harmless false positive, while an
+            // un-masked redacted tail is key material in the WebView.
+            if let Some(after) = match_prefix(&chars, i, "sk-", false) {
+                let (j, counted) = consume_body(after, true);
+                if counted >= 4 {
+                    out.push_str("sk-***");
                     i = j;
                     continue;
+                }
+            }
+            // Google API key (koe-31u multi-provider).
+            if let Some(after) = match_prefix(&chars, i, "AIza", false) {
+                let (j, counted) = consume_body(after, true);
+                if counted >= 30 {
+                    out.push_str("AIza***");
+                    i = j;
+                    continue;
+                }
+            }
+            // Echoed Authorization header. The scheme is case-insensitive by
+            // spec; the separator accepts 1+ whitespace AND/OR transparent
+            // chars (a zero-width separator collapsed to U+FFFD must not
+            // un-anchor the token).
+            if let Some(after) = match_prefix(&chars, i, "bearer", true) {
+                let mut t = after;
+                while t < chars.len()
+                    && (chars[t].is_whitespace() || chars[t] == MASK_TRANSPARENT)
+                {
+                    t += 1;
+                }
+                if t > after {
+                    let mut j = t;
+                    let mut counted = 0usize;
+                    while j < chars.len() && !chars[j].is_whitespace() {
+                        if chars[j] != MASK_TRANSPARENT {
+                            counted += 1;
+                        }
+                        j += 1;
+                    }
+                    if counted >= 8 {
+                        out.push_str("Bearer ***");
+                        i = j;
+                        continue;
+                    }
                 }
             }
         }
@@ -1079,6 +1135,67 @@ mod tests {
             "key AIza*** here"
         );
         assert_eq!(mask_key_material("plain message"), "plain message");
+    }
+
+    #[test]
+    fn parse_frame_server_error_masks_bidi_interleaved_key() {
+        // CodeRabbit Major (PR #61): a server interleaving invisible/bidi chars
+        // inside the key (s\u{202E}k-…, sk-pr\u{200B}oj-…) must not slip the
+        // key past the mask — hygiene collapses them to U+FFFD and the mask
+        // treats U+FFFD as transparent.
+        let p = OpenAiRealtime::new();
+        let key_tail = "A".repeat(24);
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": {
+                "message": format!(
+                    "bad key s\u{202E}k-proj-{key_tail} and sk-pr\u{200B}oj-{key_tail} end"
+                )
+            }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { message, .. }] => {
+                assert!(
+                    !message.contains(&key_tail),
+                    "interleaved key must be masked: {message:?}"
+                );
+                assert!(message.contains("sk-***"), "mask marker expected: {message:?}");
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_server_error_masks_provider_redacted_fragment() {
+        // Codex P2 (PR #61): a provider-redacted fragment ("sk-...abcd") is
+        // still key material — the un-hidden tail must not reach the WebView.
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": { "message": "Incorrect API key provided: sk-...WXYZ" }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { message, .. }] => {
+                assert!(!message.contains("WXYZ"), "redacted tail must be masked: {message:?}");
+                assert!(message.contains("sk-***"), "mask marker expected: {message:?}");
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn mask_key_material_skips_transparent_chars() {
+        // Direct unit check of the post-hygiene contract: U+FFFD (what hygiene
+        // leaves behind) is transparent in the prefix, the body, and the
+        // Bearer separator.
+        assert_eq!(
+            mask_key_material(&format!("s\u{FFFD}k-proj-{}", "B".repeat(12))),
+            "sk-***"
+        );
+        assert_eq!(
+            mask_key_material(&format!("Bearer\u{FFFD}tok_{}", "C".repeat(10))),
+            "Bearer ***"
+        );
     }
 
     #[test]
