@@ -122,6 +122,10 @@ function LogRow({ event }: { event: ToolEvent }) {
       </span>
       <span className="koe-log-tool">{event.tool}</span>
       <span className="koe-log-summary">{event.displaySummary}</span>
+      {/* The backend's pre-redacted WHY ("tool not implemented", "declined by
+          operator", caution note…) — without it an error row shows only THAT
+          something failed, not why (koe-r2o R-C). */}
+      {event.detail && <span className="koe-log-detail">{event.detail}</span>}
     </li>
   );
 }

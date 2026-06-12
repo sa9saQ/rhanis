@@ -75,6 +75,17 @@ describe("ActivityLog", () => {
     expect(screen.getByRole("list", { name: "サーバーエラー" })).toBeInTheDocument();
   });
 
+  it("shows the WHY of an error row via the backend detail (koe-r2o)", () => {
+    render(<ActivityLog />);
+    act(() => {
+      useActivityStore.getState().ingestToolEvent({
+        ...ev({ eventId: "e1", actionId: "a1", sequence: 1, phase: "error" }),
+        detail: "tool not implemented",
+      });
+    });
+    expect(screen.getByText("tool not implemented")).toBeInTheDocument();
+  });
+
   it("shows the pending-approval badge", () => {
     render(<ActivityLog />);
     act(() => {

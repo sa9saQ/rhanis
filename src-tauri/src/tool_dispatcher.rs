@@ -6,10 +6,12 @@
 //!    `detail` note here — it never waits for approval, per `koe-caution-tier`).
 //! 3. For `run_command`, enforce the shell DENY_LIST (token-level) BEFORE anything.
 //! 4. Bound the incoming args size (external, attacker-influenced input).
+//!    Then reject an UNREGISTERED tool with phase=error BEFORE the gate
+//!    (koe-r2o — the old Ok-stub showed phase=done for a no-op, and the
+//!    operator must never be interrupted to approve something that cannot run).
 //! 5. Route by tier: SAFE/CAUTION run immediately; DANGER → human gate, a decline
 //!    returns `"user declined"` as the tool output.
-//! 6. Run the registered tool (unregistered → a safe "not yet implemented" stub,
-//!    so koe-s7i can plug real tools later without the dispatcher being dead).
+//! 6. Run the registered tool (koe-s7i plugs real tools in).
 //! 7. Emit phase=done|error and return the `conversation.item.create` +
 //!    `response.create` frames for `session_manager` (koe-e3m) to send.
 //!
@@ -290,6 +292,22 @@ async fn dispatch_impl(
         return function_call_output(&call_id, error_output("arguments too large"));
     }
 
+    // (4.5) Unregistered tool: fail VISIBLY before the human gate (koe-r2o).
+    // The old stub returned Ok (phase=done) — an approved DANGER op that
+    // silently no-ops is indistinguishable from a successful one in the
+    // ActivityLog, a lie in a product whose thesis is calibrated transparency.
+    // Checking BEFORE the gate also means the operator is never interrupted to
+    // approve something that cannot run. After the deny-list (3) on purpose:
+    // a deny-listed command reports the security block, not "not implemented"
+    // (the more safety-relevant signal wins). koe-s7i fills the registry in.
+    let Some(tool) = registry.get(&name) else {
+        io.emit_tool_event(make_event(
+            &seq, &name, &call_id, "error",
+            summary.clone(), Some("tool not implemented".to_string()),
+        ));
+        return function_call_output(&call_id, error_output("tool not implemented"));
+    };
+
     // (5) Gate decision = built-in tier COMPOSED with the user permission policy
     // (koe-351). The policy can only ADD safety: `AutoApprove` skips the gate for
     // an allow-listed target; `Default` keeps the tier behaviour (DANGER gates,
@@ -334,11 +352,8 @@ async fn dispatch_impl(
         return function_call_output(&call_id, error_output("command not permitted"));
     }
 
-    // (6) run the tool. Unregistered → safe stub (koe-s7i fills these in).
-    let result = match registry.get(&name) {
-        Some(t) => (t.func)(args).await,
-        None => Ok("{\"status\":\"tool not yet implemented\"}".to_string()),
-    };
+    // (6) run the tool (presence pinned at 4.5 — `tool` borrows the local Arc).
+    let result = (tool.func)(args).await;
 
     // (7) phase=done|error + frames.
     match result {
@@ -541,6 +556,27 @@ mod tests {
         Arc::new(r)
     }
 
+    /// Registry with a trivial Ok tool registered under `name` — for tests whose
+    /// POINT is the gate / policy / descriptor flow, not the tool body (koe-r2o
+    /// made the unregistered path a pre-gate error, so flow tests must register
+    /// the tool they exercise).
+    fn registry_with(name: &str) -> Arc<ToolRegistry> {
+        let mut r = ToolRegistry::new();
+        r.register(
+            name,
+            Arc::new(|_args: Value| {
+                Box::pin(async move { Ok("{\"status\":\"ran\"}".to_string()) })
+            }),
+            ToolSchema {
+                kind: "function".into(),
+                name: name.into(),
+                description: "test tool".into(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        );
+        Arc::new(r)
+    }
+
     fn call(name: &str, args: Value) -> FunctionCall {
         FunctionCall { call_id: format!("call_{name}"), name: name.into(), args }
     }
@@ -573,31 +609,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregistered_tool_returns_safe_stub_not_panic() {
+    async fn unregistered_tool_fails_visibly_not_stub_ok() {
+        // koe-r2o: the old stub returned Ok + phase=done — "executed" in the
+        // ActivityLog while nothing ran, a lie in a glass-box product. An
+        // unregistered tool must surface phase=error + a fixed detail, and the
+        // model must receive an error frame.
         let io = MockIo::new(ApprovalOutcome::Approved);
         let res = run(&io, Arc::new(ToolRegistry::new()), call("write_note", serde_json::json!({}))).await;
-        assert_eq!(io.phases(), vec!["start", "done"]);
+        assert_eq!(io.phases(), vec!["start", "error"]);
+        let events = io.events.lock().unwrap();
+        assert_eq!(
+            events[1].detail.as_deref(),
+            Some("tool not implemented"),
+            "the error row must say WHY"
+        );
+        drop(events);
         let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
-        assert!(out.contains("not yet implemented"));
+        assert!(out.contains("tool not implemented"), "model must see the error: {out}");
+    }
+
+    #[tokio::test]
+    async fn unregistered_danger_tool_fails_before_the_human_gate() {
+        // koe-r2o: the registry check runs BEFORE the approval gate — the
+        // operator is never interrupted to approve something that cannot run.
+        // Declined MockIo proves the gate was not consulted: if it were, the
+        // output would be "user declined", not "tool not implemented".
+        let io = MockIo::new(ApprovalOutcome::Declined);
+        let res = run(&io, Arc::new(ToolRegistry::new()), call("delete_file", serde_json::json!({"path": "x"}))).await;
+        assert_eq!(io.phases(), vec!["start", "error"]);
+        let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
+        assert!(out.contains("tool not implemented"), "gate must not fire: {out}");
+        assert!(
+            io.approval_summaries().is_empty(),
+            "no approval modal for a tool that cannot run"
+        );
     }
 
     #[tokio::test]
     async fn caution_tool_emits_caution_note_and_runs_without_gate() {
-        // write_file is CAUTION; unregistered here, so it stubs — but the point
-        // is it RUNS (reaches done) without an approval gate, with a caution note.
+        // write_file is CAUTION (registered here — koe-r2o): the point is it
+        // RUNS (reaches done) without an approval gate, with a caution note.
         let io = MockIo::new(ApprovalOutcome::Declined); // would block if gated
-        let res = run(&io, Arc::new(ToolRegistry::new()), call("write_file", serde_json::json!({}))).await;
+        let res = run(&io, registry_with("write_file"), call("write_file", serde_json::json!({}))).await;
         assert_eq!(io.phases(), vec!["start", "done"], "CAUTION must not gate");
         let start = &io.events.lock().unwrap()[0];
         assert_eq!(start.detail.as_deref(), Some("caution: notified, running without approval"));
         let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
-        assert!(out.contains("not yet implemented"));
+        assert!(out.contains("ran"));
     }
 
     #[tokio::test]
     async fn danger_tool_declined_returns_user_declined() {
         let io = MockIo::new(ApprovalOutcome::Declined);
-        let res = run(&io, Arc::new(ToolRegistry::new()), call("delete_file", serde_json::json!({"path": "x"}))).await;
+        let res = run(&io, registry_with("delete_file"), call("delete_file", serde_json::json!({"path": "x"}))).await;
         // start, then error (declined) — never reaches done.
         assert_eq!(io.phases(), vec!["start", "error"]);
         let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
@@ -607,20 +671,27 @@ mod tests {
     #[tokio::test]
     async fn danger_tool_approved_runs() {
         let io = MockIo::new(ApprovalOutcome::Approved);
-        let res = run(&io, Arc::new(ToolRegistry::new()), call("delete_file", serde_json::json!({"path": "x"}))).await;
+        let res = run(&io, registry_with("delete_file"), call("delete_file", serde_json::json!({"path": "x"}))).await;
         assert_eq!(io.phases(), vec!["start", "done"]);
         let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
-        assert!(out.contains("not yet implemented"));
+        assert!(out.contains("ran"));
     }
 
     #[tokio::test]
     async fn run_command_denylist_blocks_before_gate() {
         // Even with approval granted, a deny-listed command never runs.
+        // Registry intentionally EMPTY (do NOT "fix" to registry_with): with
+        // koe-r2o this also pins deny-list (3) firing BEFORE the unregistered
+        // check (4.5) — the security block must win over "tool not implemented".
         let io = MockIo::new(ApprovalOutcome::Approved);
         let res = run(&io, Arc::new(ToolRegistry::new()), call("run_command", serde_json::json!({"command": "rm -rf /"}))).await;
         assert_eq!(io.phases(), vec!["start", "error"]);
         let out = res.conversation_item_create["item"]["output"].as_str().unwrap();
         assert!(out.contains("security policy"));
+        assert!(
+            !out.contains("tool not implemented"),
+            "deny-list must report the security block, not the registry miss"
+        );
     }
 
     #[tokio::test]
@@ -635,7 +706,7 @@ mod tests {
         let io = MockIo::new(ApprovalOutcome::Approved);
         let res = run(
             &io,
-            Arc::new(ToolRegistry::new()),
+            registry_with("run_command"),
             call("run_command", serde_json::json!({"command": "python script.py"})),
         )
         .await;
@@ -683,7 +754,7 @@ mod tests {
         let p = home.join("Documents").join("report.txt");
         let _ = run(
             &io,
-            Arc::new(ToolRegistry::new()),
+            registry_with("delete_file"),
             call("delete_file", serde_json::json!({ "path": p.to_string_lossy() })),
         )
         .await;
@@ -709,7 +780,7 @@ mod tests {
         let io = MockIo::new(ApprovalOutcome::Approved);
         let _ = run(
             &io,
-            Arc::new(ToolRegistry::new()),
+            registry_with("run_command"),
             call("run_command", serde_json::json!({ "command": "ls -la /home/user/secret-dir" })),
         )
         .await;
@@ -729,7 +800,7 @@ mod tests {
         let io = MockIo::new(ApprovalOutcome::Approved);
         let _ = run(
             &io,
-            Arc::new(ToolRegistry::new()),
+            registry_with("open_url"),
             call(
                 "open_url",
                 serde_json::json!({ "url": "https://user:tok-123@site.example/cb?key=apikey" }),
@@ -886,7 +957,7 @@ mod tests {
         let provider: Arc<dyn PolicyProvider> = Arc::new(MockPolicyProvider(PolicyState::Unavailable));
         let res = run_with_policy(
             &io,
-            Arc::new(ToolRegistry::new()),
+            registry_with("read_file"),
             call("read_file", serde_json::json!({ "path": file.to_str().unwrap() })),
             provider,
         )
@@ -913,7 +984,7 @@ mod tests {
         let io = MockIo::new(ApprovalOutcome::Declined); // would block if gated
         run_with_policy(
             &io,
-            Arc::new(ToolRegistry::new()),
+            registry_with("delete_file"),
             call("delete_file", serde_json::json!({ "path": file.to_str().unwrap() })),
             loaded(policy),
         )
@@ -945,7 +1016,7 @@ mod tests {
         let io = MockIo::new(ApprovalOutcome::Declined);
         let res = run_with_policy(
             &io,
-            Arc::new(ToolRegistry::new()),
+            registry_with("read_file"),
             call("read_file", serde_json::json!({ "path": file.to_str().unwrap() })),
             provider,
         )
@@ -982,7 +1053,7 @@ mod tests {
         let io = MockIo::new(ApprovalOutcome::Declined); // would block if gated
         run_with_policy(
             &io,
-            Arc::new(ToolRegistry::new()),
+            registry_with("delete_file"),
             call("delete_file", serde_json::json!({ "path": file.to_str().unwrap() })),
             provider,
         )
