@@ -17,13 +17,14 @@ function makeOn(key: string) {
 vi.mock("../../lib/tauri/ipc", () => ({
   onToolEvent: (h: (p: unknown) => void) => makeOn("tool")(h),
   onThinkingEvent: (h: (p: unknown) => void) => makeOn("thinking")(h),
+  onProviderError: (h: (p: unknown) => void) => makeOn("providerError")(h),
   onApprovalRequired: (h: (p: unknown) => void) => makeOn("approval")(h),
   onSessionStatus: (h: (p: unknown) => void) => makeOn("status")(h),
 }));
 
 import { useActivityStore } from "./activityStore";
 import { useActivityEvents } from "./useActivityEvents";
-import type { ApprovalRequest, ThinkingEvent, ToolEvent } from "./types";
+import type { ApprovalRequest, ProviderErrorEvent, ThinkingEvent, ToolEvent } from "./types";
 
 beforeEach(() => {
   for (const k of Object.keys(handlers)) delete handlers[k];
@@ -32,14 +33,29 @@ beforeEach(() => {
 });
 
 describe("useActivityEvents", () => {
-  it("subscribes to all four channels", async () => {
+  it("subscribes to all five channels", async () => {
     renderHook(() => useActivityEvents());
     await waitFor(() => {
       expect(handlers.tool).toBeTypeOf("function");
       expect(handlers.thinking).toBeTypeOf("function");
+      expect(handlers.providerError).toBeTypeOf("function");
       expect(handlers.approval).toBeTypeOf("function");
       expect(handlers.status).toBeTypeOf("function");
     });
+  });
+
+  it("routes provider errors into the store (koe-nal)", async () => {
+    renderHook(() => useActivityEvents());
+    await waitFor(() => expect(handlers.providerError).toBeTypeOf("function"));
+    const event: ProviderErrorEvent = {
+      eventId: "p1",
+      sequence: 1,
+      code: "unknown_parameter",
+      message: "Unknown parameter: 'session.bogus'.",
+      timestamp: 1000,
+    };
+    act(() => handlers.providerError?.(event));
+    expect(useActivityStore.getState().providerErrors).toHaveLength(1);
   });
 
   it("routes thinking events into the store", async () => {
@@ -92,7 +108,7 @@ describe("useActivityEvents", () => {
 
   it("unlistens every channel on unmount", async () => {
     const { unmount } = renderHook(() => useActivityEvents());
-    await waitFor(() => expect(unlistenSpies).toHaveLength(4));
+    await waitFor(() => expect(unlistenSpies).toHaveLength(5));
     unmount();
     await waitFor(() => {
       for (const spy of unlistenSpies) expect(spy).toHaveBeenCalledTimes(1);

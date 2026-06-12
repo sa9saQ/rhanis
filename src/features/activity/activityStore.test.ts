@@ -3,13 +3,21 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   EVENT_CAP,
   MAX_ACTIONS,
+  PROVIDER_ERROR_CAP,
   THINKING_CAP,
   selectActiveActions,
   selectDisplayStatus,
+  selectRecentProviderErrors,
   selectRecentThinking,
   useActivityStore,
 } from "./activityStore";
-import type { ApprovalRequest, ThinkingEvent, ToolEvent, ToolPhase } from "./types";
+import type {
+  ApprovalRequest,
+  ProviderErrorEvent,
+  ThinkingEvent,
+  ToolEvent,
+  ToolPhase,
+} from "./types";
 
 function ev(
   partial: Pick<ToolEvent, "eventId" | "actionId" | "sequence" | "phase"> & Partial<ToolEvent>,
@@ -42,6 +50,17 @@ function approval(partial: Partial<ApprovalRequest> & { approvalId: string }): A
     displaySummary: "run a shell command",
     deadlineAt: 30_000,
     sequence: 1,
+    ...partial,
+  };
+}
+
+function perr(
+  partial: Pick<ProviderErrorEvent, "eventId" | "sequence"> & Partial<ProviderErrorEvent>,
+): ProviderErrorEvent {
+  return {
+    code: "unknown_parameter",
+    message: "Unknown parameter: 'session.bogus'.",
+    timestamp: partial.sequence * 1000,
     ...partial,
   };
 }
@@ -319,6 +338,71 @@ describe("ingestThinkingEvent — thinking trace (glass-box M1)", () => {
     s.reset();
     expect(useActivityStore.getState().thinking).toHaveLength(0);
     expect(useActivityStore.getState().seenThinkingIds.size).toBe(0);
+  });
+});
+
+describe("ingestProviderError — provider error strip (koe-nal)", () => {
+  it("folds errors newest-first via the selector, ordered by sequence", () => {
+    const s = useActivityStore.getState();
+    s.ingestProviderError(perr({ eventId: "p2", sequence: 20 }));
+    s.ingestProviderError(perr({ eventId: "p1", sequence: 10 }));
+    const recent = selectRecentProviderErrors(useActivityStore.getState());
+    expect(recent.map((e) => e.eventId)).toEqual(["p2", "p1"]);
+  });
+
+  it("de-duplicates by eventId", () => {
+    const s = useActivityStore.getState();
+    s.ingestProviderError(perr({ eventId: "p1", sequence: 1 }));
+    s.ingestProviderError(perr({ eventId: "p1", sequence: 1 }));
+    expect(useActivityStore.getState().providerErrors).toHaveLength(1);
+  });
+
+  it("caps the retained list at PROVIDER_ERROR_CAP (oldest evicted)", () => {
+    const s = useActivityStore.getState();
+    for (let i = 1; i <= PROVIDER_ERROR_CAP + 5; i++) {
+      s.ingestProviderError(perr({ eventId: `p${i}`, sequence: i }));
+    }
+    const state = useActivityStore.getState();
+    expect(state.providerErrors).toHaveLength(PROVIDER_ERROR_CAP);
+    expect(state.providerErrors[0].eventId).toBe("p6"); // p1..p5 evicted
+  });
+
+  it("survives idle / error / reconnecting (sticky post-mortem context)", () => {
+    const s = useActivityStore.getState();
+    s.ingestProviderError(perr({ eventId: "p1", sequence: 1 }));
+    s.setSessionStatus({ state: "reconnecting", sequence: 1 });
+    s.setSessionStatus({ state: "error", error: "boom", sequence: 2 });
+    s.setSessionStatus({ state: "idle", sequence: 3 });
+    expect(useActivityStore.getState().providerErrors).toHaveLength(1);
+  });
+
+  it("clears when a NEW session starts connecting (old rejection is stale)", () => {
+    const s = useActivityStore.getState();
+    s.ingestProviderError(perr({ eventId: "p1", sequence: 1 }));
+    s.setSessionStatus({ state: "connecting", sequence: 1 });
+    const state = useActivityStore.getState();
+    expect(state.providerErrors).toHaveLength(0);
+    expect(state.seenProviderErrorIds.size).toBe(0);
+  });
+
+  it("does not flip the derived display status (non-terminal by design)", () => {
+    const s = useActivityStore.getState();
+    s.setSessionStatus({ state: "connected", sequence: 1 });
+    s.ingestProviderError(perr({ eventId: "p1", sequence: 1 }));
+    expect(selectDisplayStatus(useActivityStore.getState())).toBe("conversing");
+  });
+
+  it("drops a late-DELIVERED error from before the clear (old session, koe-nal R-C)", () => {
+    const s = useActivityStore.getState();
+    // The new session starts: clear happens at status sequence 5.
+    s.setSessionStatus({ state: "connecting", sequence: 5 });
+    // An old-session error emitted at sequence 3 straggles in afterwards
+    // (Tauri channels are independent) — it must NOT pollute the new strip.
+    s.ingestProviderError(perr({ eventId: "p-old", sequence: 3 }));
+    expect(useActivityStore.getState().providerErrors).toHaveLength(0);
+    // A genuinely new error (after the clear) still lands.
+    s.ingestProviderError(perr({ eventId: "p-new", sequence: 7 }));
+    expect(useActivityStore.getState().providerErrors).toHaveLength(1);
   });
 });
 

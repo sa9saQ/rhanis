@@ -141,6 +141,31 @@ export interface ApprovalRequest {
 export type ApprovalDecision = "approve" | "deny";
 
 /**
+ * Emitted by the backend on the `provider-error` channel when the realtime
+ * server reports a NON-benign `error` frame (koe-nal) — e.g. a rejected
+ * `session.update`, which silently disables tools / ASR / journaling while
+ * audio keeps flowing. Deliberately NOT a `session-status: error`: that state
+ * is the TERMINAL contract below, and a mid-session error frame does not end
+ * the session. The backend pre-sanitizes + length-caps `code`/`message`
+ * (server-controlled strings; control/bidi chars are already U+FFFD) and
+ * suppresses the expected barge-in cancel race (koe-bx7) before emitting.
+ * Same dedup/ordering discipline as {@link ToolEvent}: `eventId` de-duplicates,
+ * `sequence` (the same globally-monotonic counter) orders.
+ */
+export interface ProviderErrorEvent {
+  /** Unique per emit. Primary de-duplication key. */
+  eventId: string;
+  /** Globally monotonic counter (shared space with ToolEvent.sequence). */
+  sequence: number;
+  /** Sanitized, capped provider error code (e.g. "unknown_parameter"). */
+  code?: string;
+  /** Sanitized, capped provider error message. */
+  message: string;
+  /** Backend epoch milliseconds. */
+  timestamp: number;
+}
+
+/**
  * Raw connection state reported by the backend on `session-status`.
  * `reconnecting` (koe-byf) is emitted by the session supervisor while it
  * exponential-backoff-retries a recoverable transport drop; the session is NOT

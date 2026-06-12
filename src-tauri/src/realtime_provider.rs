@@ -168,6 +168,24 @@ pub enum ProviderEvent {
     /// [`PlaybackHandle::handle_server_audio`]: crate::audio_bridge::PlaybackHandle::handle_server_audio
     /// [`cancel_frame`]: RealtimeProvider::cancel_frame
     SpeechStarted,
+    /// A server-reported `error` frame (koe-nal), normalized to a sanitized,
+    /// length-capped code + message (the strings are server-controlled display
+    /// input — see [`sanitize_server_text`]). Previously these frames fell
+    /// through to [`Ignored`], so a rejected `session.update` silently killed
+    /// tool advertisement / ASR / journaling / thinking-events in one stroke
+    /// while audio kept flowing. `benign` marks the expected barge-in cancel
+    /// race — [`cancel_frame`] is sent ungated on every speech start, so the
+    /// provider answering "no active response" is steady-state noise (koe-bx7)
+    /// — letting the session loop journal it WITHOUT alarming the user, while
+    /// every other error is surfaced to the UI.
+    ///
+    /// [`Ignored`]: ProviderEvent::Ignored
+    /// [`cancel_frame`]: RealtimeProvider::cancel_frame
+    ServerError {
+        code: Option<String>,
+        message: String,
+        benign: bool,
+    },
     /// Streaming transcript delta / ack / blank transcript / unknown — the loop
     /// continues without action (and records nothing).
     Ignored,
@@ -205,9 +223,14 @@ pub trait RealtimeProvider: Send + Sync + 'static {
     /// with `response.cancel` — sent UNGATED on every speech start because the
     /// client does not track response lifecycle; when no response is active
     /// (or the server's VAD `interrupt_response` already cancelled it) the
-    /// server answers with a benign `error` frame that `parse_frame` maps to
-    /// [`ProviderEvent::Ignored`]. koe-nal (error surfacing) must keep that
-    /// duplicate-cancel error classified as benign.
+    /// server answers with a duplicate-cancel `error` frame that `parse_frame`
+    /// maps to [`ProviderEvent::ServerError`] with `benign: true` (koe-nal,
+    /// see `is_benign_cancel_error`) — the session loop suppresses it from the
+    /// UI instead of alarming the operator. That classification is part of
+    /// this contract: error surfacing must keep the duplicate-cancel answer
+    /// benign.
+    ///
+    /// [`ProviderEvent::ServerError`]: ProviderEvent::ServerError
     fn cancel_frame(&self) -> Option<Message> {
         None
     }
@@ -273,8 +296,9 @@ impl RealtimeProvider for OpenAiRealtime {
         // `response.cancel` stops the in-flight response. Sent ungated on every
         // speech start (see the trait doc): with the GA default server VAD the
         // server has usually interrupted already, and a cancel with no active
-        // response yields a benign `error` frame (Ignored today; koe-nal keeps
-        // it benign). Static shape — no per-call state, mirrors initial_frames.
+        // response yields a duplicate-cancel `error` frame that parse_frame
+        // classifies `ServerError { benign: true }` (koe-nal) — suppressed from
+        // the UI. Static shape — no per-call state, mirrors initial_frames.
         Some(Message::Text(
             serde_json::json!({ "type": "response.cancel" }).to_string().into(),
         ))
@@ -395,6 +419,35 @@ impl RealtimeProvider for OpenAiRealtime {
                 }],
                 None => vec![],
             },
+            // Server-reported error (koe-nal). Previously fell through to the
+            // `_ => Ignored` catch-all, silently swallowing e.g. a rejected
+            // `session.update` — which disables tools / ASR / journaling /
+            // thinking-events in one stroke while audio keeps flowing. The
+            // code/message strings are server-controlled: sanitized (control /
+            // bidi chars → U+FFFD, same hygiene as `display_descriptor`) and
+            // length-capped before they may ride a UI payload. The benign
+            // classification is deliberately narrow (the koe-bx7 cancel race
+            // only — see `is_benign_cancel_error`); anything else surfaces.
+            // The live error payload shape is pinned in koe-ef8; until then a
+            // missing `error` object still yields a visible, generic message
+            // (fail-visible, not fail-silent).
+            Some("error") => {
+                let err = event.get("error");
+                let code = err
+                    .and_then(|e| e.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|c| sanitize_server_text(c, SERVER_ERROR_CODE_MAX_CHARS));
+                let message = err
+                    .and_then(|e| e.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|m| sanitize_server_text(m, SERVER_ERROR_MESSAGE_MAX_CHARS))
+                    // An empty / whitespace-only message is as silent as a
+                    // missing one — fall back to the visible generic (R-B).
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or_else(|| "(provider sent an error frame with no message)".to_string());
+                let benign = is_benign_cancel_error(code.as_deref(), &message);
+                vec![ProviderEvent::ServerError { code, message, benign }]
+            }
             _ => vec![ProviderEvent::Ignored],
         }
     }
@@ -512,6 +565,130 @@ fn transcript_text(event: &Value) -> Option<String> {
         Some(text) if !text.trim().is_empty() => Some(text.to_string()),
         _ => None,
     }
+}
+
+// ---- server error normalization (koe-nal) --------------------------------------
+
+/// Max characters of a server error `code` kept for display (codes are short
+/// identifiers; anything longer is suspicious padding).
+const SERVER_ERROR_CODE_MAX_CHARS: usize = 64;
+/// Max characters of a server error `message` kept for display. Enough for any
+/// real OpenAI error sentence; bounds an attacker-controlled string before it
+/// rides an event payload.
+const SERVER_ERROR_MESSAGE_MAX_CHARS: usize = 200;
+
+/// Display-hygienes a server-controlled string before it may reach the UI:
+/// key-shaped substrings are masked FIRST (on the uncapped string, so a cap
+/// cannot split a key out of pattern reach), then control / invisible-bidi
+/// chars become U+FFFD (same discipline as the approval-modal descriptors,
+/// `display_descriptor::sanitize_display`), then the result is capped to
+/// `max_chars` characters (char-boundary safe).
+fn sanitize_server_text(s: &str, max_chars: usize) -> String {
+    let sanitized = crate::display_descriptor::sanitize_display(&mask_key_material(s));
+    if sanitized.chars().count() > max_chars {
+        sanitized.chars().take(max_chars).collect()
+    } else {
+        sanitized
+    }
+}
+
+/// Masks key-shaped substrings before a server-controlled string may ride a UI
+/// payload or stderr (koe-nal R-B). An HONEST provider error already echoes
+/// partial key material ("Incorrect API key provided: sk-…") and a malicious
+/// provider can echo the full Bearer credential — and "the raw key never
+/// reaches the WebView / a Tauri event payload / a log line" is a hard koe
+/// boundary (CLAUDE.md BYOK discipline), kept even though the provider itself
+/// obviously already holds the key. Patterns (word-boundary anchored, masked
+/// whole — never partially preserved):
+/// - `sk-` + 8+ key chars (OpenAI-style secret keys)
+/// - `AIza` + 30+ key chars (Google API keys, koe-31u multi-provider)
+/// - `Bearer ` + 8+ non-space (echoed Authorization header)
+fn mask_key_material(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let is_key_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    // A match only starts at a word boundary so prose like "task-12345678" is
+    // not laundered into a mask (false positives are harmless but noisy).
+    let at_boundary =
+        |i: usize, chars: &[char]| i == 0 || !chars[i - 1].is_ascii_alphanumeric();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if at_boundary(i, &chars) && chars[i..].starts_with(&['s', 'k', '-']) {
+            let mut j = i + 3;
+            while j < chars.len() && is_key_char(chars[j]) {
+                j += 1;
+            }
+            if j - (i + 3) >= 8 {
+                out.push_str("sk-***");
+                i = j;
+                continue;
+            }
+        }
+        if at_boundary(i, &chars) && chars[i..].starts_with(&['A', 'I', 'z', 'a']) {
+            let mut j = i + 4;
+            while j < chars.len() && is_key_char(chars[j]) {
+                j += 1;
+            }
+            if j - (i + 4) >= 30 {
+                out.push_str("AIza***");
+                i = j;
+                continue;
+            }
+        }
+        // "Bearer" is an HTTP auth scheme — case-insensitive by spec, and the
+        // echoing server controls the whitespace, so accept any case + 1..n
+        // ASCII whitespace before the token (R-C).
+        if at_boundary(i, &chars)
+            && i + 6 <= chars.len()
+            && chars[i..i + 6]
+                .iter()
+                .zip("bearer".chars())
+                .all(|(c, b)| c.to_ascii_lowercase() == b)
+        {
+            let mut t = i + 6;
+            while t < chars.len() && chars[t].is_whitespace() {
+                t += 1;
+            }
+            if t > i + 6 {
+                let mut j = t;
+                while j < chars.len() && !chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j - t >= 8 {
+                    out.push_str("Bearer ***");
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Whether a server error is the EXPECTED barge-in cancel race: koe-bx7 sends
+/// `response.cancel` ungated on every `speech_started`, so "there is no active
+/// response to cancel" answers are steady-state noise, not a failure (pinned in
+/// the `cancel_frame` trait doc and the koe-nal issue note). Deliberately
+/// narrow — match the cancel-specific code, or the no-active-response phrasing
+/// ONLY when the message also speaks of cancellation AND is short (the genuine
+/// race answer is one short sentence; a long message that merely QUOTES both
+/// phrases — e.g. a validation error echoing attacker-influenced content —
+/// must still surface, R-B) — so a real failure cannot be laundered into
+/// silence. The phrase fallback exists only until koe-ef8 pins the live wire
+/// code; widen/narrow only with that evidence.
+fn is_benign_cancel_error(code: Option<&str>, message: &str) -> bool {
+    if let Some(c) = code {
+        if c.eq_ignore_ascii_case("response_cancel_not_active") {
+            return true;
+        }
+    }
+    const BENIGN_PHRASE_MAX_CHARS: usize = 120;
+    let m = message.to_ascii_lowercase();
+    m.chars().count() <= BENIGN_PHRASE_MAX_CHARS
+        && m.contains("cancel")
+        && m.contains("no active response")
 }
 
 // ---- provider selection ------------------------------------------------------
@@ -739,6 +916,220 @@ mod tests {
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({ "type": "response.created" });
         assert!(matches!(p.parse_frame(&ev).as_slice(), [ProviderEvent::Ignored]));
+    }
+
+    // ---- server error frames (koe-nal) ------------------------------------------
+
+    #[test]
+    fn parse_frame_server_error_surfaces_code_and_message() {
+        // A rejected session.update must NOT be swallowed (the old behaviour was
+        // the `_ => Ignored` catch-all): it normalizes to a non-benign ServerError
+        // carrying the sanitized code + message.
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "unknown_parameter",
+                "message": "Unknown parameter: 'session.tools[0].bogus'."
+            }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { code, message, benign }] => {
+                assert_eq!(code.as_deref(), Some("unknown_parameter"));
+                assert_eq!(message, "Unknown parameter: 'session.tools[0].bogus'.");
+                assert!(!benign, "a session.update rejection is NOT benign");
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_server_error_cancel_code_is_benign() {
+        // The barge-in cancel race (koe-bx7): cancel sent with no active response
+        // is steady-state noise — classified benign via the cancel-specific code.
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "response_cancel_not_active",
+                "message": "Cancellation failed: no active response found."
+            }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { benign, .. }] => {
+                assert!(benign, "cancel-without-active-response must be benign");
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_server_error_cancel_message_without_code_is_benign() {
+        // Same race, but classified from the message phrasing alone (the live
+        // code is pinned in koe-ef8; until then both signals are accepted).
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": { "message": "Cancellation failed: there is no active response." }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { benign, .. }] => {
+                assert!(benign, "cancel phrasing must classify benign without a code");
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_server_error_no_active_response_alone_is_not_benign() {
+        // "no active response" WITHOUT cancellation wording must surface: the
+        // benign filter is narrow on purpose (a real failure must not be
+        // laundered into silence by a partial phrase match).
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": { "message": "internal error: no active response handler" }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { benign, .. }] => {
+                assert!(!benign, "non-cancel errors must surface");
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_server_error_without_error_object_is_visible_generic() {
+        // A malformed error frame still surfaces (fail-visible, not fail-silent):
+        // generic message, no code, non-benign.
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({ "type": "error" });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { code, message, benign }] => {
+                assert!(code.is_none());
+                assert!(!message.is_empty(), "fallback message must be non-empty");
+                assert!(!benign);
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_server_error_sanitizes_and_caps_display_strings() {
+        // code/message are server-controlled display input: control chars become
+        // U+FFFD and both fields are capped (message 200 / code 64 chars).
+        let p = OpenAiRealtime::new();
+        let long_tail = "x".repeat(SERVER_ERROR_MESSAGE_MAX_CHARS + 50);
+        let long_code = "c".repeat(SERVER_ERROR_CODE_MAX_CHARS + 10);
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": format!("weird\u{0007}{long_code}"),
+                "message": format!("bad\u{202E}thing {long_tail}")
+            }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { code, message, .. }] => {
+                let code = code.as_deref().expect("code present");
+                assert!(code.starts_with("weird\u{FFFD}"), "control char must be defanged: {code:?}");
+                assert_eq!(code.chars().count(), SERVER_ERROR_CODE_MAX_CHARS, "code must be capped");
+                assert!(message.starts_with("bad\u{FFFD}thing"), "bidi override must be defanged: {message:?}");
+                assert_eq!(
+                    message.chars().count(),
+                    SERVER_ERROR_MESSAGE_MAX_CHARS,
+                    "message must be capped"
+                );
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_server_error_masks_echoed_key_material() {
+        // An honest provider error echoes partial key material ("Incorrect API
+        // key provided: sk-…"); a malicious one can echo the full credential.
+        // The BYOK key must never ride a Tauri event payload (koe-nal R-B).
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "invalid_api_key",
+                "message": "Incorrect API key provided: sk-proj-abcdef0123456789abcdef. \
+                            Auth header was Bearer sk-proj-abcdef0123456789abcdef."
+            }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { message, benign, .. }] => {
+                assert!(!message.contains("abcdef0123456789"), "key must be masked: {message:?}");
+                assert!(message.contains("sk-***"), "mask marker expected: {message:?}");
+                assert!(!benign, "an auth failure must surface");
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn mask_key_material_respects_word_boundaries() {
+        // Prose containing "sk-"-shaped substrings mid-word must not be masked
+        // (noise), while boundary-anchored keys (incl. Google AIza…) are.
+        assert_eq!(mask_key_material("task-1234567890 stays"), "task-1234567890 stays");
+        assert_eq!(
+            mask_key_material(&format!("key AIza{} here", "Q".repeat(35))),
+            "key AIza*** here"
+        );
+        assert_eq!(mask_key_material("plain message"), "plain message");
+    }
+
+    #[test]
+    fn mask_key_material_bearer_is_case_insensitive_and_whitespace_tolerant() {
+        // The HTTP auth scheme is case-insensitive and the echoing server
+        // controls the whitespace — a lowercase "bearer" + double space must
+        // still mask a non-`sk-` token (R-C).
+        assert_eq!(
+            mask_key_material("auth was bearer  tok_1234567890 here"),
+            "auth was Bearer *** here"
+        );
+        // "bearer" as prose (no following token) stays untouched.
+        assert_eq!(mask_key_material("the bearer of news"), "the bearer of news");
+    }
+
+    #[test]
+    fn parse_frame_server_error_empty_message_falls_back_to_generic() {
+        // "message": "" is as silent as a missing message — the visible generic
+        // fallback must kick in (fail-visible).
+        let p = OpenAiRealtime::new();
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": { "code": "weird", "message": "   " }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { message, .. }] => {
+                assert!(!message.trim().is_empty(), "fallback must be non-empty: {message:?}");
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_server_error_long_cancel_phrase_is_not_benign() {
+        // A LONG message that merely quotes both benign phrases (e.g. echoing
+        // attacker-influenced content) must still surface — the phrase fallback
+        // only accepts the short genuine race answer (R-B anti-laundering).
+        let p = OpenAiRealtime::new();
+        let padding = "z".repeat(150);
+        let ev = serde_json::json!({
+            "type": "error",
+            "error": {
+                "message": format!("validation failed for value 'cancel no active response {padding}'")
+            }
+        });
+        match p.parse_frame(&ev).as_slice() {
+            [ProviderEvent::ServerError { benign, .. }] => {
+                assert!(!benign, "a long phrase-quoting error must surface");
+            }
+            _ => panic!("expected exactly one ServerError"),
+        }
     }
 
     // ---- barge-in (koe-bx7) ----------------------------------------------------

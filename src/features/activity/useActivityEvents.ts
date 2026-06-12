@@ -8,6 +8,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import {
   onApprovalRequired,
+  onProviderError,
   onSessionStatus,
   onThinkingEvent,
   onToolEvent,
@@ -43,6 +44,7 @@ export function useActivityEvents(): void {
 
     subscribe(onToolEvent, (event) => store.ingestToolEvent(event));
     subscribe(onThinkingEvent, (event) => store.ingestThinkingEvent(event));
+    subscribe(onProviderError, (event) => store.ingestProviderError(event));
     subscribe(onApprovalRequired, (request) => store.enqueueApproval(request));
     subscribe(onSessionStatus, (status) => store.setSessionStatus(status));
 
