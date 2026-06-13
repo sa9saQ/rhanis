@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn persists_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe.db");
+        let path = dir.path().join("rhanis.db");
         {
             let a = SqliteAdapter::open(&path).expect("open 1");
             a.save_note("durable").unwrap();
@@ -471,7 +471,7 @@ mod tests {
         // File-backed: the accumulated total (here a saturated u64::MAX) must
         // survive a restart exactly (persistence + the u64<->i64 bit round-trip).
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe.db");
+        let path = dir.path().join("rhanis.db");
         {
             let a = SqliteAdapter::open(&path).expect("open 1");
             a.add_month_cost(202605, u64::MAX).unwrap();
@@ -531,7 +531,7 @@ mod tests {
         // concurrently: the `BEGIN IMMEDIATE` transaction + busy_timeout serialize
         // the writers, so the persisted total equals the SUM of every successful add.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe.db");
+        let path = dir.path().join("rhanis.db");
         let a = Arc::new(SqliteAdapter::open(&path).expect("open A"));
         let b = Arc::new(SqliteAdapter::open(&path).expect("open B"));
 
