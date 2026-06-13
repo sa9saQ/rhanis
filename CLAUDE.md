@@ -3,7 +3,7 @@
 グローバル `~/.claude/CLAUDE.md` を継承する。本ファイルは **koe 固有** のみ記述する（重複ルールは書かない）。
 
 ## Project Overview
-- **製品名（2026-06-13 確定、SoT=`docs/reviews/2026-06-13-product-name-rhanis.md` / `koe-0xy`）**: フル製品名 = **Rhanis Agent**（ラニスエージェント、別表記 Rhanis AI）。短縮呼称・音声ウェイクワード = **Rhanis**（"Hey Rhanis"）。由来=ギリシャ神話の水のニンフ Rhanis（水のしずく）、中心思想 glass-box と整合。**「Koe」 は開発コードネーム**（bd prefix・repo 名・内部識別子は koe 継続、対外製品名のみ Rhanis Agent。実コード反映 = tauri.conf.json productName/バンドル識別子/package.json は署名 `koe-44h`・配布 `koe-8h0` と整合のため M1.5 配布タスクで一括）
+- **製品名（2026-06-13 確定、SoT=`docs/reviews/2026-06-13-product-name-rhanis.md` / `koe-0xy`）**: フル製品名 = **Rhanis Agent**（ラニスエージェント、別表記 Rhanis AI）。短縮呼称・音声ウェイクワード = **Rhanis**（"Hey Rhanis"）。由来=ギリシャ神話の水のニンフ Rhanis（水のしずく）、中心思想 glass-box と整合。**「Koe」 は旧称 → 全面 Rhanis に統一予定（2026-06-13 user 決定）**: フォルダ名・bd prefix・crate・GitHub repo まで含め `rhanis` へ。破壊的・大規模（フォルダ mv + Claude memory dir 引き継ぎでセッション断絶を伴う）ため **次セッション（専用）で順序厳守の手順書に沿って実行 = `docs/reviews/2026-06-13-rhanis-migration-plan.md`**。移行完了まで暫定で koe 識別子が残る（bd prefix `koe-`・crate `koe`・repo `sa9saQ/koe` 等）
 - **What**: 起動しっぱなしのリアルタイム音声 AI 秘書（デスクトップアプリ）。GPT-Realtime-2 で人と話すように連続会話しながら、裏で PC 操作 / Web 検索 / 記録を実行し、AI が今何をしているかを画面で可視化する
 - **中心思想（2026-06-04 研究で確定、SoT=plan §中心思想 + bd epic koe-sua）**: 「校正された透明性（calibrated glass-box）」。考えていること（検証可能な行為＝実行tool/参照source）と校正済みの確信度（実正解率に合わせた3-4段ラベル）を声と画面で開示し、人間が「いつ介入するか」を判断できる。即答ブラックボックスへのアンチテーゼ。既存19製品+学術で「思考の透明化」だけが真空席（製品0・論文0 ※**2026-06-10 スコープ修正**: 無条件「製品0」は FALSE〔Maven AGI が企業CX・内部向けで校正確信度を実装〕→ 真の主張は「**消費者×音声×PC秘書で校正確信度を end user にリアルタイム開示する製品=0**」。`koe-20f` / `docs/reviews/2026-06-10-competitive-landscape.md`）。詳細 = `~/research/koe-voice-agent-novelty-2026/report.md`
 - **Stack**: Tauri 2 + React 19 + TypeScript + Rust + OpenAI Realtime-2 (WebSocket BYOK)

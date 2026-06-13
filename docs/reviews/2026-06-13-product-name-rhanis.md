@@ -7,7 +7,8 @@
 **フルの製品名 = 「Rhanis Agent」**（ラニスエージェント。user 確定 2026-06-13）。別表記 = Rhanis AI。
 **短縮呼称・音声ウェイクワード = 「Rhanis」**（ラニス）。= 二層運用（フル名でロゴ/ストア表記、短縮で日常呼称・"Hey Rhanis"。cf. "Hey Google" / 製品名 Google Assistant）。
 識別力の源は固有名詞 **Rhanis**（Agent は説明的接尾語）なので、商標出願の核は Rhanis。
-**「Koe」 は開発コードネームに降格**（bd prefix・リポジトリ名・内部識別子は当面 koe を継続使用、対外的な製品名のみ Rhanis Agent）。
+
+**「Koe」 は全面 Rhanis に統一する（2026-06-13 user 決定で更新）**。当初案「Koe はコードネーム継続（内部識別子は koe のまま）」は撤回。フォルダ名・bd prefix・crate 名・GitHub repo まで含め `rhanis` に統一する。破壊的・大規模（特にフォルダ mv + Claude memory dir 引き継ぎでセッション断絶を伴う）ため、**次セッション（専用）で順序厳守の手順書に沿って実行**: `docs/reviews/2026-06-13-rhanis-migration-plan.md`。それまでの暫定状態では koe 識別子が残る（移行中の旧称）。
 
 ## 由来とコンセプト整合
 
