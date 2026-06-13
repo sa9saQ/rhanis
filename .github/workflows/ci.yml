@@ -1,6 +1,6 @@
 name: ci
 
-# Real CI is koe's Definition of Done: local "cargo test" / "pnpm test" being
+# Real CI is Rhanis's Definition of Done: local "cargo test" / "pnpm test" being
 # green is not enough (CLAUDE.md, ci-status-gate). This runs the pure-logic
 # suites on a clean Linux runner. Audio capture / WebSocket E2E are NOT here —
 # they need a real microphone and a native Windows host (see CLAUDE.md Testing).
@@ -100,13 +100,13 @@ jobs:
       - name: Run tests
         run: pnpm test
 
-  # koe-ef8 Step A: prove the Tauri debug build BOOTS on a native Windows host
+  # rhanis-ef8 Step A: prove the Tauri debug build BOOTS on a native Windows host
   # (WebView2) via tauri-driver + WebdriverIO. Smoke only — reaches the
   # onboarding screen without opening the mic or any real API (the audio bridge
-  # is idle until a session starts, lib.rs koe-flu). The Linux jobs above cannot
+  # is idle until a session starts, lib.rs rhanis-flu). The Linux jobs above cannot
   # cover this: a WSL/Linux build links WebKitGTK, not the Windows WebView2 that
   # ships in production. Audio + real Realtime API stay a native-Windows manual
-  # check (koe-ef8 full). Rationale: ~/research/wsl-vs-windows-ai-e2e-2026.
+  # check (rhanis-ef8 full). Rationale: ~/research/wsl-vs-windows-ai-e2e-2026.
   windows-e2e:
     name: E2E smoke (Windows, tauri-driver)
     runs-on: windows-latest
@@ -143,7 +143,7 @@ jobs:
       # *WebView2 Runtime*. The two drift (e.g. Edge 149 vs WebView2 148) and the
       # mismatched driver then refuses the session ("session not created"): an
       # identical E2E spec passes on one runner image and fails on the next
-      # (koe-m3o). Pin the driver to the WebView2 Runtime that is actually
+      # (rhanis-m3o). Pin the driver to the WebView2 Runtime that is actually
       # installed: read its version, download the major-matching Edge WebDriver,
       # and prepend it to PATH so tauri-driver picks it over the drifted system
       # one. (tauri-driver searches PATH for msedgedriver by default — v2 Tauri
