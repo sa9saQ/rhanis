@@ -19,8 +19,10 @@
 | A | tauri window title | `koe` | `Rhanis Agent` | Claude | ✅ |
 | A | package.json name | `koe` | `rhanis` | Claude | ✅ |
 | A | Cargo package / lib | `koe` / `koe_lib` | `rhanis` / `rhanis_lib`（+main.rs, Cargo.lock 同期） | Claude | ✅ |
-| B | SQLite DB ファイル名 | `koe.db` | `rhanis.db`（移行コード無し = M1 配布前・user 0） | Claude | ✅ |
-| B | screenshot prefix | `koe-screenshot-` | `rhanis-screenshot-` | Claude | ✅ |
+| B | SQLite DB ファイル名 | `koe.db` | **据え置き**（永続ストア = 改名で会話履歴を孤児化。下記「意図的に変更しない」参照） | Claude | ✅ |
+| B | Stronghold スナップショット / partition / keychain | `koe-secrets.stronghold` / `b"koe-secrets"` / `com.zsaku.koe` | **据え置き**（保存済み API キーを孤児化 + secret_store.rs に「stable across versions」契約あり） | Claude | ✅ |
+| B | 設定ファイル | `koe-settings.json` | **据え置き**（設定を孤児化） | Claude | ✅ |
+| B | screenshot prefix / audio thread 名 | `koe-screenshot-` / (なし) | `rhanis-screenshot-` / `rhanis-audio`（出力名・ラベル = 永続ストアでない） | Claude | ✅ |
 | C | CSS クラス / DOM id / aria | `.koe-*` | `.rhanis-*`（全 *.css + className/id/aria-controls + 連動 test） | Claude | ✅ |
 | C | UI 文字列 | サイドバーbrand・オンボ見出し/本文・e2e assert | `Rhanis` | Claude | ✅ |
 | D | bd ID prefix | `koe-` | `rhanis-`（`bd rename-prefix`、159 件、foreign 混入 0） | Claude | ⏳ commit3 |
@@ -37,6 +39,11 @@
 
 ## 意図的に変更しない（記録）
 
+**原則: ローンチをまたいでユーザーデータを保持する永続ストアのファイル名 / パーティション名 / サービス名は `koe` で安定維持する**（不可視の内部識別子であり、改名は保存済みデータを孤児化するだけでブランド上の利益ゼロ）。ブランド / 識別 / 出力名のみ `rhanis` 化した。コードベース自身の文書化方針（`secret_store.rs`「a rename would orphan it」「Stable across versions」）に従う。R-B.5（CodeRabbit CLI）が CLIENT_PATH の互換破壊を major 指摘 → 本原則で対応。
+
+- **Stronghold 資格情報ストア（3点セット）**: `koe-secrets.stronghold`（スナップショットファイル）/ `secret_store.rs::CLIENT_PATH = b"koe-secrets"`（partition）/ `lib.rs::KEYCHAIN_SERVICE = "com.zsaku.koe"`（OS キーチェーンの復号鍵サービス名）。3点は連動し、1つでも `rhanis` に変えると既存スナップショットの復号 or partition 解決に失敗し**保存済み API キーが消失**する。`secret_store.rs:29` に「Stable across versions」契約が明文化済み。**注**: バンドル識別子（tauri.conf.json `identifier`）は `com.zsaku.rhanis` に変更済み（こちらはユーザー可視の識別子）。両者は別物。
+- **`koe-settings.json`**（`JsonSettingsStore`）: 音声プロバイダ / 許可ポリシー / 予算設定の永続ファイル。改名で設定が初期化される。
+- **`koe.db`**（`SqliteAdapter`）: 会話ログ / ノート / コストの永続 DB。改名で履歴孤児化。
 - **`.beads/metadata.json` の `dolt_database: "koe"`**: 内部 Dolt DB のストレージ名。`bd rename-prefix` は issue ID を変えるが Dolt DB 名は変えず、手で書き換えると embedded Dolt と齟齬し bd 破損リスク。対外露出なしのため**据え置き**。
 - **外部競合製品 `koe.ai` / `koe.fm` / `koe.live`**: 命名研究で「koe が衝突する既存製品」として登場する第三者製品。リネームすると事実を破壊するため**保護（不変）**。
 - **研究フォルダ `~/research/koe-voice-agent-novelty-2026` / `~/research/koe-integration-tech-2026-06`**: 本リネームの対象外（research アーカイブ）。パス参照は**保護（不変）**。

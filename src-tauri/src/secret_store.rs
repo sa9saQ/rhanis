@@ -27,8 +27,12 @@ use zeroize::Zeroizing;
 const SNAPSHOT_KEY_LEN: usize = 32;
 
 /// Client path inside the Stronghold snapshot. Stable across versions so the
-/// snapshot keeps resolving after upgrades.
-const CLIENT_PATH: &[u8] = b"rhanis-secrets";
+/// snapshot keeps resolving after upgrades — INTENTIONALLY retained as
+/// `koe-secrets` through the koe→Rhanis rename. This is an invisible internal
+/// storage-partition identifier (not branding); renaming it would return
+/// `ClientDataNotPresent` for existing snapshots and orphan every saved API key.
+/// See docs/reviews/2026-06-13-rhanis-migration-plan.md (intentionally-kept list).
+const CLIENT_PATH: &[u8] = b"koe-secrets";
 
 /// Logical name of the OpenAI key record inside the store.
 pub const OPENAI_KEY_NAME: &str = "openai_api_key";
@@ -576,7 +580,7 @@ mod tests {
         password: Box<dyn SnapshotPassword>,
     ) -> (StrongholdSecretStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("rhanis-secrets.stronghold");
+        let path = dir.path().join("koe-secrets.stronghold");
         (StrongholdSecretStore::new(path, password), dir)
     }
 
@@ -675,7 +679,7 @@ mod tests {
     #[test]
     fn persists_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("rhanis-secrets.stronghold");
+        let path = dir.path().join("koe-secrets.stronghold");
         {
             let store = StrongholdSecretStore::new(path.clone(), Box::new(FixedPassword::new()));
             store
@@ -705,7 +709,7 @@ mod tests {
         // Snapshot exists but the keychain key is gone: must NOT silently report
         // "empty" or regenerate a key (which would orphan the snapshot).
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("rhanis-secrets.stronghold");
+        let path = dir.path().join("koe-secrets.stronghold");
         StrongholdSecretStore::new(path.clone(), Box::new(FixedPassword::new()))
             .save_api_key("openai", SecretString::new("sk-orphan".to_string()))
             .expect("seed snapshot");
@@ -853,7 +857,7 @@ mod tests {
         // A locked vault must surface as Err, not a silent `false` — same
         // fail-closed contract the OpenAI path has.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("rhanis-secrets.stronghold");
+        let path = dir.path().join("koe-secrets.stronghold");
         StrongholdSecretStore::new(path.clone(), Box::new(FixedPassword::new()))
             .save_api_key(provider_key_name("xai").unwrap(), SecretString::new("k".into()))
             .expect("seed snapshot");

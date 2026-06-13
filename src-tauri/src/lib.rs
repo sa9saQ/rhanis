@@ -40,7 +40,12 @@ use storage::{
 use tool_dispatcher::{AppDispatchIo, RealToolDispatcher, ToolRegistry};
 
 /// Keychain identifiers for the Stronghold snapshot decryption key.
-const KEYCHAIN_SERVICE: &str = "com.zsaku.rhanis";
+/// INTENTIONALLY retained as `com.zsaku.koe` through the koe→Rhanis rename: an
+/// invisible internal storage identifier paired with `secret_store::CLIENT_PATH`.
+/// Changing it orphans the OS-keychain entry that decrypts existing snapshots
+/// (the saved API key becomes unreadable). Distinct from the user-facing bundle
+/// identifier `com.zsaku.rhanis` in tauri.conf.json. See the migration plan.
+const KEYCHAIN_SERVICE: &str = "com.zsaku.koe";
 const KEYCHAIN_SNAPSHOT_ACCOUNT: &str = "stronghold-snapshot-key";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -62,7 +67,7 @@ pub fn run() {
             // is held in the OS keychain (never on disk in plain).
             let data_dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            let snapshot_path = data_dir.join("rhanis-secrets.stronghold");
+            let snapshot_path = data_dir.join("koe-secrets.stronghold");
 
             let password = Box::new(KeychainPassword::new(
                 KEYCHAIN_SERVICE,
@@ -76,7 +81,7 @@ pub fn run() {
             // No WebView SQL surface; consumers (write_note tool rhanis-s7i,
             // session_manager rhanis-e3m) reach it via tauri::State<ManagedRecorder>.
             let recorder: Arc<dyn RecorderAdapter> =
-                Arc::new(SqliteAdapter::open(&data_dir.join("rhanis.db"))?);
+                Arc::new(SqliteAdapter::open(&data_dir.join("koe.db"))?);
             app.manage(ManagedRecorder(Arc::clone(&recorder)));
 
             // Approval gate (rhanis-1vi). One process-wide activity-event sequence
@@ -99,7 +104,7 @@ pub fn run() {
             // JSON; no WebView file surface. Built BEFORE the dispatcher so the
             // permission-policy provider can share the SAME store Arc (so a policy
             // edit via `set_permission_policy` is seen by the next dispatch).
-            let settings_path = data_dir.join("rhanis-settings.json");
+            let settings_path = data_dir.join("koe-settings.json");
             let settings_store: Arc<dyn SettingsStore> =
                 Arc::new(JsonSettingsStore::new(settings_path));
             app.manage(ManagedSettings::new(Arc::clone(&settings_store)));

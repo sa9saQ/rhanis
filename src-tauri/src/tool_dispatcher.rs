@@ -998,7 +998,7 @@ mod tests {
     #[tokio::test]
     async fn denied_folder_via_real_settings_store_forces_gate() {
         let data = tempfile::tempdir().unwrap();
-        let path = data.path().join("rhanis-settings.json");
+        let path = data.path().join("koe-settings.json");
         let store: Arc<dyn SettingsStore> = Arc::new(JsonSettingsStore::new(path));
 
         let work = tempfile::tempdir().unwrap();
@@ -1032,7 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn allow_danger_via_real_settings_store_auto_executes() {
         let data = tempfile::tempdir().unwrap();
-        let path = data.path().join("rhanis-settings.json");
+        let path = data.path().join("koe-settings.json");
         let store: Arc<dyn SettingsStore> = Arc::new(JsonSettingsStore::new(path));
 
         let work = tempfile::tempdir().unwrap();

@@ -1,4 +1,4 @@
-//! App settings persistence — Rust-owned JSON at `app_local_data_dir/rhanis-settings.json`.
+//! App settings persistence — Rust-owned JSON at `app_local_data_dir/koe-settings.json`.
 //!
 //! # Design
 //! - Settings are stored as JSON in the per-user app data dir. No WebView SQL
@@ -35,7 +35,7 @@ use crate::secret_store::{
 // ---------------------------------------------------------------------------
 
 /// Persisted application settings. Serialised as JSON to
-/// `app_local_data_dir/rhanis-settings.json` via [`JsonSettingsStore`].
+/// `app_local_data_dir/koe-settings.json` via [`JsonSettingsStore`].
 ///
 /// Non-safety fields carry serde defaults (so a future-added field does not fail
 /// an older file), but [`budget`](AppSettings::budget) is **required** — it is a
@@ -656,7 +656,7 @@ mod tests {
 
     fn temp_store() -> (JsonSettingsStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("rhanis-settings.json");
+        let path = dir.path().join("koe-settings.json");
         (JsonSettingsStore::new(path), dir)
     }
 
@@ -867,7 +867,7 @@ mod tests {
         use std::thread;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonSettingsStore::new(dir.path().join("rhanis-settings.json")));
+        let store = Arc::new(JsonSettingsStore::new(dir.path().join("koe-settings.json")));
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -1080,7 +1080,7 @@ mod tests {
         // can't lose each other's updates (R-C / Codex High).
         let dir = tempfile::tempdir().expect("tempdir");
         let store: Arc<dyn SettingsStore> =
-            Arc::new(JsonSettingsStore::new(dir.path().join("rhanis-settings.json")));
+            Arc::new(JsonSettingsStore::new(dir.path().join("koe-settings.json")));
         store.save(&AppSettings::default()).expect("seed");
         let managed = ManagedSettings::new(Arc::clone(&store));
 
@@ -1222,7 +1222,7 @@ mod tests {
     #[test]
     fn settings_policy_provider_loaded_and_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("rhanis-settings.json");
+        let path = dir.path().join("koe-settings.json");
         let store: Arc<dyn SettingsStore> = Arc::new(JsonSettingsStore::new(path.clone()));
         let policy = PermissionPolicy {
             allowed_url_hosts: vec!["openai.com".into()],
