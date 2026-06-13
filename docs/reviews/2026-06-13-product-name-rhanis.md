@@ -37,5 +37,5 @@ Koe が音声 AI 領域で 3 製品衝突（koe.ai voice changer / koe.fm / koe.
 - **商標の精密調査（要・専門家）**: 称呼類似（Lannister 等の音近接、類 9 ソフトウェア / 類 42 SaaS）の最終判定は弁理士の領分。一次検索はクリアだが、出願前に専門調査を通すこと。`rhanis-n6s`（法務）に連動。
 - **ドメイン取得**: rhanis.ai を主、rhanis.app / .io と rhanisagent.com を防御的に確保（Cloudflare Registrar、CLAUDE.md スタック方針）。
 - **ハンドル確保**: GitHub org `rhanis-ai`、X `@rhanis` 系、npm scope `@rhanis`。
-- **実コードへの反映は完了（2026-06-14、`rhanis-zs8`）**: `src-tauri/tauri.conf.json`（`productName`=`Rhanis Agent` / `mainBinaryName`=`rhanis` / `identifier`=`com.zsaku.rhanis` / window title=`Rhanis Agent`）、`package.json` name=`rhanis`、Cargo crate 名 `rhanis` / `rhanis_lib`、SQLite DB `rhanis.db`、CSS クラス `.rhanis-*` をリネーム済み。署名証明書（`rhanis-44h`）・ストア登録・配布（`rhanis-8h0`）は M1.5 でこの識別子（`com.zsaku.rhanis`）を踏襲する。
+- **実コードへの反映は完了（命名確定 2026-06-13 → 実装反映 2026-06-14、`rhanis-zs8`）**: `src-tauri/tauri.conf.json`（`productName`=`Rhanis Agent` / `mainBinaryName`=`rhanis` / `identifier`=`com.zsaku.rhanis` / window title=`Rhanis Agent`）、`package.json` name=`rhanis`、Cargo crate 名 `rhanis` / `rhanis_lib`、SQLite DB `rhanis.db`、CSS クラス `.rhanis-*` をリネーム済み。署名証明書（`rhanis-44h`）・ストア登録・配布（`rhanis-8h0`）は M1.5 でこの識別子（`com.zsaku.rhanis`）を踏襲する。
 - **ピッチ / コピーへの反映**: `rhanis-20f`（競合対応・ピッチ）で "Rhanis — see what your AI is doing" 系の brand story を確定。
