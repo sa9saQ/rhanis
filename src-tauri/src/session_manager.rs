@@ -10,6 +10,7 @@
 //!     monthly budget is exceeded;
 //!   - a single **write task** that owns the socket sink, so concurrent dispatch
 //!     tasks never interleave frames on the wire.
+//!
 //! `stop_session` signals shutdown, aborts both tasks (dropping the write
 //! receiver ends the writer) and the in-flight dispatch `JoinSet`.
 //!

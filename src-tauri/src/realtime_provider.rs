@@ -593,17 +593,6 @@ fn sanitize_server_text(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Masks key-shaped substrings before a server-controlled string may ride a UI
-/// payload or stderr (koe-nal R-B). An HONEST provider error already echoes
-/// partial key material ("Incorrect API key provided: sk-…") and a malicious
-/// provider can echo the full Bearer credential — and "the raw key never
-/// reaches the WebView / a Tauri event payload / a log line" is a hard koe
-/// boundary (CLAUDE.md BYOK discipline), kept even though the provider itself
-/// obviously already holds the key. Patterns (word-boundary anchored, masked
-/// whole — never partially preserved):
-/// - `sk-` + 8+ key chars (OpenAI-style secret keys)
-/// - `AIza` + 30+ key chars (Google API keys, koe-31u multi-provider)
-/// - `Bearer ` + 8+ non-space (echoed Authorization header)
 /// The replacement char `sanitize_display` leaves where a display-hostile char
 /// was. Key DETECTION treats it as TRANSPARENT (skipped, not counted): a
 /// server interleaving invisible/bidi chars inside a key — `s\u{202E}k-…`,
@@ -612,6 +601,19 @@ fn sanitize_server_text(s: &str, max_chars: usize) -> String {
 /// Requires `mask_key_material` to run AFTER `sanitize_display`.
 const MASK_TRANSPARENT: char = '\u{FFFD}';
 
+/// Masks key-shaped substrings before a server-controlled string may ride a UI
+/// payload or stderr (koe-nal R-B). An HONEST provider error already echoes
+/// partial key material ("Incorrect API key provided: sk-…") and a malicious
+/// provider can echo the full Bearer credential — and "the raw key never
+/// reaches the WebView / a Tauri event payload / a log line" is a hard koe
+/// boundary (CLAUDE.md BYOK discipline), kept even though the provider itself
+/// obviously already holds the key. Patterns (word-boundary anchored, masked
+/// whole — never partially preserved; bodies also count redaction punctuation
+/// `*` `.` `…`, so provider-redacted fragments stay masked):
+///
+/// - `sk-` + 4+ body chars (OpenAI-style keys incl. redacted fragments)
+/// - `AIza` + 4+ body chars (Google API keys, koe-31u multi-provider)
+/// - `Bearer` (case-insensitive) + whitespace + 8+ non-space (echoed header)
 fn mask_key_material(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let is_key_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';

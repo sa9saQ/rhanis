@@ -1,0 +1,4 @@
+# Claude Code: worktree 作成時に新 worktree へ自動コピーする gitignored ファイル (gitignore 構文)
+# 根拠: git.md 教訓「worktree dir に .env 不在で vitest 全 fail」の公式解 (worktrees docs)
+.env
+.env.*
