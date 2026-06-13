@@ -40,7 +40,7 @@ use storage::{
 use tool_dispatcher::{AppDispatchIo, RealToolDispatcher, ToolRegistry};
 
 /// Keychain identifiers for the Stronghold snapshot decryption key.
-const KEYCHAIN_SERVICE: &str = "com.zsaku.Rhanis";
+const KEYCHAIN_SERVICE: &str = "com.zsaku.rhanis";
 const KEYCHAIN_SNAPSHOT_ACCOUNT: &str = "stronghold-snapshot-key";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
