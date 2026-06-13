@@ -1,6 +1,6 @@
-//! Recorder storage abstraction (koe-nnk).
+//! Recorder storage abstraction (rhanis-nnk).
 //!
-//! koe persists three kinds of data locally: free-form **notes** (the
+//! Rhanis persists three kinds of data locally: free-form **notes** (the
 //! `write_note` tool / user memos), a **conversation log** (assistant/user
 //! turns and tool milestones), and periodic **cost snapshots** (so the monthly
 //! budget total survives an app restart instead of resetting to zero).
@@ -64,7 +64,7 @@ pub struct Note {
 /// A logged conversation event: an assistant/user turn or a tool milestone.
 /// `summary` is pre-vetted by the caller to exclude the BYOK key, file paths, and
 /// tool arguments/results. It DOES, however, contain a finalized speech transcript
-/// verbatim for `kind = "speech"` turns (koe-pbe), which is **sensitive,
+/// verbatim for `kind = "speech"` turns (rhanis-pbe), which is **sensitive,
 /// local-only user data that can include PII** — it is intentionally persisted to
 /// the on-device SQLite store, but any future Tauri command / UI / export that
 /// surfaces `summary` outside the device MUST apply a PII review / redaction first.
@@ -88,9 +88,9 @@ pub struct ConversationEvent {
 /// `secret_store::SecretStore::get_api_key`.
 pub trait RecorderAdapter: Send + Sync {
     /// Persists a note, returning its row id. Consumed by the `write_note` tool
-    /// (koe-s7i) and the settings health probe (koe-200).
+    /// (rhanis-s7i) and the settings health probe (rhanis-200).
     ///
-    /// `text` is stored verbatim. Callers (the tool_dispatcher, koe-2gy) own
+    /// `text` is stored verbatim. Callers (the tool_dispatcher, rhanis-2gy) own
     /// redaction AND size-bounding of tool output before it reaches the store,
     /// so the byte cap lives in one place rather than drifting between layers.
     fn save_note(&self, text: &str) -> Result<i64, RecorderError>;
@@ -105,7 +105,7 @@ pub trait RecorderAdapter: Send + Sync {
     fn list_recent_notes(&self, limit: u32) -> Result<Vec<Note>, RecorderError>;
 
     /// Appends a conversation event, returning its row id. Consumed by
-    /// session_manager (koe-e3m). `summary` is stored verbatim — callers own
+    /// session_manager (rhanis-e3m). `summary` is stored verbatim — callers own
     /// redaction and size-bounding (see [`save_note`](RecorderAdapter::save_note)).
     fn log_conversation_event(
         &self,
@@ -114,14 +114,14 @@ pub trait RecorderAdapter: Send + Sync {
         summary: &str,
     ) -> Result<i64, RecorderError>;
 
-    /// Most-recent-first conversation events, capped at `limit`. (koe-e3m)
+    /// Most-recent-first conversation events, capped at `limit`. (rhanis-e3m)
     /// Returns content-bearing structs; the same PII-review caveat as
     /// [`list_recent_notes`](RecorderAdapter::list_recent_notes) applies to any
     /// command that exposes them.
     fn list_recent_events(&self, limit: u32) -> Result<Vec<ConversationEvent>, RecorderError>;
 
     /// Adds `delta_nanodollars` to the running monthly cost ledger for a month
-    /// (`YYYYMM`) and returns the new accumulated total (koe-ixt). This is an
+    /// (`YYYYMM`) and returns the new accumulated total (rhanis-ixt). This is an
     /// **additive ledger**, not an absolute-total upsert: the monthly cost is the
     /// SUM of every session's per-`response.done` charge, so adding each delta
     ///   - sums two sessions' spend that overlap during a stop→start handover
@@ -129,7 +129,7 @@ pub trait RecorderAdapter: Send + Sync {
     ///     instead of keeping only the max and losing one side's contribution;
     ///   - is order-independent, so a late / out-of-order write can never roll the
     ///     total backwards (undercount);
-    ///   - lets session_manager (koe-e3m) gate the budget on the authoritative
+    ///   - lets session_manager (rhanis-e3m) gate the budget on the authoritative
     ///     **cross-session** total rather than a single session's stale local
     ///     baseline (so a handover cannot run a newer session fail-open).
     ///
@@ -137,28 +137,28 @@ pub trait RecorderAdapter: Send + Sync {
     /// `+`, which promotes an `i64` overflow to a `REAL` float and breaks the
     /// integer-only / NaN-free budget invariant). The `cost_tracker` domain layer
     /// guarantees `month_yyyymm` validity; the store persists it verbatim.
-    /// Consumed by session_manager (koe-e3m).
+    /// Consumed by session_manager (rhanis-e3m).
     fn add_month_cost(
         &self,
         month_yyyymm: u32,
         delta_nanodollars: u64,
     ) -> Result<u64, RecorderError>;
 
-    /// Loads the accumulated cost total for a month, or `None` if absent. (koe-e3m)
+    /// Loads the accumulated cost total for a month, or `None` if absent. (rhanis-e3m)
     fn load_cost_snapshot(&self, month_yyyymm: u32) -> Result<Option<u64>, RecorderError>;
 
     /// Read-only liveness probe: confirms the store is openable and queryable
     /// **without writing**. A write-probe would pollute the user's notes table
     /// (which `list_recent_notes` surfaces). Probes the `notes` table only (the
     /// primary user-visible table) — a liveness check, not a full multi-table
-    /// integrity check. Consumed by the settings health indicator (koe-200),
+    /// integrity check. Consumed by the settings health indicator (rhanis-200),
     /// which adds the Tauri command that calls it.
     fn health_check(&self) -> Result<(), RecorderError>;
 }
 
 /// Tauri managed-state wrapper around the active recorder. The DB is opened and
 /// migrated once at startup (`lib.rs` setup) and shared (`Arc`) with future
-/// callers (the `write_note` tool koe-s7i, session_manager koe-e3m) via
+/// callers (the `write_note` tool rhanis-s7i, session_manager rhanis-e3m) via
 /// `tauri::State<'_, ManagedRecorder>` — the same managed-state seam as
 /// `secret_store::ManagedSecretStore`.
 pub struct ManagedRecorder(pub Arc<dyn RecorderAdapter>);

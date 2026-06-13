@@ -1,5 +1,5 @@
 [package]
-name = "koe"
+name = "rhanis"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "koe_lib"
+name = "rhanis_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -20,7 +20,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
-# Native folder-picker for the permission-policy editor (koe-351). Used ONLY via
+# Native folder-picker for the permission-policy editor (rhanis-351). Used ONLY via
 # the Rust `DialogExt` API behind a `pick_folder` command — the JS plugin surface
 # (`@tauri-apps/plugin-dialog`) is intentionally NOT added, so the WebView gains
 # no dialog command (same minimal-surface posture as the disabled stronghold JS
@@ -29,7 +29,7 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # URL parsing + IDNA host normalization for the permission-policy URL allow/deny
-# matching (koe-351). Already pulled in transitively by reqwest; declared directly
+# matching (rhanis-351). Already pulled in transitively by reqwest; declared directly
 # because permission_policy.rs uses `url::Url` / `url::Host` for host suffix +
 # dot-boundary matching (defends against the evil-openai.com vs openai.com bypass).
 url = "2"
@@ -39,18 +39,18 @@ tauri-plugin-stronghold = "2"
 iota_stronghold = "2"
 zeroize = "1"
 getrandom = "0.2"
-# Recorder storage (koe-nnk). rusqlite owns the SQLite DB entirely in Rust;
+# Recorder storage (rhanis-nnk). rusqlite owns the SQLite DB entirely in Rust;
 # `bundled` compiles SQLite in (no system lib dependency -> reproducible Windows
 # builds). tauri-plugin-sql is intentionally NOT used: it would expose a SQL
 # surface to the WebView, the same risk the disabled stronghold plugin avoids.
 rusqlite = { version = "0.37", features = ["bundled"] }
-# Approval gate (koe-1vi): a per-request `oneshot` channel carries the human
+# Approval gate (rhanis-1vi): a per-request `oneshot` channel carries the human
 # decision back to the awaiting tool task, and `time::timeout` enforces the 30s
 # fail-closed deadline. Tauri already pulls tokio in transitively, but the
 # approval gate depends on these APIs directly, so it is declared explicitly
 # (`rt`/`macros` are needed for the `#[tokio::test]` timeout tests).
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "net"] }
-# WebSocket client for the OpenAI Realtime session (koe-e3m). rustls (pure Rust,
+# WebSocket client for the OpenAI Realtime session (rhanis-e3m). rustls (pure Rust,
 # no system TLS lib) so `cargo test` links on WSL/Linux — native-tls fails to
 # link there.
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
@@ -58,7 +58,7 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 # is declared explicitly so StreamExt does not depend on a transitive feature.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "async-await"] }
 
-# HTTP client for the web_search tool (Bing Search API, koe-s7i). rustls-tls
+# HTTP client for the web_search tool (Bing Search API, rhanis-s7i). rustls-tls
 # (pure Rust) is used for the same reason as tokio-tungstenite: reliable
 # `cargo test` on WSL/Linux without a system TLS library.
 #
@@ -66,12 +66,12 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # normal `[dependencies]` table, NOT under `cfg(not(windows))`. Windows is the
 # M1 ship target, and web_search.rs / take_screenshot.rs / read_file.rs use them
 # unconditionally (on Windows too). Putting them under cfg(not(windows)) made the
-# Windows build fail to resolve these crates (koe-s7i P1-1). They all build on
+# Windows build fail to resolve these crates (rhanis-s7i P1-1). They all build on
 # every target (Windows / macOS / Linux), so no platform gating is needed here —
 # only `libc` below is genuinely Unix-only.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
-# Screenshot capture for the take_screenshot tool (koe-s7i). xcap provides a
+# Screenshot capture for the take_screenshot tool (rhanis-s7i). xcap provides a
 # cross-platform API (Windows / macOS / Linux X11). The real screen-capture call
 # is OS-specific; pure-logic paths (path building, size cap, encoding) are
 # unit-testable on WSL without a display via feature-flagged stubbing.
@@ -82,11 +82,11 @@ xcap = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Directory discovery for the read_file default allowlist (Documents, Desktop).
-# koe-351 will replace the callers with user-configurable policy from
+# rhanis-351 will replace the callers with user-configurable policy from
 # JsonSettingsStore; the seam is the `allowed_bases` parameter.
 dirs-next = "2"
 
-# Audio bridge (koe-flu): cpal for mic capture, rodio for playback.
+# Audio bridge (rhanis-flu): cpal for mic capture, rodio for playback.
 # cpal: cross-platform audio I/O — Windows WASAPI / macOS CoreAudio / Linux ALSA.
 # rodio: high-level playback on top of cpal; handles PCM sink + format negotation.
 # These MUST be unconditional [dependencies] (Windows is the M1 ship target and
@@ -100,7 +100,7 @@ dirs-next = "2"
 #   PKG_CONFIG_PATH=<path-to-extracted-alsa>/pkgconfig
 #   RUSTFLAGS="-L<path-to-extracted-alsa>/lib"
 # The pure-logic unit tests (no hardware) pass on WSL with this workaround.
-# Real mic / playback E2E requires native Windows (see koe-ef8).
+# Real mic / playback E2E requires native Windows (see rhanis-ef8).
 cpal = "0.15"
 rodio = { version = "0.20", default-features = false, features = ["symphonia-wav"] }
 # rubato removed: the hand-rolled resample_mono_linear() in audio_bridge.rs
@@ -119,7 +119,7 @@ keyring = { version = "3", features = ["windows-native"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 # Raw syscall access for the openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)
-# TOCTOU-safe open on Linux (koe-s7i read_file). Not needed on Windows (handled
+# TOCTOU-safe open on Linux (rhanis-s7i read_file). Not needed on Windows (handled
 # via FILE_FLAG_OPEN_REPARSE_POINT). libc is the ONLY genuinely Unix-only crate.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

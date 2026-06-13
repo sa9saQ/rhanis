@@ -15,16 +15,16 @@ const ADAPTERS = [
 
 export function AdapterSelector({ value, onChange, disabled = false }: AdapterSelectorProps) {
   return (
-    <div className="koe-adapter-selector">
-      <label htmlFor="koe-adapter-select" className="koe-label">
+    <div className="rhanis-adapter-selector">
+      <label htmlFor="rhanis-adapter-select" className="rhanis-label">
         保存先アダプター
       </label>
       <select
-        id="koe-adapter-select"
+        id="rhanis-adapter-select"
         value={value}
         onChange={(e) => onChange?.(e.target.value)}
         disabled={disabled}
-        className="koe-select"
+        className="rhanis-select"
       >
         {ADAPTERS.map((a) => (
           <option key={a.name} value={a.name} disabled={!a.available}>

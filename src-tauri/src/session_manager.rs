@@ -1,11 +1,11 @@
-//! WebSocket session_manager (koe-e3m): drives one OpenAI Realtime session.
+//! WebSocket session_manager (rhanis-e3m): drives one OpenAI Realtime session.
 //!
 //! Lifecycle: `start_session` connects `wss://api.openai.com/v1/realtime?model=
 //! gpt-realtime-2` with a BYOK Bearer header (the key is exposed ONLY to build
 //! the handshake header — never stored, logged, or emitted), sends a
 //! `session.update` carrying the dispatcher's tool schemas, then spawns:
 //!   - a **read loop** that routes `response.function_call_arguments.done` to the
-//!     dispatcher (koe-2gy) via [`DispatcherSeam`] and, on each `response.done`
+//!     dispatcher (rhanis-2gy) via [`DispatcherSeam`] and, on each `response.done`
 //!     usage event, adds to a [`CostTracker`] and stops fail-closed if the
 //!     monthly budget is exceeded;
 //!   - a single **write task** that owns the socket sink, so concurrent dispatch
@@ -20,7 +20,7 @@
 //! `Debug` is redacted. All user-facing/log strings are fixed phrases.
 //!
 //! ## WSL note
-//! The live socket only runs on Windows (koe-ef8). Here the loop is
+//! The live socket only runs on Windows (rhanis-ef8). Here the loop is
 //! [`run_read_loop`], generic over an abstract frame `Stream` with an injected
 //! `emit` closure, so it is unit-tested by feeding synthetic frames — no socket,
 //! no `AppHandle`.
@@ -53,7 +53,7 @@ use crate::tool_dispatcher::MAX_TOOL_NAME_LEN;
 /// Hard session cap (also a coarse cost backstop). Mirrors CLAUDE.md's 30 min.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const WRITE_CHANNEL_CAP: usize = 32;
-/// Freshness bound for the PARKED barge-in cancel (koe-bx7, Codex Cloud P2).
+/// Freshness bound for the PARKED barge-in cancel (rhanis-bx7, Codex Cloud P2).
 /// The write channel is FIFO and can be full of mic PCM during the user's
 /// utterance; a cancel delivered after the backlog drains may arrive AFTER the
 /// server has already interrupted the old response and created the reply — and
@@ -62,9 +62,9 @@ const WRITE_CHANNEL_CAP: usize = 32;
 /// window has passed (server VAD interrupted the old response long ago), and a
 /// channel that stays full this long means a stalled writer / dying connection
 /// — the cost of the one uncancelled response stays bounded by the budget cap.
-/// The durable fix (active response_id tracking + targeted cancel) is koe-460.
+/// The durable fix (active response_id tracking + targeted cancel) is rhanis-460.
 const CANCEL_PARK_BOUND: Duration = Duration::from_secs(1);
-/// Upper bound on concurrently in-flight tool dispatches (DoS guard, koe-wj2).
+/// Upper bound on concurrently in-flight tool dispatches (DoS guard, rhanis-wj2).
 ///
 /// A hostile / compromised model server could stream `function_call` frames for
 /// the whole [`SESSION_TIMEOUT`] window. Each accepted frame spawns a task that
@@ -82,7 +82,7 @@ const CANCEL_PARK_BOUND: Duration = Duration::from_secs(1);
 /// `function_call_output` (the model's pending call is intentionally left
 /// unanswered); this is the deliberate fail-soft contract under attack.
 ///
-/// Known gap (tracked: koe-rxh): a DANGER-tier dispatch parks its slot for up to
+/// Known gap (tracked: rhanis-rxh): a DANGER-tier dispatch parks its slot for up to
 /// the 30s approval-gate timeout, so a burst of DANGER calls can hold the cap and
 /// starve subsequent calls for that window. Bounding *pending approvals*
 /// separately is approval_gate's concern, out of scope for this session-loop cap.
@@ -90,7 +90,7 @@ const MAX_INFLIGHT_DISPATCHES: usize = 64;
 /// Consecutive cost-snapshot save failures tolerated before stopping fail-closed
 /// (a persistent failure means a restart could lose the running total).
 const MAX_SNAPSHOT_SAVE_FAILURES: u32 = 3;
-/// Per-session cap on surfaced `provider-error` emits (koe-nal R-C): a hostile
+/// Per-session cap on surfaced `provider-error` emits (rhanis-nal R-C): a hostile
 /// provider spamming distinct non-benign error frames must not flood the
 /// WebView with Tauri events. The UI strip retains only the last 20.
 const MAX_PROVIDER_ERROR_EMITS: u64 = 50;
@@ -107,12 +107,12 @@ const WS_MAX_FRAME_SIZE: usize = 512 * 1024;
 /// In-flight session handles. `None` when idle.
 pub(crate) struct ActiveSession {
     /// Monotonic generation minted by [`ManagedSession`] for this session
-    /// (koe-ego). The read loop clears the slot / emits the terminal idle only
+    /// (rhanis-ego). The read loop clears the slot / emits the terminal idle only
     /// while the slot still holds *this* generation, so a stop->start handover
     /// (slot taken, then a new session stored) cannot have the old loop's
     /// teardown clear the newer session's handle.
     generation: u64,
-    /// Master stop signal for the session SUPERVISOR (koe-byf). `stop_session`
+    /// Master stop signal for the session SUPERVISOR (rhanis-byf). `stop_session`
     /// fires it; the supervisor receives it (its `master_shutdown`), forwards a
     /// clean shutdown to the current connection's read loop and stops reconnecting.
     /// The per-connection write task is no longer held here — it is recreated on
@@ -126,7 +126,7 @@ pub(crate) struct ActiveSession {
 /// setup so two concurrent starts cannot both pass the `is_some()` check
 /// (double-start race). Field `.0` is `pub(crate)` (not `pub`) because
 /// `ActiveSession` is crate-private; field `.1` is the generation counter
-/// (koe-ego) — `start_session` mints from it and the read loop reads it to ask
+/// (rhanis-ego) — `start_session` mints from it and the read loop reads it to ask
 /// "has a newer start begun since mine?" at its terminal slot-clear. Read only
 /// inside this module.
 pub struct ManagedSession(
@@ -181,7 +181,7 @@ fn current_yyyymm() -> u32 {
     (year as u32) * 100 + m as u32
 }
 
-// ---- reconnection state machine (koe-byf) ------------------------------------
+// ---- reconnection state machine (rhanis-byf) ------------------------------------
 //
 // transaction N/A · idempotency_key N/A (real-time connection control; the budget
 // guard and the additive cost ledger remain the only billing-side invariants, and
@@ -191,7 +191,7 @@ fn current_yyyymm() -> u32 {
 // monthly total / budget gate).
 
 /// How one connection's read loop ended, decided INSIDE [`run_read_loop`] and
-/// returned to the supervisor (koe-byf).
+/// returned to the supervisor (rhanis-byf).
 ///
 /// - [`Ended`](ConnectionOutcome::Ended): a TERMINAL exit (clean stop / server
 ///   close / 30-min timeout / mic lost / budget exceeded / cost-tracking
@@ -211,7 +211,7 @@ enum ConnectionOutcome {
     Reconnect,
 }
 
-/// Whether a connect attempt failed in a way worth retrying (koe-byf).
+/// Whether a connect attempt failed in a way worth retrying (rhanis-byf).
 ///
 /// - [`Recoverable`](ConnectError::Recoverable): transient transport failure
 ///   (network down / 5xx / handshake / a socket that died right after connect).
@@ -227,7 +227,7 @@ enum ConnectError {
 }
 
 /// One established connection's moving parts, handed from [`establish_connection`]
-/// to the supervisor (koe-byf). Type-erased (boxed) so the supervisor and
+/// to the supervisor (rhanis-byf). Type-erased (boxed) so the supervisor and
 /// [`run_read_loop`] are not generic over the per-connection socket/closure types
 /// — every reconnect yields the SAME concrete `Connection`. The boxing costs one
 /// dynamic dispatch per server frame (`stream.next()` / `audio_handler`) and one on
@@ -251,7 +251,7 @@ struct Connection {
     writer_abort: Option<tokio::task::AbortHandle>,
 }
 
-/// Reconnect tuning (koe-byf). Injectable so tests use tiny delays.
+/// Reconnect tuning (rhanis-byf). Injectable so tests use tiny delays.
 #[derive(Debug, Clone, Copy)]
 struct ReconnectConfig {
     /// Max consecutive failed attempts before failing closed (no infinite retry).
@@ -279,13 +279,13 @@ struct ReconnectConfig {
     /// closed. Bounds worst-case billable session-opens per start (R-B Critical).
     max_total_reconnects: u32,
     /// Per-attempt ceiling on how long ONE (re)connect may take before it is abandoned
-    /// as a recoverable failure (koe-9wb). Without this, a TLS/proxy/firewall handshake
+    /// as a recoverable failure (rhanis-9wb). Without this, a TLS/proxy/firewall handshake
     /// that blackholes the socket hangs until the OS TCP timeout (often 1-3 min), and
     /// the supervisor stays in `connecting` (= UI "準備中"/loading) the whole time with
     /// no escape but a user stop. Wrapping each attempt in this timeout turns a hang
     /// into a `Recoverable("connection timeout")` that rides the SAME bounded backoff →
     /// `max_attempts`/`max_total_reconnects` → fail-closed path as any transient drop
-    /// (never infinite, never `Fatal`). The frontend escape hatch (koe-5fs) covers the
+    /// (never infinite, never `Fatal`). The frontend escape hatch (rhanis-5fs) covers the
     /// per-attempt wait; this bounds the worst case at the source. Injectable so tests
     /// use a tiny value.
     connect_timeout: Duration,
@@ -309,7 +309,7 @@ impl Default for ReconnectConfig {
             // 15s: long enough to tolerate a genuinely slow-but-real handshake (congested
             // wifi / mobile tethering) without false-positiving it as a hang, short enough
             // that a true blackhole surfaces a retry / fail-closed in a bounded window
-            // instead of waiting out the OS TCP timeout. Aligns with the koe-5fs frontend
+            // instead of waiting out the OS TCP timeout. Aligns with the rhanis-5fs frontend
             // "slow connect" watchdog (~12-15s) so the UI shows the escape hatch around the
             // same time the backend abandons the attempt.
             connect_timeout: Duration::from_secs(15),
@@ -317,7 +317,7 @@ impl Default for ReconnectConfig {
     }
 }
 
-/// EQUAL-JITTER exponential backoff (koe-byf), pure + deterministic given
+/// EQUAL-JITTER exponential backoff (rhanis-byf), pure + deterministic given
 /// `jitter_factor`. `attempt` is 1-based. The capped exponential is
 /// `exp = min(cap, base * 2^(attempt-1))` (saturating, so a large attempt can
 /// never overflow); the returned delay is `exp/2 + jitter_factor * (exp/2)`, i.e.
@@ -342,7 +342,7 @@ fn reconnect_delay(attempt: u32, base: Duration, cap: Duration, jitter_factor: f
     Duration::from_nanos(jittered.min(u128::from(u64::MAX)) as u64)
 }
 
-/// Server WS close codes that mean "transient — reconnect" (koe-byf): going away
+/// Server WS close codes that mean "transient — reconnect" (rhanis-byf): going away
 /// (1001), abnormal (1006), internal error (1011), service restart (1012), try
 /// again later (1013). A normal close (1000) or a code-less close is NOT
 /// recoverable — it is the server saying "done", which stays the clean idle path.
@@ -352,7 +352,7 @@ fn is_recoverable_close_code(code: Option<u16>) -> bool {
     matches!(code, Some(1001 | 1006 | 1011 | 1012 | 1013))
 }
 
-/// Classifies a WS handshake failure for the supervisor's retry decision (koe-byf,
+/// Classifies a WS handshake failure for the supervisor's retry decision (rhanis-byf,
 /// CR R-B.5). A 4xx HTTP response (rejected / expired BYOK credentials) is FATAL —
 /// retrying cannot fix a bad key, and burning the retry budget would surface a
 /// misconfiguration as a misleading "reconnect failed". Everything else (network
@@ -395,7 +395,7 @@ enum LoopAction {
     /// it is NOT emitted here but carried out to `finalize_session_slot`, which
     /// emits it under the slot lock (generation-guarded) so a stop->start handover
     /// cannot flash a dying loop's `error` over a newer, connected session
-    /// (koe-ego).
+    /// (rhanis-ego).
     Stop(&'static str),
 }
 
@@ -407,7 +407,7 @@ const MIC_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Terminal slot handling for a read loop: clears the slot AND emits the single
 /// terminal status (`error` or `idle`) atomically under the slot lock — the
 /// generation guard that closes the `stop_session`→`start_session` handover race
-/// (koe-ego). This is the ONLY place run_read_loop emits a terminal status, so
+/// (rhanis-ego). This is the ONLY place run_read_loop emits a terminal status, so
 /// **every** terminal `error`/`idle` is generation-guarded, not just `idle`.
 ///
 /// `terminal_error`: `Some(reason)` for an abnormal exit (budget / timeout / mic
@@ -481,8 +481,8 @@ async fn finalize_session_slot<F>(
     }
 }
 
-/// Live "what koe is about to do" disclosure emitted on the `thinking-event`
-/// channel (glass-box M1, koe-sua.1). Field names are camelCased to match
+/// Live "what Rhanis is about to do" disclosure emitted on the `thinking-event`
+/// channel (glass-box M1, rhanis-sua.1). Field names are camelCased to match
 /// `ThinkingEvent` in `src/features/activity/types.ts`.
 ///
 /// Verifiable-action-first redaction: EVERY field is derived from the tool NAME
@@ -492,7 +492,7 @@ async fn finalize_session_slot<F>(
 /// tool-name-derived `displaySummary`); an unknown / model-controlled name is NOT
 /// named (`tool` = None) and falls back to a generic phrase, so a hostile model
 /// cannot drive arguments, secrets, or an arbitrary string into the payload. The
-/// calibrated confidence label (koe-sua.2) is deliberately absent — the
+/// calibrated confidence label (rhanis-sua.2) is deliberately absent — the
 /// calibration layer that would earn it does not exist yet, so M1 never
 /// fabricates one.
 ///
@@ -547,14 +547,14 @@ impl ThinkingEvent {
 }
 
 /// A non-benign provider/server error surfaced to the UI on the `provider-error`
-/// channel (koe-nal). Field names are camelCased to match `ProviderErrorEvent`
+/// channel (rhanis-nal). Field names are camelCased to match `ProviderErrorEvent`
 /// in `src/features/activity/types.ts`. `code` / `message` arrive PRE-sanitized
 /// and length-capped from `parse_frame` (server-controlled strings never ride a
 /// payload raw — control/bidi chars are already U+FFFD); no key / path / PII is
 /// in scope here. Deliberately NOT a `session-status` emit: that channel's
 /// `error` state is the TERMINAL contract (types.ts), and a mid-session error
 /// frame does not end the session — whether specific codes should fail-stop is
-/// decided from live payloads in koe-ef8.
+/// decided from live payloads in rhanis-ef8.
 /// transaction N/A · idempotency_key N/A (display-only disclosure, not billing).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -598,7 +598,7 @@ fn now_epoch_ms() -> i64 {
 /// model-controlled name is never surfaced (the caller shows a generic, name-less
 /// plan instead). This is the SAME redaction discipline as the dispatcher's
 /// tool-name-derived `displaySummary` — derived from the tool name, never the
-/// arguments, and only for names koe actually knows.
+/// arguments, and only for names Rhanis actually knows.
 fn disclosure_for_tool(tool_name: &str) -> Option<(&'static str, Option<&'static str>)> {
     match tool_name {
         "web_search" => Some(("ウェブを検索しています", Some("web"))),
@@ -667,19 +667,19 @@ async fn run_read_loop<S, F, EC, ET, EP, A, SA>(
     mic_running: Arc<AtomicBool>,
     stop_audio: SA,
     writer_abort: Option<tokio::task::AbortHandle>,
-    // Live cost emitter (koe-9xi): called on each usage frame with the authoritative
+    // Live cost emitter (rhanis-9xi): called on each usage frame with the authoritative
     // (month, cross-session total, budget) so `start_session` can push a `cost-update`
     // to the UI. Injected (not an `AppHandle`) so the loop stays unit-testable with a
     // no-op closure — the same AppHandle-free discipline as `emit` / `audio_handler`.
     emit_cost: EC,
-    // Pre-tool thinking disclosure emitter (glass-box M1, koe-sua.1): called with
+    // Pre-tool thinking disclosure emitter (glass-box M1, rhanis-sua.1): called with
     // (call_id, tool_name) when a function call arrives, BEFORE the dispatch is
     // spawned, so `start_session` can push a redacted `thinking-event` to the UI.
     // Injected (not an `AppHandle`) for the same AppHandle-free unit-testability as
     // `emit` / `emit_cost`. The tool ARGUMENTS are deliberately NOT passed — the
     // closure derives a safe disclosure from the name alone (verifiable-action-first).
     emit_thinking: ET,
-    // Non-benign server error emitter (koe-nal): called with the pre-sanitized
+    // Non-benign server error emitter (rhanis-nal): called with the pre-sanitized
     // (code, message) of a surfaced `error` frame so `start_session` can push a
     // `provider-error` event to the UI. Injected for the same AppHandle-free
     // unit-testability as `emit` / `emit_cost` / `emit_thinking`.
@@ -699,19 +699,19 @@ where
     let mut dispatch_tasks = tokio::task::JoinSet::new();
     // The unpersisted-spend carry + consecutive-failure count now live in the SHARED
     // `CostTracker` (cost.pending_* / cost.save_failures) so they survive a reconnect
-    // (koe-byf) instead of being dropped with this loop's locals — see handle_event.
+    // (rhanis-byf) instead of being dropped with this loop's locals — see handle_event.
     // Latch so the in-flight dispatch cap logs once per saturation episode, not
     // once per dropped frame — a sustained flood must not turn the fail-soft drop
-    // into a stderr-backpressure DoS (koe-wj2 R-C / Codex).
+    // into a stderr-backpressure DoS (rhanis-wj2 R-C / Codex).
     let mut cap_warned = false;
-    // Barge-in cancel fallback latch (koe-bx7): at most ONE parked background
+    // Barge-in cancel fallback latch (rhanis-bx7): at most ONE parked background
     // send per connection when the write channel is momentarily full — see
     // handle_event's SpeechStarted arm.
     let cancel_pending = Arc::new(AtomicBool::new(false));
-    // Same latch discipline for journal-channel drops (koe-emd / CR): surface a
+    // Same latch discipline for journal-channel drops (rhanis-emd / CR): surface a
     // dropped conversation record once per episode without a per-drop flood.
     let mut journal_drop_warned = false;
-    // And for the benign-cancel suppression log (koe-nal): once per connection.
+    // And for the benign-cancel suppression log (rhanis-nal): once per connection.
     let mut benign_err_warned = false;
     let deadline = tokio::time::sleep(SESSION_TIMEOUT);
     tokio::pin!(deadline);
@@ -726,14 +726,14 @@ where
     // response frames complete rather than being killed mid-flight.
     let abort_inflight: bool;
     // Terminal status carried out to `finalize_session_slot`, which emits it under
-    // the slot lock (generation-guarded — koe-ego): `Some(reason)` for an abnormal
+    // the slot lock (generation-guarded — rhanis-ego): `Some(reason)` for an abnormal
     // exit (budget / timeout / mic lost / cost-tracking unavailable) →
     // `error(reason)`; `None` for a clean stop/close → `idle`. Set by the loop's
     // error arms below. Emitting here would leak the dying loop's status over a
     // newer session during a stop->start handover. Only consulted on the `Ended`
     // outcome (a `Reconnect` does not finalize).
     let mut terminal_error: Option<&'static str> = None;
-    // How this connection ends (koe-byf). Default `Ended` (finalize on exit); set
+    // How this connection ends (rhanis-byf). Default `Ended` (finalize on exit); set
     // to `Reconnect` by the recoverable-transport arms (WS error / transient close
     // code) so the supervisor reconnects instead of finalizing the slot.
     let mut outcome = ConnectionOutcome::Ended;
@@ -749,15 +749,15 @@ where
         }
         stop_audio(false); // false = immediate (no tail flush)
         // Emit the terminal `error` under the slot lock (generation-guarded —
-        // koe-ego), and only for our own slot: a stop->start handover must not
+        // rhanis-ego), and only for our own slot: a stop->start handover must not
         // flash this dying loop's error over a newer, connected session.
         finalize_session_slot(&session, generation, &latest_generation, Some("mic device lost"), &emit).await;
         return ConnectionOutcome::Ended;
     }
 
-    // Conversation journal (koe-emd): records flow to a single writer task so a
+    // Conversation journal (rhanis-emd): records flow to a single writer task so a
     // SQLite write never blocks the read loop and the function-call hot path
-    // gains no `await` (which would perturb the koe-wj2 in-flight cap). Bounded
+    // gains no `await` (which would perturb the rhanis-wj2 in-flight cap). Bounded
     // so a hostile model cannot grow journal memory without bound; on overflow a
     // record is dropped (fail-soft) rather than stalling the loop.
     let (rec_tx, rec_rx) = mpsc::channel::<ConversationRecord>(CONVERSATION_LOG_CAP);
@@ -814,7 +814,7 @@ where
                             // Carry the terminal error reason out to finalize so it
                             // is emitted under the slot lock (generation-guarded),
                             // not here — a handover must not flash it over a newer
-                            // session (koe-ego).
+                            // session (rhanis-ego).
                             LoopAction::Stop(reason) => {
                                 terminal_error = Some(reason);
                                 abort_inflight = true;
@@ -825,7 +825,7 @@ where
                     // An explicit server CLOSE frame: a transient close code (going
                     // away / abnormal / internal error / restart / try-again) is a
                     // recoverable drop → RECONNECT; a normal (1000) or code-less close
-                    // is the server saying "done" → clean idle exit (koe-byf).
+                    // is the server saying "done" → clean idle exit (rhanis-byf).
                     Some(Ok(Message::Close(frame))) => {
                         let code = frame.as_ref().map(|f| u16::from(f.code));
                         if is_recoverable_close_code(code) {
@@ -837,7 +837,7 @@ where
                         break;
                     }
                     // The stream ended without a close frame: clean end (idle),
-                    // matching pre-koe-byf behavior — only an explicit transport
+                    // matching pre-rhanis-byf behavior — only an explicit transport
                     // ERROR or a transient close code reconnects.
                     None => {
                         abort_inflight = false;
@@ -851,7 +851,7 @@ where
                     // protocol error) — a RECOVERABLE drop: tear this connection down
                     // and hand a `Reconnect` to the supervisor WITHOUT finalizing the
                     // slot. The supervisor shows `reconnecting` and retries, or fails
-                    // closed after exhausting the retry budget (koe-byf). Previously
+                    // closed after exhausting the retry budget (rhanis-byf). Previously
                     // this finalized `error("connection error")` immediately.
                     Some(Err(_)) => {
                         outcome = ConnectionOutcome::Reconnect;
@@ -882,7 +882,7 @@ where
         // Drain in-flight dispatches so their side effects + final frames finish.
         while dispatch_tasks.join_next().await.is_some() {}
     }
-    // Terminal slot handling (koe-ego): clear the slot and emit the single
+    // Terminal slot handling (rhanis-ego): clear the slot and emit the single
     // terminal status (`error(reason)` for an abnormal exit, else `idle`) ONLY
     // while the slot still holds *this* session's generation (or is already empty —
     // stop_session took our handle). If a stop_session->start_session handover has
@@ -899,7 +899,7 @@ where
     // clearing here (not after the conversation-writer drain) means the slot
     // handover is never delayed by journalling.
     //
-    // koe-byf: finalize ONLY on a terminal exit. On a recoverable disconnect
+    // rhanis-byf: finalize ONLY on a terminal exit. On a recoverable disconnect
     // (`Reconnect`) the slot is left intact so the supervisor can reconnect; the
     // teardown above (writer abort + stop_audio) still runs so THIS connection's
     // socket/audio are released before the next attempt.
@@ -917,9 +917,9 @@ where
     outcome
 }
 
-// ---- reconnection: connection builder + supervisor (koe-byf) ------------------
+// ---- reconnection: connection builder + supervisor (rhanis-byf) ------------------
 
-/// Establishes ONE live connection's moving parts (koe-byf): fetch the BYOK key
+/// Establishes ONE live connection's moving parts (rhanis-byf): fetch the BYOK key
 /// (exposed ONLY to build the handshake header, then dropped — no long-lived copy),
 /// open the WS with DoS size caps, send the provider's setup frames, spawn the
 /// single write task (owns the sink), and start the audio bridge. Returns the
@@ -928,7 +928,7 @@ where
 ///
 /// Called fresh on EVERY (re)connect, so the key-exposure window stays one
 /// header-build per attempt and `AudioBridge::start` reaps the previous audio
-/// thread before opening new devices (koe-flu). Emits NO session-status — the
+/// thread before opening new devices (rhanis-flu). Emits NO session-status — the
 /// supervisor owns the connecting/connected/reconnecting/error transitions.
 async fn establish_connection(
     secret: Arc<dyn SecretStore>,
@@ -1010,7 +1010,7 @@ async fn establish_connection(
         (running, stop_handle, playback)
     };
 
-    // Audio playback handler — LOCK-FREE via PlaybackHandle (koe-bx7). The old
+    // Audio playback handler — LOCK-FREE via PlaybackHandle (rhanis-bx7). The old
     // `try_lock` version skipped a frame under contention; that was fine when a
     // miss cost one lossy PCM chunk, but the barge-in gate transitions
     // (speech_started / speech_stopped / response.created) now ride this seam,
@@ -1039,8 +1039,8 @@ async fn establish_connection(
 }
 
 /// Whether the supervisor still owns the session slot when deciding to reconnect
-/// (koe-byf) — a pure QUERY mirroring [`finalize_session_slot`]'s generation guard
-/// (koe-ego), with NO clear and NO emit.
+/// (rhanis-byf) — a pure QUERY mirroring [`finalize_session_slot`]'s generation guard
+/// (rhanis-ego), with NO clear and NO emit.
 enum SlotOwnership {
     /// The slot still holds OUR generation → we are the active session → reconnect.
     Owns,
@@ -1072,7 +1072,7 @@ async fn slot_ownership(
     }
 }
 
-/// Drives a session across reconnects (koe-byf): connect → read loop → on a
+/// Drives a session across reconnects (rhanis-byf): connect → read loop → on a
 /// recoverable disconnect, exponential-backoff reconnect (equal jitter, bounded by
 /// `cfg.max_attempts`), failing closed once the retry budget is exhausted. The SAME
 /// `cost` Arc + recorder ledger flow into every connection's read loop, so the
@@ -1136,13 +1136,13 @@ async fn run_session_supervised<C, Fut, F, EC, ET, EP, J>(
         // spend. Gate on persisted ledger + the (month-scoped) carried amount — the
         // same fail-closed lower bound the read loop's budget gate uses. Only when a cap
         // is enabled (an unlimited session skips the read). An unknown balance (read
-        // error) is fail-closed (koe rule: unknown/error reject).
+        // error) is fail-closed (Rhanis rule: unknown/error reject).
         {
             // Key on the tracker's EFFECTIVE month (`current_month`), NOT the raw clock
             // `current_yyyymm()`: `add_usage` only advances it on a FORWARD month, so a
             // backward clock skew / NTP step cannot make this check read an EARLIER
             // (emptier) month's ledger than the read loop's gate keys on (which would be
-            // fail-open) — koe-ixt month-keying discipline (CR R-B.5).
+            // fail-open) — rhanis-ixt month-keying discipline (CR R-B.5).
             let (budget, effective_month, carried) = {
                 let c = cost.lock().await;
                 let effective_month = c.current_month;
@@ -1187,7 +1187,7 @@ async fn run_session_supervised<C, Fut, F, EC, ET, EP, J>(
             }
         }
 
-        // Bound each (re)connect two ways (koe-9wb + koe-byf):
+        // Bound each (re)connect two ways (rhanis-9wb + rhanis-byf):
         //   1. `cfg.connect_timeout` caps how long ONE attempt may hang. A blackholed
         //      TLS/proxy/firewall handshake would otherwise stall until the OS TCP
         //      timeout (1-3 min) with the UI stuck in `connecting` (= "準備中"). On
@@ -1328,7 +1328,7 @@ async fn run_session_supervised<C, Fut, F, EC, ET, EP, J>(
         // Generation gate: only reconnect if we still own the slot. A handover
         // (stop->start) means a newer session owns everything — reconnecting would
         // create a competing live socket (BYOK double-charge). Mirrors finalize's
-        // generation guard (koe-ego).
+        // generation guard (rhanis-ego).
         match slot_ownership(&session, generation, &latest_generation).await {
             SlotOwnership::Owns => {}
             SlotOwnership::StopIdle => {
@@ -1387,7 +1387,7 @@ async fn run_session_supervised<C, Fut, F, EC, ET, EP, J>(
     }
 }
 
-/// One conversation event queued for the journal writer (koe-emd). `role` /
+/// One conversation event queued for the journal writer (rhanis-emd). `role` /
 /// `kind` are fixed `&'static str` labels; `summary` is owned, pre-vetted safe
 /// content — a finalized transcript or a tool name, never tool arguments /
 /// results, paths, or the BYOK key (the recorder stores `summary` verbatim).
@@ -1397,17 +1397,17 @@ struct ConversationRecord {
     summary: String,
 }
 
-/// Bounded backlog for the conversation journal (koe-emd). Turns are human-paced
+/// Bounded backlog for the conversation journal (rhanis-emd). Turns are human-paced
 /// so this is never reached in normal use; it is purely a flood backstop so a
 /// hostile model spamming function calls cannot grow journal memory without
 /// bound. On overflow the record is dropped (best-effort journalling, fail-soft)
 /// rather than blocking the read loop. See [`spawn_conversation_writer`].
 const CONVERSATION_LOG_CAP: usize = 256;
 
-/// Spawns the conversation journal writer (koe-emd): a single task that drains
+/// Spawns the conversation journal writer (rhanis-emd): a single task that drains
 /// records in send order and persists each via the recorder, so the read loop
 /// never blocks on a SQLite write and never adds an `await` to the function-call
-/// hot path (an `await` there would let the koe-wj2 in-flight cap reap an
+/// hot path (an `await` there would let the rhanis-wj2 in-flight cap reap an
 /// instant dispatch and admit more than `MAX_INFLIGHT_DISPATCHES`).
 ///
 /// Ordering: a single FIFO consumer + sequential `await` means insert order ==
@@ -1442,11 +1442,11 @@ fn spawn_conversation_writer(
 
 /// Enqueues a conversation record on the journal channel — non-blocking and
 /// fail-soft, but NOT silent. `try_send` adds no `await` to the caller (so the
-/// koe-wj2 function-call hot path is unchanged) and never blocks the read loop.
+/// rhanis-wj2 function-call hot path is unchanged) and never blocks the read loop.
 ///
 /// A drop is logged ONCE per episode (latched via `drop_warned`, re-armed on the
 /// next successful send) so a sustained flood cannot turn the drop into a
-/// stderr-backpressure DoS — while still surfacing the audit gap koe-emd exists
+/// stderr-backpressure DoS — while still surfacing the audit gap rhanis-emd exists
 /// to close (a silently-dropped record is exactly the "log is empty" failure we
 /// are fixing). `Closed` (writer task gone) is reported distinctly from `Full`
 /// (backlog saturated under flood).
@@ -1458,7 +1458,7 @@ fn spawn_conversation_writer(
 /// call, the recorder write, is a `spawn_blocking` whose `JoinError`/`Err` is
 /// handled, not unwrapped). So a `Full`-latched-then-`Closed` gap cannot occur in
 /// practice; if the writer is ever made fallible mid-loop, split the latch (per
-/// the koe-a4f follow-up).
+/// the rhanis-a4f follow-up).
 fn enqueue_record(
     rec_tx: &mpsc::Sender<ConversationRecord>,
     record: ConversationRecord,
@@ -1484,7 +1484,7 @@ fn enqueue_record(
 /// Drives one decoded server frame: the provider normalizes it into zero or more
 /// [`ProviderEvent`]s, each handled by [`handle_event`] in order. A single frame
 /// can yield more than one event — the user `.completed` ASR frame yields a
-/// `Transcript` AND a `Usage` (koe-pbe) — and the normalizer surfaces the
+/// `Transcript` AND a `Usage` (rhanis-pbe) — and the normalizer surfaces the
 /// transcript FIRST, so the turn is journalled before a `Usage` budget gate could
 /// stop the loop. The first `Stop` short-circuits the rest of the frame's events.
 #[allow(clippy::too_many_arguments)]
@@ -1501,7 +1501,7 @@ async fn handle_text<EC, ET, EP>(
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
     // Latch: the benign-cancel suppression logs ONCE per connection (same
-    // anti-stderr-flood discipline as `cap_warned`, koe-nal R-B).
+    // anti-stderr-flood discipline as `cap_warned`, rhanis-nal R-B).
     benign_err_warned: &mut bool,
     emit_cost: &EC,
     emit_thinking: &ET,
@@ -1540,14 +1540,14 @@ where
 
 /// Handles ONE normalized [`ProviderEvent`]. Returns whether to keep looping.
 /// (Extracted from `handle_text` unchanged when `parse_frame` became multi-event,
-/// koe-pbe — the cost-metering `Usage` arm is byte-for-byte the koe-9xi/koe-ixt
+/// rhanis-pbe — the cost-metering `Usage` arm is byte-for-byte the rhanis-9xi/rhanis-ixt
 /// logic; an ASR `Usage` flows through it identically, so there is no second cost
 /// path to keep in sync.)
 #[allow(clippy::too_many_arguments)]
 async fn handle_event<EC, ET, EP>(
     ev: ProviderEvent,
     provider: &Arc<dyn RealtimeProvider>,
-    // Latch for the barge-in cancel's parked-fallback send (koe-bx7) — see the
+    // Latch for the barge-in cancel's parked-fallback send (rhanis-bx7) — see the
     // SpeechStarted arm. Per-connection (a run_read_loop local).
     cancel_pending: &Arc<AtomicBool>,
     write_tx: &mpsc::Sender<Message>,
@@ -1559,7 +1559,7 @@ async fn handle_event<EC, ET, EP>(
     cap_warned: &mut bool,
     journal_drop_warned: &mut bool,
     // Latch: the benign-cancel suppression logs ONCE per connection (same
-    // anti-stderr-flood discipline as `cap_warned`, koe-nal R-B).
+    // anti-stderr-flood discipline as `cap_warned`, rhanis-nal R-B).
     benign_err_warned: &mut bool,
     emit_cost: &EC,
     emit_thinking: &ET,
@@ -1573,8 +1573,8 @@ where
     match ev {
         ProviderEvent::FunctionCall(pending) => {
             // Reap finished dispatches so the in-flight count reflects reality,
-            // then bound it (DoS guard, koe-wj2 — see MAX_INFLIGHT_DISPATCHES for
-            // the threat model and the koe-rxh approval-gate caveat). The per-frame
+            // then bound it (DoS guard, rhanis-wj2 — see MAX_INFLIGHT_DISPATCHES for
+            // the threat model and the rhanis-rxh approval-gate caveat). The per-frame
             // argument size cap (MAX_ARGS_LEN) already ran in parse_frame (over-cap
             // frames arrive here as `Ignored`); the call's arguments are still
             // UNPARSED at this point, so a saturated burst is rejected below WITHOUT
@@ -1598,7 +1598,7 @@ where
             // episode logs once more.
             *cap_warned = false;
 
-            // Journal the tool INVOCATION (koe-emd) — i.e. "the model requested
+            // Journal the tool INVOCATION (rhanis-emd) — i.e. "the model requested
             // tool X", recorded when the function_call arrives, NOT a confirmed
             // execution outcome. A later approval-deny / policy-block / dispatch
             // error is not yet reflected here; an outcome/phase column on
@@ -1625,7 +1625,7 @@ where
                 );
 
                 // Disclose the imminent action BEFORE the tool runs (glass-box M1,
-                // koe-sua.1) — gated on the SAME valid-name-length condition the
+                // rhanis-sua.1) — gated on the SAME valid-name-length condition the
                 // journal and the dispatcher enforce: an over-long name is rejected
                 // by the dispatcher BEFORE it emits any tool-event, so a disclosure
                 // for it would be a dangling orphan (a thinking-event with no
@@ -1662,7 +1662,7 @@ where
         }
         ProviderEvent::Usage(usage) => {
             // Reconnect double-count safety (AGENTS.md: "WebSocket 再接続で usage を
-            // 二重カウント → event_id/response.id で dedup"). koe-byf does NOT need an
+            // 二重カウント → event_id/response.id で dedup"). rhanis-byf does NOT need an
             // explicit usage-id seen-set because a duplicate `response.done` cannot
             // reach this arm twice across a reconnect: (1) the supervisor `jh.await`s
             // the old connection's read loop to completion — including this cost path
@@ -1671,8 +1671,8 @@ where
             // (no session resumption), so the server starts a new session and never
             // replays the previous session's `response.done`. Explicit
             // event_id/response.id dedup is deferred to when session resumption is
-            // added OR koe-ef8 verifies the live frame id shapes (server event shapes
-            // are koe-ef8-verified — see OpenAiRealtime::build_request) — tracked.
+            // added OR rhanis-ef8 verifies the live frame id shapes (server event shapes
+            // are rhanis-ef8-verified — see OpenAiRealtime::build_request) — tracked.
             //
             // This frame's incremental cost — the delta to add to the month's
             // ledger. Advance the SESSION-LOCAL tracker too (month rollover +
@@ -1690,7 +1690,7 @@ where
             let observed_month = current_yyyymm();
             // The amount to add includes any earlier spend that FAILED to persist
             // (carried in the SHARED `CostTracker.pending_*`, so it survives a
-            // reconnect — koe-byf), so a transient ledger failure never silently drops
+            // reconnect — rhanis-byf), so a transient ledger failure never silently drops
             // spend: we retry the whole unpersisted amount and the gate keeps counting
             // it until an add succeeds. The carry is MONTH-SCOPED: if it belongs to a
             // PAST month (a rollover happened while spend was still unpersisted), the
@@ -1701,7 +1701,7 @@ where
             // (`load_cost_snapshot` is only called for the current month at session
             // start). We then proceed normally so THIS frame's spend IS still recorded
             // in — and gated against — the NEW month, instead of being lost to an early
-            // stop (koe-ixt R-C / Codex P2). Computed under the first lock so the carry
+            // stop (rhanis-ixt R-C / Codex P2). Computed under the first lock so the carry
             // read + the add_usage advance + the month-scope reset are atomic.
             let (effective_month, budget, to_add) = {
                 let mut c = cost.lock().await;
@@ -1715,7 +1715,7 @@ where
                 (effective_month, c.config, to_add)
             };
             // Add to the SHARED monthly ledger and read back the new authoritative
-            // cross-session total (koe-ixt). Additive accounting is the single source
+            // cross-session total (rhanis-ixt). Additive accounting is the single source
             // of truth: it SUMS every session's spend, so a stop->start handover
             // where an older read loop is still draining late usage cannot run a
             // newer session fail-open on a stale local baseline (mechanism 4), and two
@@ -1754,7 +1754,7 @@ where
                         // Can't durably track spend → stop rather than risk a restart
                         // resetting the monthly total (fail-closed). Terminal error
                         // emitted by finalize_session_slot under the slot lock
-                        // (koe-ego), not here.
+                        // (rhanis-ego), not here.
                         return LoopAction::Stop("cost tracking unavailable");
                     }
                     // The ledger ADD failed but the persisted total is usually still
@@ -1762,7 +1762,7 @@ where
                     // a fail-closed lower bound on true spend, so a handover sibling's
                     // over-cap total still stops THIS session across a transient write
                     // failure. If the READ also fails the balance is UNKNOWN → an
-                    // unknown balance must never permit continued charging (koe rule:
+                    // unknown balance must never permit continued charging (Rhanis rule:
                     // unknown / error / timeout reject), so fail-closed stop. NOT
                     // durable: this total carries the unpersisted amount.
                     let rec_read = Arc::clone(recorder);
@@ -1776,7 +1776,7 @@ where
                     }
                 }
             };
-            // Push the cost snapshot to the UI (koe-9xi) — but ONLY when the total is
+            // Push the cost snapshot to the UI (rhanis-9xi) — but ONLY when the total is
             // DURABLE (the add succeeded), so the pushed value equals what a later
             // `get_cost_snapshot` pull (reading only the persisted ledger) would also
             // see. Emitting the NON-durable readback total (persisted + carried
@@ -1795,7 +1795,7 @@ where
             }
             // Fail-closed against the AUTHORITATIVE (cross-session) ledger total, not
             // just this session's local total. Terminal error emitted by
-            // finalize_session_slot under the slot lock (koe-ego), not here, so a
+            // finalize_session_slot under the slot lock (rhanis-ego), not here, so a
             // handover can't flash it over a newer session.
             if budget.is_over(authoritative_total) {
                 return LoopAction::Stop("monthly budget exceeded"); // fail-closed
@@ -1803,7 +1803,7 @@ where
             LoopAction::Continue
         }
         ProviderEvent::Transcript { role, text } => {
-            // Journal a user / assistant speech turn (koe-emd). kind="speech"
+            // Journal a user / assistant speech turn (rhanis-emd). kind="speech"
             // matches the existing sqlite tests. Non-blocking + FIFO-ordered; a
             // full backlog drops the turn (fail-soft) so a journal write can never
             // stall or stop the conversation, but the drop is surfaced (latched)
@@ -1819,7 +1819,7 @@ where
             );
             LoopAction::Continue
         }
-        // Barge-in (koe-bx7): the user started speaking. The AUDIO half — cutting
+        // Barge-in (rhanis-bx7): the user started speaking. The AUDIO half — cutting
         // local playback + closing the delta gate — already happened when the
         // read loop fed this same frame to `audio_handler` (which runs BEFORE the
         // normalized dispatch, so the cut is not delayed behind this match). The
@@ -1839,7 +1839,7 @@ where
         // speech-starts skip — the parked cancel already covers them; `Closed`
         // means the connection is tearing down and the cancel is moot). The
         // duplicate-cancel `error` reply arrives as ServerError{benign:true}
-        // (koe-nal) and is suppressed from the UI by the arm below.
+        // (rhanis-nal) and is suppressed from the UI by the arm below.
         ProviderEvent::SpeechStarted => {
             if let Some(frame) = provider.cancel_frame() {
                 match write_tx.try_send(frame) {
@@ -1866,21 +1866,21 @@ where
             }
             LoopAction::Continue
         }
-        // Server-reported error frame (koe-nal). Before this arm, error frames
+        // Server-reported error frame (rhanis-nal). Before this arm, error frames
         // fell into the Ignored catch-all: a rejected session.update silently
         // disabled tools / ASR / journaling / thinking-events while audio kept
-        // flowing (the koe-emd/pbe/sua.1 live-failure scenarios all converge
+        // flowing (the rhanis-emd/pbe/sua.1 live-failure scenarios all converge
         // here). code/message arrive pre-sanitized + capped from parse_frame.
         ProviderEvent::ServerError { code, message, benign } => {
             if benign {
-                // The expected barge-in cancel race (koe-bx7): response.cancel
+                // The expected barge-in cancel race (rhanis-bx7): response.cancel
                 // is sent ungated on every speech start, so "no active response"
                 // answers are steady-state noise — logged to stderr ONCE per
                 // connection (latched like `cap_warned`: a hostile server
                 // spamming benign-classified frames must not turn suppression
-                // into a stderr-flood, koe-nal R-B), never alarming the
+                // into a stderr-flood, rhanis-nal R-B), never alarming the
                 // operator. The first occurrence carries code+message — the
-                // live wire shape is exactly the koe-ef8 evidence the narrow
+                // live wire shape is exactly the rhanis-ef8 evidence the narrow
                 // `is_benign_cancel_error` classifier waits on.
                 if !*benign_err_warned {
                     *benign_err_warned = true;
@@ -1892,7 +1892,7 @@ where
                 // Surface, but do NOT stop the session: `session-status: error`
                 // is the TERMINAL contract (types.ts) and a mid-session error
                 // frame is not necessarily fatal. Whether specific codes should
-                // fail-stop is decided from live payloads in koe-ef8.
+                // fail-stop is decided from live payloads in rhanis-ef8.
                 emit_provider_error(code.as_deref(), &message);
             }
             LoopAction::Continue
@@ -1926,7 +1926,7 @@ pub async fn start_session(
     if guard.is_some() {
         return Err("session already active".to_string());
     }
-    // Mint this start attempt's generation (koe-ego) BEFORE the fallible setup
+    // Mint this start attempt's generation (rhanis-ego) BEFORE the fallible setup
     // (connect / session.update / audio), so even a start that FAILS before
     // storing an ActiveSession still advances the counter. An exiting old loop
     // reads this counter to detect that a newer start has begun and then stays
@@ -1973,7 +1973,7 @@ pub async fn start_session(
     // (the frontend's start path expects that for a misconfigured app), but do NOT
     // hold it: the supervisor's `establish_connection` re-fetches it per (re)connect
     // and drops it right after building the header — no long-lived key copy
-    // (koe-byf keeps the pre-existing "expose only to build the header" discipline,
+    // (rhanis-byf keeps the pre-existing "expose only to build the header" discipline,
     // now per attempt).
     secret
         .0
@@ -1996,7 +1996,7 @@ pub async fn start_session(
         emit_session_status(&app_for_loop, &seq_for_loop, state, error);
     };
 
-    // Live cost emitter (koe-9xi): pushes a `cost-update` on each DURABLE usage frame.
+    // Live cost emitter (rhanis-9xi): pushes a `cost-update` on each DURABLE usage frame.
     // Numbers + a bool only — no key / path / PII.
     let app_for_cost = app.clone();
     let seq_for_cost = Arc::clone(&seq.0);
@@ -2006,7 +2006,7 @@ pub async fn start_session(
         let _ = app_for_cost.emit("cost-update", snapshot);
     };
 
-    // Pre-tool thinking emitter (glass-box M1, koe-sua.1): redacted `thinking-event`
+    // Pre-tool thinking emitter (glass-box M1, rhanis-sua.1): redacted `thinking-event`
     // built from the tool NAME only — no key / path / PII / tool argument.
     let app_for_thinking = app.clone();
     let seq_for_thinking = Arc::clone(&seq.0);
@@ -2016,7 +2016,7 @@ pub async fn start_session(
         let _ = app_for_thinking.emit("thinking-event", payload);
     };
 
-    // Non-benign server error emitter (koe-nal): pushes a `provider-error` so a
+    // Non-benign server error emitter (rhanis-nal): pushes a `provider-error` so a
     // rejected session.update (tools/ASR silently dead) is visible in the
     // ActivityLog instead of swallowed. code/message are pre-sanitized + capped
     // in parse_frame — no key / path / PII.
@@ -2050,7 +2050,7 @@ pub async fn start_session(
         let _ = app_for_perr.emit("provider-error", payload);
     };
 
-    // Connect factory (koe-byf): builds ONE fresh connection per (re)connect. Captures
+    // Connect factory (rhanis-byf): builds ONE fresh connection per (re)connect. Captures
     // only `'static` Arcs so the supervisor and each call's future are `Send + 'static`.
     // The provider is resolved once (a session does not switch voice provider
     // mid-flight); the BYOK key is re-fetched + dropped inside `establish_connection`.
@@ -2074,7 +2074,7 @@ pub async fn start_session(
     let dispatcher_arc = Arc::clone(&dispatcher.0);
     let session_for_loop = Arc::clone(&session.0);
 
-    // Spawn the reconnect supervisor (koe-byf): connect → read loop → backoff
+    // Spawn the reconnect supervisor (rhanis-byf): connect → read loop → backoff
     // reconnect, emitting connecting/connected/reconnecting and failing closed
     // (error) once the retry budget is exhausted. `generation` was minted above
     // (right after the is_some check); `latest_generation` is the shared counter the
@@ -2110,7 +2110,7 @@ pub async fn stop_session(
 ) -> Result<(), String> {
     let taken = { session.0.lock().await.take() };
     if let Some(active) = taken {
-        // Fire the master stop signal (koe-byf): the SUPERVISOR receives it, forwards
+        // Fire the master stop signal (rhanis-byf): the SUPERVISOR receives it, forwards
         // a clean shutdown to the current connection's read loop (whose shutdown arm
         // aborts the live write task) and stops reconnecting. The read loop then runs
         // its shutdown arm — guaranteeing the in-flight dispatch cleanup + the one
@@ -2123,21 +2123,21 @@ pub async fn stop_session(
     // aborts the writer before any tail could race onto the WS. Idempotent: safe even
     // if start() was never called.
     //
-    // PRE-EXISTING handover caveat (NOT introduced by koe-byf — stop_session always
+    // PRE-EXISTING handover caveat (NOT introduced by rhanis-byf — stop_session always
     // stopped the shared bridge directly): this stops the bridge's CURRENT generation,
     // which during a stop->start handover could be a newer session's audio (and a stale
     // read loop could then read `mic_running=false` and emit "mic device lost"). The
     // proper fix routes the stop through a generation-specific handle held per session
     // rather than the shared bridge — that is an audio-bridge generation redesign,
-    // Windows-audio territory verified on real devices (koe-pr3), out of scope for this
+    // Windows-audio territory verified on real devices (rhanis-pr3), out of scope for this
     // reconnect-state-machine PR. Tracked as a follow-up. The per-generation flag
-    // design (koe-flu) already prevents a stale thread from clobbering the new flag.
+    // design (rhanis-flu) already prevents a stale thread from clobbering the new flag.
     audio.0.lock().await.stop_immediate();
     Ok(())
 }
 
 /// Builds a [`CostSnapshot`] from the recorder's authoritative monthly total and a
-/// budget (koe-9xi). The spend is the additive ledger value for `month`
+/// budget (rhanis-9xi). The spend is the additive ledger value for `month`
 /// ([`RecorderAdapter::load_cost_snapshot`]); an absent row (no usage yet this
 /// month) is `0` spent — NOT an error. A recorder failure is propagated as `Err`
 /// (fail-closed): the caller surfaces an explicit "unknown" state rather than a
@@ -2157,7 +2157,7 @@ fn build_cost_snapshot(
     Ok(CostSnapshot::new(month, used, budget, sequence))
 }
 
-/// Returns the current month's cost snapshot for the UI's live header (koe-9xi) —
+/// Returns the current month's cost snapshot for the UI's live header (rhanis-9xi) —
 /// the **pull** path (the matching **push** is the `cost-update` emit in the read
 /// loop). The spend comes from the recorder's additive ledger (the cross-session
 /// authority, not a session-local total), the cap from the persisted
@@ -2198,7 +2198,7 @@ mod tests {
     /// Generation passed to `run_read_loop` in tests whose `session` slot starts
     /// empty (`None`): paired with [`test_counter`] so the `None` arm sees "I am
     /// still the latest start" and emits as before. Tests that exercise the
-    /// generation guard pass explicit `GEN_*` values instead (see the koe-ego
+    /// generation guard pass explicit `GEN_*` values instead (see the rhanis-ego
     /// handover tests).
     const TEST_GENERATION: u64 = 1;
 
@@ -2212,7 +2212,7 @@ mod tests {
 
     /// Builds an `ActiveSession` standing in for a session that occupies the slot,
     /// with `generation` set. The `shutdown_tx` is inert (a dropped receiver) — the
-    /// koe-ego tests only inspect `generation` to prove the slot was (not) cleared.
+    /// rhanis-ego tests only inspect `generation` to prove the slot was (not) cleared.
     fn fake_active_session(generation: u64) -> ActiveSession {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel();
         ActiveSession { generation, shutdown_tx }
@@ -2283,7 +2283,7 @@ mod tests {
     type RecordedEvents = Arc<StdMutex<Vec<(String, String, String)>>>;
 
     /// Recorder double that captures every `log_conversation_event` call in
-    /// order (koe-emd) so a test can assert the journalled sequence + role/kind.
+    /// order (rhanis-emd) so a test can assert the journalled sequence + role/kind.
     /// Cost-snapshot saves succeed so the cost path never stops the loop.
     struct RecordingRecorder {
         events: RecordedEvents,
@@ -2352,7 +2352,7 @@ mod tests {
         (log, emit)
     }
 
-    // ---- koe-ego: stop_session -> start_session slot-handover generation guard --
+    // ---- rhanis-ego: stop_session -> start_session slot-handover generation guard --
 
     #[tokio::test]
     async fn handover_race_exiting_loop_keeps_newer_session_slot() {
@@ -2422,7 +2422,7 @@ mod tests {
         assert_eq!(
             slot.lock().await.as_ref().map(|s| s.generation),
             Some(GEN_B),
-            "exiting A loop must not clear B's (newer) slot during a stop->start handover (koe-ego)"
+            "exiting A loop must not clear B's (newer) slot during a stop->start handover (rhanis-ego)"
         );
         let emitted: Vec<_> = log.lock().unwrap().clone();
         assert!(
@@ -2472,7 +2472,7 @@ mod tests {
         assert_eq!(
             slot.lock().await.as_ref().map(|s| s.generation),
             Some(GEN_B),
-            "old loop must not clear a newer session's slot on close (koe-ego)"
+            "old loop must not clear a newer session's slot on close (rhanis-ego)"
         );
         let emitted: Vec<_> = log.lock().unwrap().clone();
         assert!(
@@ -2486,7 +2486,7 @@ mod tests {
         // The pre-loop mic-lost early-return clear site honors the generation
         // guard: with a newer generation in the slot it neither takes that handle
         // NOR emits a terminal status — its `error` is generation-guarded inside
-        // finalize_session_slot (koe-ego), so a dying loop can't flash its error
+        // finalize_session_slot (rhanis-ego), so a dying loop can't flash its error
         // over the connected newer session.
         const GEN_A: u64 = 1;
         const GEN_B: u64 = 2;
@@ -2524,7 +2524,7 @@ mod tests {
         assert_eq!(
             slot.lock().await.as_ref().map(|s| s.generation),
             Some(GEN_B),
-            "mic-lost early return must not clear a newer session's slot (koe-ego)"
+            "mic-lost early return must not clear a newer session's slot (rhanis-ego)"
         );
         // With GEN_B owning the slot, the dying loop emits NO terminal status —
         // neither its `error` nor an `idle` — over the newer session.
@@ -2540,7 +2540,7 @@ mod tests {
         // The in-loop error arms (here: a transport error → the connection-error
         // arm) also route their terminal `error` through finalize_session_slot, so
         // a stop->start handover that put a newer generation in the slot must NOT
-        // flash the dying loop's `error` over the connected newer session (koe-ego).
+        // flash the dying loop's `error` over the connected newer session (rhanis-ego).
         // Otherwise the stale error sticks in the UI and disables the stop control
         // for a live, BYOK-billing session.
         const GEN_A: u64 = 1;
@@ -2579,7 +2579,7 @@ mod tests {
         assert_eq!(
             slot.lock().await.as_ref().map(|s| s.generation),
             Some(GEN_B),
-            "in-loop error exit must not clear a newer session's slot (koe-ego)"
+            "in-loop error exit must not clear a newer session's slot (rhanis-ego)"
         );
         let emitted: Vec<_> = log.lock().unwrap().clone();
         assert!(
@@ -2627,7 +2627,7 @@ mod tests {
 
         assert!(
             slot.lock().await.is_none(),
-            "own-generation slot must be cleared on clean exit (koe-ego)"
+            "own-generation slot must be cleared on clean exit (rhanis-ego)"
         );
         let emitted: Vec<_> = log.lock().unwrap().clone();
         assert!(
@@ -2638,7 +2638,7 @@ mod tests {
 
     #[tokio::test]
     async fn none_arm_stays_silent_when_a_newer_start_has_begun() {
-        // koe-ego None-arm case (Codex MCP + Codex Cloud R-C): after stop_session
+        // rhanis-ego None-arm case (Codex MCP + Codex Cloud R-C): after stop_session
         // takes our handle (slot None), a NEWER start_session can begin and even
         // FAIL before storing an ActiveSession (connect/setup/audio error) — the
         // slot stays None but the generation counter has advanced past us. The old
@@ -2732,7 +2732,7 @@ mod tests {
         assert!(matches!(f2, Message::Text(_)));
     }
 
-    // ---- thinking-event disclosure (glass-box M1, koe-sua.1) ------------------
+    // ---- thinking-event disclosure (glass-box M1, rhanis-sua.1) ------------------
 
     #[tokio::test]
     async fn thinking_event_emitted_before_tool_dispatch() {
@@ -2907,7 +2907,7 @@ mod tests {
         assert_eq!(v["plan"], "ウェブを検索しています");
         assert_eq!(v["tool"], "web_search");
         assert_eq!(v["source"], "web");
-        // The calibration label (koe-sua.2) is never fabricated in M1.
+        // The calibration label (rhanis-sua.2) is never fabricated in M1.
         assert!(v.get("confidence").is_none());
         assert!(v["timestamp"].is_i64());
     }
@@ -2962,7 +2962,7 @@ mod tests {
         assert_eq!(e.plan, "ツールを使おうとしています");
     }
 
-    // ---- conversation log wiring (koe-emd) -----------------------------------
+    // ---- conversation log wiring (rhanis-emd) -----------------------------------
 
     #[tokio::test]
     async fn conversation_turns_are_recorded_in_frame_order() {
@@ -3056,7 +3056,7 @@ mod tests {
     /// bounded channel saturates. `count` records how many writes actually landed
     /// (so a test can prove overflow records were dropped, not just delayed). Cost
     /// + note methods mirror `OkRecorder` (succeed / unused) so only the journal
-    /// path is under test. (koe-a4f)
+    /// path is under test. (rhanis-a4f)
     struct BlockingRecorder {
         gate: Arc<(StdMutex<bool>, std::sync::Condvar)>,
         count: Arc<AtomicUsize>,
@@ -3098,7 +3098,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_overflow_drops_fail_soft_and_loop_keeps_dispatching() {
-        // koe-a4f / koe-emd R-B F6: the CONVERSATION_LOG_CAP bounded-channel
+        // rhanis-a4f / rhanis-emd R-B F6: the CONVERSATION_LOG_CAP bounded-channel
         // try_send drop-on-full path is the invariant-4 non-blocking backstop in the
         // read loop. Wedge the single writer on its first record so the channel
         // saturates, feed >CAP transcript frames (each one journal record, NO
@@ -3204,7 +3204,7 @@ mod tests {
 
     #[tokio::test]
     async fn asr_completed_records_user_turn_once_and_meters_asr_once() {
-        // koe-pbe end to end: enabling input_audio_transcription makes the server
+        // rhanis-pbe end to end: enabling input_audio_transcription makes the server
         // emit a user `.completed` frame carrying BOTH the transcript AND a
         // SEPARATELY-BILLED ASR usage. ONE such frame must journal the user turn
         // EXACTLY once AND meter the ASR cost EXACTLY once through the same
@@ -3294,7 +3294,7 @@ mod tests {
         // usage: an over-cap ASR turn STOPS the session fail-closed. Order matters —
         // the transcript is surfaced FIRST, so the turn is still journalled (it
         // happened) before the gate stops the loop; the over-budget snapshot is
-        // emitted before the stop (koe-9xi), and a second frame after the stop is
+        // emitted before the stop (rhanis-9xi), and a second frame after the stop is
         // never processed.
         let (rec, events) = RecordingRecorder::new();
         let month = current_yyyymm();
@@ -3375,7 +3375,7 @@ mod tests {
 
     #[tokio::test]
     async fn inflight_dispatch_count_is_bounded() {
-        // koe-wj2 DoS guard: a hostile / compromised model that streams
+        // rhanis-wj2 DoS guard: a hostile / compromised model that streams
         // `function_call` frames for the whole session must NOT grow the dispatch
         // JoinSet without bound. We feed MAX_INFLIGHT_DISPATCHES + extra
         // function-call frames; only the cap many may ever be spawned, the rest
@@ -3437,7 +3437,7 @@ mod tests {
         .await;
 
         // Exactly the cap was spawned/dispatched; the extra frames were skipped,
-        // not crashed. (Before koe-wj2 the count would equal the full frame
+        // not crashed. (Before rhanis-wj2 the count would equal the full frame
         // count, MAX_INFLIGHT_DISPATCHES + extra.)
         let dispatched = disp.calls.lock().unwrap().len();
         assert_eq!(
@@ -3498,10 +3498,10 @@ mod tests {
         assert!(disp.calls.lock().unwrap().is_empty(), "no dispatch after budget stop");
     }
 
-    // ---- koe-ixt: cost-snapshot stop->start handover (fail-open guard) --------
+    // ---- rhanis-ixt: cost-snapshot stop->start handover (fail-open guard) --------
 
     /// Recorder double modeling the SHARED cost ledger exactly as the real
-    /// `SqliteAdapter` does after koe-ixt: an ADDITIVE accumulation that returns the
+    /// `SqliteAdapter` does after rhanis-ixt: an ADDITIVE accumulation that returns the
     /// new running total. The `persisted` map is `Arc`-shared so two simulated
     /// session loops (an older one draining late usage, a newer one just started)
     /// observe each other's adds through ONE ledger — the cross-session coupling the
@@ -3586,7 +3586,7 @@ mod tests {
 
     #[tokio::test]
     async fn handover_late_usage_stops_newer_session_via_global_total() {
-        // koe-ixt mechanism 4 (fail-open). The stop->start cost handover, modeled
+        // rhanis-ixt mechanism 4 (fail-open). The stop->start cost handover, modeled
         // with an explicit, deterministic ledger ORDERING (no timing):
         //   0. The month already had $10 of spend in the shared ledger; both A and
         //      B loaded it as their baseline.
@@ -3653,7 +3653,7 @@ mod tests {
         // LoopAction::Continue — the newer session billing fail-open.
         assert!(
             matches!(b_result, LoopAction::Stop("monthly budget exceeded")),
-            "newer session B must fail-closed on the cross-session ledger, not its stale local baseline (koe-ixt mechanism 4)"
+            "newer session B must fail-closed on the cross-session ledger, not its stale local baseline (rhanis-ixt mechanism 4)"
         );
         // The ledger SUMMED both sessions' spend ($10 seed + A's $30 + B's $1 = $41),
         // not max'd them ($40) — so a handover sibling's spend is never lost.
@@ -3672,7 +3672,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_failure_with_over_cap_local_stops_fail_closed() {
-        // koe-ixt (R-B finding): a NEW fail-closed branch. When the ledger ADD
+        // rhanis-ixt (R-B finding): a NEW fail-closed branch. When the ledger ADD
         // fails transiently (below the MAX_SNAPSHOT_SAVE_FAILURES terminal
         // threshold) but THIS frame's spend already exceeds the cap, the loop must
         // STILL stop on "monthly budget exceeded" via the fallback gate — NOT keep
@@ -3704,7 +3704,7 @@ mod tests {
 
     #[tokio::test]
     async fn usage_is_persisted_under_the_tracker_effective_month_not_the_clock() {
-        // koe-ixt backward-clock guard: the snapshot is keyed on the tracker's
+        // rhanis-ixt backward-clock guard: the snapshot is keyed on the tracker's
         // EFFECTIVE accounting month (c.current_month), NOT the raw observed clock
         // month. `add_usage` only advances current_month FORWARD, so a tracker
         // already at a LATER month than the clock (modeling a backward clock skew /
@@ -3773,7 +3773,7 @@ mod tests {
 
     #[tokio::test]
     async fn readback_failure_after_save_failure_stops_fail_closed_immediately() {
-        // koe-ixt (CodeRabbit Major): when BOTH the snapshot SAVE and the recovery
+        // rhanis-ixt (CodeRabbit Major): when BOTH the snapshot SAVE and the recovery
         // READ fail, the authoritative balance is UNKNOWN. Fail-closed — stop with
         // "cost tracking unavailable" IMMEDIATELY (on the first failure), NOT after
         // MAX_SNAPSHOT_SAVE_FAILURES: an unknown balance must never permit continued
@@ -3805,7 +3805,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_ledger_adds_carry_forward_and_still_trip_the_cap() {
-        // koe-ixt (Codex R-C): a failed `add_month_cost` must NOT silently drop this
+        // rhanis-ixt (Codex R-C): a failed `add_month_cost` must NOT silently drop this
         // frame's spend from the ledger. The unpersisted delta is carried forward
         // (`pending`) so the gate keeps counting it across frames. Codex's
         // scenario: a $15 cap and TWO consecutive add-failures of +$10 each. True
@@ -3835,7 +3835,7 @@ mod tests {
         let dispatcher: Arc<dyn DispatcherSeam> = Arc::new(NoopDispatcher);
         let mut dispatch_tasks = tokio::task::JoinSet::new();
         // The carry + failure count now live in the SHARED `cost` tracker (so they
-        // survive between frames AND across a reconnect — koe-byf), not in locals.
+        // survive between frames AND across a reconnect — rhanis-byf), not in locals.
         let (mut cap_warned, mut journal_drop_warned, mut benign_err_warned) = (false, false, false);
 
         // Frame 1: add fails; the $10 is carried, gate sees only $10 (< $15 cap).
@@ -3894,7 +3894,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_cost_from_a_past_month_is_dropped_not_folded_into_new_month() {
-        // koe-ixt (Codex P2): the carried unpersisted spend is MONTH-SCOPED. If a
+        // rhanis-ixt (Codex P2): the carried unpersisted spend is MONTH-SCOPED. If a
         // month rollover happens while spend is still unpersisted (a prior add
         // failed), the stale carry must NOT be folded into the new month's row (that
         // would over-count the new month). It is DROPPED — the old month's cap was
@@ -3929,7 +3929,7 @@ mod tests {
         let mut dispatch_tasks = tokio::task::JoinSet::new();
         let (mut cap_warned, mut journal_drop_warned, mut benign_err_warned) = (false, false, false);
         // Pre-seed the SHARED tracker's carry with unpersisted $5 left over from an
-        // EARLIER month (tracker_month - 1). koe-byf moved the carry into CostTracker
+        // EARLIER month (tracker_month - 1). rhanis-byf moved the carry into CostTracker
         // so it survives reconnects; tests seed/assert it there instead of a local.
         {
             let mut c = cost.lock().await;
@@ -3978,7 +3978,7 @@ mod tests {
 
     #[tokio::test]
     async fn handover_below_cap_sibling_spend_is_summed_not_lost() {
-        // koe-ixt (Codex P1, the max-vs-sum fail-open). The exact scenario an
+        // rhanis-ixt (Codex P1, the max-vs-sum fail-open). The exact scenario an
         // absolute-total + max() scheme fails: a $45 cap, a handover sibling (A) that
         // added $40 (below the cap), and a newer session B (loaded $0) that drains a
         // $10 frame. The TRUE month total is $50 (> $45). An additive ledger sums
@@ -4085,7 +4085,7 @@ mod tests {
     }
 
     /// Recorder whose conversation-log writes always fail but whose cost snapshot
-    /// succeeds — isolates the koe-emd fail-soft path (a failed log must NOT stop
+    /// succeeds — isolates the rhanis-emd fail-soft path (a failed log must NOT stop
     /// the session) from the cost-tracking fail-closed path. Counts log attempts
     /// so a test can prove the failing write was actually attempted-and-swallowed
     /// (not merely never sent).
@@ -4131,7 +4131,7 @@ mod tests {
     #[tokio::test]
     async fn failed_conversation_log_does_not_stop_session() {
         // A recorder error on a transcript / tool turn must be swallowed
-        // (koe-emd fail-soft): the loop keeps processing later frames (the tool
+        // (rhanis-emd fail-soft): the loop keeps processing later frames (the tool
         // still dispatches) and exits cleanly (idle), never an error status.
         let disp = Arc::new(RecordingDispatcher { calls: StdMutex::new(Vec::new()) });
         let (rec, log_attempts) = LogFailRecorder::new();
@@ -4249,7 +4249,7 @@ mod tests {
     async fn recorded_turn_survives_recoverable_disconnect() {
         // The tail-drain on loop exit is unconditional: a turn that already happened
         // must be persisted even when the connection drops abnormally (here a WS
-        // error → koe-byf `Reconnect`). Guards the "turns belong in the history even
+        // error → rhanis-byf `Reconnect`). Guards the "turns belong in the history even
         // on an abnormal exit" contract — a regression that gated the drain on the
         // `Ended` (finalize) branch would lose the tail on every reconnect.
         let (rec, events) = RecordingRecorder::new();
@@ -4309,7 +4309,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_error_returns_reconnect_and_keeps_slot() {
-        // koe-byf: a WS/IO transport error is a RECOVERABLE drop. run_read_loop must
+        // rhanis-byf: a WS/IO transport error is a RECOVERABLE drop. run_read_loop must
         // return `Reconnect`, NOT finalize the slot (so the supervisor can reconnect),
         // and emit NO terminal idle/error (the supervisor owns the
         // reconnecting/error transitions). Previously this finalized
@@ -4360,7 +4360,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_cost_carry_survives_a_recoverable_disconnect() {
-        // koe-byf (Codex Cloud P1): unpersisted spend (the koe-ixt carry) must live in
+        // rhanis-byf (Codex Cloud P1): unpersisted spend (the rhanis-ixt carry) must live in
         // the SHARED CostTracker, not run_read_loop's locals, so a recoverable
         // disconnect does NOT drop it (dropping = undercount across the reconnect =
         // fail-open). A usage frame whose ledger add FAILS leaves $10 carried; a
@@ -4624,7 +4624,7 @@ mod tests {
     }
 
     /// Drives `run_read_loop` over `frames` collecting every surfaced
-    /// (code, message) from the provider-error emitter (koe-nal).
+    /// (code, message) from the provider-error emitter (rhanis-nal).
     async fn collect_provider_errors(
         frames: Vec<serde_json::Value>,
     ) -> Vec<(Option<String>, String)> {
@@ -4666,7 +4666,7 @@ mod tests {
         Arc::try_unwrap(errors).unwrap().into_inner().unwrap()
     }
 
-    /// koe-nal: a non-benign server `error` frame is surfaced through the
+    /// rhanis-nal: a non-benign server `error` frame is surfaced through the
     /// provider-error emitter with its sanitized code + message, and the loop
     /// CONTINUES — frames after the error are still processed (the session is
     /// not torn down by a mid-session error frame).
@@ -4692,7 +4692,7 @@ mod tests {
         assert_eq!(errors[0].1, "Unknown parameter: 'session.bogus'.");
     }
 
-    /// koe-nal + koe-bx7: the benign barge-in cancel race ("no active response"
+    /// rhanis-nal + rhanis-bx7: the benign barge-in cancel race ("no active response"
     /// answers to the ungated `response.cancel`) is steady-state noise — it must
     /// NOT reach the provider-error emitter (no user-facing alarm).
     #[tokio::test]
@@ -4708,7 +4708,7 @@ mod tests {
         assert!(errors.is_empty(), "benign cancel noise must not surface: {errors:?}");
     }
 
-    /// Barge-in (koe-bx7), protocol half: a server `speech_started` frame makes
+    /// Barge-in (rhanis-bx7), protocol half: a server `speech_started` frame makes
     /// the loop send the provider's `response.cancel` on write_tx — exactly once
     /// — and the same frame ALSO reaches `audio_handler` (the seam on which the
     /// audio bridge cuts playback; that half is asserted in audio_bridge tests).
@@ -4778,7 +4778,7 @@ mod tests {
         );
     }
 
-    /// Barge-in cancel delivery when the write channel is FULL (koe-bx7, CR
+    /// Barge-in cancel delivery when the write channel is FULL (rhanis-bx7, CR
     /// finding): the cancel must not be silently dropped — a parked background
     /// task delivers it once capacity frees — and the read loop itself must not
     /// block (the loop finishes processing the stream regardless).
@@ -4842,7 +4842,7 @@ mod tests {
         assert_eq!(v["type"], "response.cancel");
     }
 
-    /// The parked cancel is FRESHNESS-BOUNDED (koe-bx7, Codex Cloud P2): if the
+    /// The parked cancel is FRESHNESS-BOUNDED (rhanis-bx7, Codex Cloud P2): if the
     /// write channel stays full past CANCEL_PARK_BOUND, the parked cancel is
     /// DROPPED — a late unqualified `response.cancel` could cancel the NEXT
     /// response (the reply to the barge-in) instead of the interrupted one.
@@ -5256,7 +5256,7 @@ mod tests {
         ).await.expect("writer task must finish naturally after normal close");
     }
 
-    // ---- get_cost_snapshot / build_cost_snapshot (pull path, koe-9xi) -----
+    // ---- get_cost_snapshot / build_cost_snapshot (pull path, rhanis-9xi) -----
 
     #[test]
     fn build_cost_snapshot_absent_row_is_zero_spent() {
@@ -5301,7 +5301,7 @@ mod tests {
         assert!(build_cost_snapshot(&ReadWriteFailRecorder, &budget, 202605, 0).is_err());
     }
 
-    // ---- cost-update emit (push path, koe-9xi) ---------------------------
+    // ---- cost-update emit (push path, rhanis-9xi) ---------------------------
 
     type CostEmits = Arc<StdMutex<Vec<(u32, u64, BudgetConfig)>>>;
 
@@ -5450,7 +5450,7 @@ mod tests {
         );
     }
 
-    // ---- koe-byf: reconnection (backoff + supervisor) ------------------------
+    // ---- rhanis-byf: reconnection (backoff + supervisor) ------------------------
 
     /// A mock `Connection` whose stream yields `items` then ends. No device → no-op
     /// audio/stop closures; the write channel's receiver is dropped (the test streams
@@ -5718,11 +5718,11 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_fails_closed_on_connect_timeout() {
-        // koe-9wb: a connect that HANGS past `connect_timeout` (a blackholed
+        // rhanis-9wb: a connect that HANGS past `connect_timeout` (a blackholed
         // TLS/proxy/firewall handshake) must NOT leave the session stuck in `connecting`
         // (= UI "準備中") forever. Each hung attempt is abandoned at the timeout, mapped
         // to a RECOVERABLE failure, and rides the SAME backoff → max_attempts →
-        // fail-closed path as any transient drop. Without the timeout (the pre-koe-9wb
+        // fail-closed path as any transient drop. Without the timeout (the pre-rhanis-9wb
         // behavior) this connect would never resolve and the supervisor would never
         // surface `reconnecting` or fail closed — the symptom-4 hang.
         let calls = Arc::new(AtomicUsize::new(0));
@@ -6057,7 +6057,7 @@ mod tests {
         // Handover: while OUR connection drops recoverably, a NEWER session owns the
         // slot. The supervisor must NOT reconnect (would orphan a live WS → BYOK
         // double-charge) and must emit no terminal status — it leaves the newer
-        // session intact (mirrors finalize's generation guard, koe-ego).
+        // session intact (mirrors finalize's generation guard, rhanis-ego).
         const GEN: u64 = 5;
         const GEN_NEWER: u64 = 6;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -6153,7 +6153,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_master_shutdown_during_connect_emits_idle() {
         // A user stop while a (re)connect is HANGING must end idle without ever
-        // connecting — connect is raced against master_shutdown (koe-byf).
+        // connecting — connect is raced against master_shutdown (rhanis-byf).
         const GEN: u64 = 11;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = Arc::clone(&calls);

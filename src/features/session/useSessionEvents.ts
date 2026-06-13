@@ -39,7 +39,7 @@ export function useSessionEvents(): void {
           // FAIL-CLOSED (cost-protection P1): if the listener fails while a session
           // is already running (status === "connected" | "loading" | "reconnecting"),
           // fire an idempotent stopSession so the backend is not left running
-          // unbounded with no UI way to reach it. `reconnecting` (koe-byf) is a LIVE
+          // unbounded with no UI way to reach it. `reconnecting` (rhanis-byf) is a LIVE
           // session — the backend supervisor is actively re-opening (billable)
           // connections — so it MUST be force-stopped here too, else a dropped status
           // channel during a reconnect storm leaves the supervisor reconnecting

@@ -81,7 +81,7 @@ describe("VoiceButton", () => {
     expect(isBusy).toBe(true);
   });
 
-  it("stays enabled, busy, and stoppable while reconnecting (koe-byf)", async () => {
+  it("stays enabled, busy, and stoppable while reconnecting (rhanis-byf)", async () => {
     act(() => {
       useSessionStore.getState().setFromEvent({ state: "reconnecting", sequence: 1 });
     });

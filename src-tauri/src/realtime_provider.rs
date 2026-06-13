@@ -1,4 +1,4 @@
-//! Voice connection layer (koe-zv3): the `RealtimeProvider` trait that lets the
+//! Voice connection layer (rhanis-zv3): the `RealtimeProvider` trait that lets the
 //! session loop drive either OpenAI Realtime or (PR2) Google Gemini Live.
 //!
 //! PR1 abstracts the existing OpenAI path into [`OpenAiRealtime`] with
@@ -39,7 +39,7 @@ const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-
 /// Token-billed (so its usage is meterable as tokens, not an opaque `duration`
 /// shape — see [`parse_asr_usage`]), low-cost, and supports Japanese. It is billed
 /// SEPARATELY from the realtime model; its usage is metered via [`parse_asr_usage`]
-/// onto the same cost ledger (koe-pbe).
+/// onto the same cost ledger (rhanis-pbe).
 const ASR_MODEL: &str = "gpt-4o-mini-transcribe";
 
 // ---- RealtimeAuth ------------------------------------------------------------
@@ -87,7 +87,7 @@ impl fmt::Debug for RealtimeAuth {
 /// A function call whose arguments are size-capped but NOT yet JSON-parsed. The
 /// read loop parses `args_raw` only AFTER the in-flight dispatch cap admits the
 /// call, so a saturated burst is rejected without paying the per-frame parse —
-/// the pre-trait code checked the cap before parsing arguments (koe-wj2 DoS
+/// the pre-trait code checked the cap before parsing arguments (rhanis-wj2 DoS
 /// guard). Carrying the raw string keeps the size cap (applied in `parse_frame`)
 /// while deferring the parse to the loop.
 pub struct PendingCall {
@@ -97,7 +97,7 @@ pub struct PendingCall {
 }
 
 /// Which side of the conversation a [`ProviderEvent::Transcript`] turn came
-/// from. Maps to the `role` column of a stored `ConversationEvent` (koe-emd) via
+/// from. Maps to the `role` column of a stored `ConversationEvent` (rhanis-emd) via
 /// [`TranscriptRole::as_role_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptRole {
@@ -131,15 +131,15 @@ pub enum ProviderEvent {
     /// `response.done`; the SEPARATELY-BILLED ASR (input-transcription) usage rides
     /// on `conversation.item.input_audio_transcription.completed` and is metered
     /// through this SAME variant (and the same `add_month_cost` ledger), so there is
-    /// no second cost path to keep in sync (koe-pbe).
+    /// no second cost path to keep in sync (rhanis-pbe).
     Usage(Usage),
     /// A **finalized** speech transcript turn — user input (OpenAI:
     /// `conversation.item.input_audio_transcription.completed`) or assistant
     /// output (OpenAI GA: `response.output_audio_transcript.done`). Carries the
     /// finalized text only; streaming `.delta` events map to [`Ignored`] so each
     /// turn is journalled exactly once (no fragmented / double rows). The session
-    /// loop persists it via the recorder (koe-emd). The user `.completed` frame also
-    /// yields a [`Usage`] for its ASR cost (koe-pbe) — surfaced after this transcript
+    /// loop persists it via the recorder (rhanis-emd). The user `.completed` frame also
+    /// yields a [`Usage`] for its ASR cost (rhanis-pbe) — surfaced after this transcript
     /// so the turn is journalled before any budget gate.
     ///
     /// [`Ignored`]: ProviderEvent::Ignored
@@ -154,7 +154,7 @@ pub enum ProviderEvent {
     #[allow(dead_code)]
     AudioDelta,
     /// The user started speaking (OpenAI: `input_audio_buffer.speech_started`,
-    /// server VAD) — the barge-in trigger (koe-bx7). Two reactions, two seams:
+    /// server VAD) — the barge-in trigger (rhanis-bx7). Two reactions, two seams:
     /// the audio side (cut local playback + suppress stale deltas) happens in
     /// [`PlaybackHandle::handle_server_audio`], which sees the same frame via the
     /// read loop's `audio_handler`; the protocol side — sending the provider's
@@ -168,14 +168,14 @@ pub enum ProviderEvent {
     /// [`PlaybackHandle::handle_server_audio`]: crate::audio_bridge::PlaybackHandle::handle_server_audio
     /// [`cancel_frame`]: RealtimeProvider::cancel_frame
     SpeechStarted,
-    /// A server-reported `error` frame (koe-nal), normalized to a sanitized,
+    /// A server-reported `error` frame (rhanis-nal), normalized to a sanitized,
     /// length-capped code + message (the strings are server-controlled display
     /// input — see [`sanitize_server_text`]). Previously these frames fell
     /// through to [`Ignored`], so a rejected `session.update` silently killed
     /// tool advertisement / ASR / journaling / thinking-events in one stroke
     /// while audio kept flowing. `benign` marks the expected barge-in cancel
     /// race — [`cancel_frame`] is sent ungated on every speech start, so the
-    /// provider answering "no active response" is steady-state noise (koe-bx7)
+    /// provider answering "no active response" is steady-state noise (rhanis-bx7)
     /// — letting the session loop journal it WITHOUT alarming the user, while
     /// every other error is surfaced to the UI.
     ///
@@ -209,13 +209,13 @@ pub trait RealtimeProvider: Send + Sync + 'static {
     /// A single wire event can map to MORE THAN ONE normalized event: the user
     /// input-transcription `.completed` frame carries BOTH the finalized transcript
     /// AND a separately-billed ASR usage report, so it yields a `Transcript` *and* a
-    /// `Usage` (koe-pbe). Every other frame yields a 0- or 1-element `Vec` — a
+    /// `Usage` (rhanis-pbe). Every other frame yields a 0- or 1-element `Vec` — a
     /// negligible allocation next to the per-frame `serde_json` parse the read loop
-    /// already paid, and it does NOT weaken the koe-wj2 function-call DoS guard: the
+    /// already paid, and it does NOT weaken the rhanis-wj2 function-call DoS guard: the
     /// in-flight cap check still runs in the loop AFTER this returns a 1-element
     /// `Vec`, and an over-cap `arguments` blob is still dropped here without parsing.
     fn parse_frame(&self, event: &Value) -> Vec<ProviderEvent>;
-    /// The client frame that cancels the in-flight response (barge-in, koe-bx7).
+    /// The client frame that cancels the in-flight response (barge-in, rhanis-bx7).
     /// The session loop sends it when [`ProviderEvent::SpeechStarted`] arrives.
     ///
     /// Default `None`: a provider whose server handles interruption entirely on
@@ -224,7 +224,7 @@ pub trait RealtimeProvider: Send + Sync + 'static {
     /// client does not track response lifecycle; when no response is active
     /// (or the server's VAD `interrupt_response` already cancelled it) the
     /// server answers with a duplicate-cancel `error` frame that `parse_frame`
-    /// maps to [`ProviderEvent::ServerError`] with `benign: true` (koe-nal,
+    /// maps to [`ProviderEvent::ServerError`] with `benign: true` (rhanis-nal,
     /// see `is_benign_cancel_error`) — the session loop suppresses it from the
     /// UI instead of alarming the operator. That classification is part of
     /// this contract: error surfacing must keep the duplicate-cancel answer
@@ -260,7 +260,7 @@ impl RealtimeProvider for OpenAiRealtime {
         // gpt-realtime-2 is a GA model; the current Realtime WebSocket docs drop
         // the `OpenAI-Beta: realtime=v1` header (it selected the now-superseded
         // beta interface). The exact handshake headers + server event shapes are
-        // verified against the live API in koe-ef8 (Windows E2E).
+        // verified against the live API in rhanis-ef8 (Windows E2E).
         Ok(request)
     }
 
@@ -269,7 +269,7 @@ impl RealtimeProvider for OpenAiRealtime {
         // function calls (else the dispatch loop is permanently idle), AND enabling
         // user-speech transcription so the user half of the conversation log fills.
         //
-        // koe-pbe: USER-speech transcripts require enabling input audio
+        // rhanis-pbe: USER-speech transcripts require enabling input audio
         // transcription. The GA Realtime session config nests it at
         // `session.audio.input.transcription` (this is a PARTIAL `session.update`:
         // the server merges it, leaving other audio defaults — format /
@@ -277,10 +277,10 @@ impl RealtimeProvider for OpenAiRealtime {
         // so it is COUPLED with metering the ASR usage that rides on
         // `conversation.item.input_audio_transcription.completed.usage` — see
         // [`parse_asr_usage`] and the `.completed` arm in [`parse_frame`]. Without
-        // that metering the fail-closed monthly budget would leak (koe's core
+        // that metering the fail-closed monthly budget would leak (Rhanis's core
         // invariant), which is exactly why this enable + the ASR metering ship in
         // ONE change. [`ASR_MODEL`] is token-billed so the usage is meterable; the
-        // exact live usage field shape is pinned in koe-ef8 (Windows E2E).
+        // exact live usage field shape is pinned in rhanis-ef8 (Windows E2E).
         let session_update = serde_json::json!({
             "type": "session.update",
             "session": {
@@ -297,7 +297,7 @@ impl RealtimeProvider for OpenAiRealtime {
         // speech start (see the trait doc): with the GA default server VAD the
         // server has usually interrupted already, and a cancel with no active
         // response yields a duplicate-cancel `error` frame that parse_frame
-        // classifies `ServerError { benign: true }` (koe-nal) — suppressed from
+        // classifies `ServerError { benign: true }` (rhanis-nal) — suppressed from
         // the UI. Static shape — no per-call state, mirrors initial_frames.
         Some(Message::Text(
             serde_json::json!({ "type": "response.cancel" }).to_string().into(),
@@ -334,7 +334,7 @@ impl RealtimeProvider for OpenAiRealtime {
                 // parses them only after the MAX_INFLIGHT_DISPATCHES cap admits the
                 // call, so a saturated burst is dropped without paying the per-frame
                 // JSON parse (the pre-trait code checked the cap before parsing the
-                // arguments — koe-wj2 DoS guard).
+                // arguments — rhanis-wj2 DoS guard).
                 vec![ProviderEvent::FunctionCall(PendingCall {
                     call_id,
                     name,
@@ -343,13 +343,13 @@ impl RealtimeProvider for OpenAiRealtime {
             }
             // Realtime-model usage. A `response.done` WITHOUT a parseable `usage`
             // is currently Ignored (continue) — a known fail-OPEN gap tracked by
-            // koe-2br, deliberately NOT hardened here: a `response.done` for a
+            // rhanis-2br, deliberately NOT hardened here: a `response.done` for a
             // cancelled/empty turn legitimately carries no usage ($0), so naively
             // fail-closing every usage-less `response.done` would spuriously stop
             // normal sessions. Distinguishing "absent = normal" from "malformed =
-            // suspicious" needs the live payload shape, which koe-ef8 (Windows E2E)
-            // pins; koe-2br does the fail-closed hardening once that data exists.
-            // Out of scope for koe-pbe (ASR transcription/metering); behaviour here
+            // suspicious" needs the live payload shape, which rhanis-ef8 (Windows E2E)
+            // pins; rhanis-2br does the fail-closed hardening once that data exists.
+            // Out of scope for rhanis-pbe (ASR transcription/metering); behaviour here
             // is unchanged from before this PR.
             Some("response.done") => match parse_usage(event) {
                 Some(usage) => vec![ProviderEvent::Usage(usage)],
@@ -360,7 +360,7 @@ impl RealtimeProvider for OpenAiRealtime {
             // the SAME `audio_bridge::is_audio_delta_type` predicate as that
             // seam, so it matches both wire names (GA
             // `response.output_audio.delta` / superseded beta
-            // `response.audio.delta`, koe-bd7) and cannot drift from the
+            // `response.audio.delta`, rhanis-bd7) and cannot drift from the
             // seam's match. Today this equals the `_ => Ignored` catch-all,
             // but pinning the names keeps audio frames out of any future
             // non-Ignored catch-all (e.g. unknown-frame logging). PR2 will
@@ -368,12 +368,12 @@ impl RealtimeProvider for OpenAiRealtime {
             Some(t) if crate::audio_bridge::is_audio_delta_type(t) => {
                 vec![ProviderEvent::Ignored]
             }
-            // Barge-in trigger (koe-bx7): the user began speaking (server VAD).
+            // Barge-in trigger (rhanis-bx7): the user began speaking (server VAD).
             // The audio cut happens in the `audio_handler` seam (the bridge sees
             // this same frame); the normalized event tells the session loop to
             // send `cancel_frame()`.
             Some("input_audio_buffer.speech_started") => vec![ProviderEvent::SpeechStarted],
-            // Finalized user-speech transcription (koe-emd / koe-pbe). The matching
+            // Finalized user-speech transcription (rhanis-emd / rhanis-pbe). The matching
             // `.delta` stream falls through to `_ => Ignored`, so only the completed
             // turn is journalled. This frame carries BOTH the transcript AND a
             // SEPARATELY-BILLED ASR usage (OpenAI: "billed according to the ASR
@@ -385,11 +385,11 @@ impl RealtimeProvider for OpenAiRealtime {
             // most once: the turn is recorded once and the ASR cost counted once (no
             // double-record / double-count).
             //
-            // C-P2b (koe-ef8): ASR runs asynchronously, so `.completed` may arrive
+            // C-P2b (rhanis-ef8): ASR runs asynchronously, so `.completed` may arrive
             // BEFORE or AFTER the response it belongs to. The journal orders by row
             // id (arrival order), which can diverge from strict conversation order;
             // whether an item_id/response_id-based ordering (a `ConversationEvent`
-            // schema migration) is warranted is decided from live traffic in koe-ef8,
+            // schema migration) is warranted is decided from live traffic in rhanis-ef8,
             // NOT in this PR. `item_id` is intentionally not consumed here yet.
             Some("conversation.item.input_audio_transcription.completed") => {
                 let mut events = Vec::new();
@@ -404,11 +404,11 @@ impl RealtimeProvider for OpenAiRealtime {
                 }
                 events
             }
-            // Finalized assistant-speech transcript (koe-emd). The GA Realtime
+            // Finalized assistant-speech transcript (rhanis-emd). The GA Realtime
             // event is `response.output_audio_transcript.done`; the superseded
             // beta interface used `response.audio_transcript.done`. Match both so
             // the log fills regardless of which the live handshake selects (the
-            // exact server event shape is confirmed in koe-ef8 Windows E2E). Both
+            // exact server event shape is confirmed in rhanis-ef8 Windows E2E). Both
             // carry the final text in `transcript`; the `.delta` stream is
             // ignored below so the turn is recorded once.
             Some("response.output_audio_transcript.done")
@@ -419,16 +419,16 @@ impl RealtimeProvider for OpenAiRealtime {
                 }],
                 None => vec![],
             },
-            // Server-reported error (koe-nal). Previously fell through to the
+            // Server-reported error (rhanis-nal). Previously fell through to the
             // `_ => Ignored` catch-all, silently swallowing e.g. a rejected
             // `session.update` — which disables tools / ASR / journaling /
             // thinking-events in one stroke while audio keeps flowing. The
             // code/message strings are server-controlled: sanitized (control /
             // bidi chars → U+FFFD, same hygiene as `display_descriptor`) and
             // length-capped before they may ride a UI payload. The benign
-            // classification is deliberately narrow (the koe-bx7 cancel race
+            // classification is deliberately narrow (the rhanis-bx7 cancel race
             // only — see `is_benign_cancel_error`); anything else surfaces.
-            // The live error payload shape is pinned in koe-ef8; until then a
+            // The live error payload shape is pinned in rhanis-ef8; until then a
             // missing `error` object still yields a visible, generic message
             // (fail-visible, not fail-silent).
             Some("error") => {
@@ -456,7 +456,7 @@ impl RealtimeProvider for OpenAiRealtime {
 /// Best-effort parse of an OpenAI Realtime usage payload into [`Usage`].
 ///
 /// NOTE: the exact token-detail field names are confirmed against live traffic
-/// in koe-ef8 (Windows E2E). Unknown fields default to 0, so an unexpected shape
+/// in rhanis-ef8 (Windows E2E). Unknown fields default to 0, so an unexpected shape
 /// under-counts rather than panicking — the session timeout is the backstop.
 fn parse_usage(event: &Value) -> Option<Usage> {
     let u = event.get("response")?.get("usage")?;
@@ -489,7 +489,7 @@ fn parse_usage(event: &Value) -> Option<Usage> {
 /// never under-count: under-counting would leak the fail-closed monthly budget
 /// (fail-open = real BYOK money), while over-counting can only trip a budget EARLY.
 /// A dedicated (lower) ASR per-token rate is intentionally NOT introduced here;
-/// pinning the live usage shape + a precise ASR rate is a koe-ef8 (Windows E2E)
+/// pinning the live usage shape + a precise ASR rate is a rhanis-ef8 (Windows E2E)
 /// follow-up. Mapping of the GA "tokens" usage shape:
 ///   - `input_token_details.audio_tokens` -> `audio_input_tokens` (realtime audio rate)
 ///   - `input_token_details.text_tokens`  -> `text_input_tokens`
@@ -500,11 +500,11 @@ fn parse_usage(event: &Value) -> Option<Usage> {
 /// rather than dropping cost: any token the server reports in a coarse field but
 /// that the per-modality breakdown did not account for is billed at the audio rate.
 /// So the metered total is always `>= total_tokens` (and `>= input_tokens`) = never
-/// under-count (fail-closed) — this is the koe-pbe R-C hardening. Only a usage with
+/// under-count (fail-closed) — this is the rhanis-pbe R-C hardening. Only a usage with
 /// NO numeric token field anywhere (absent block, a `duration` usage we never
 /// select, or junk) meters nothing; that residual is backstopped by the realtime
 /// model's own audio input on `response.done` + the session timeout, and the live
-/// shape is pinned in koe-ef8 (which also confirms integer typing on the wire).
+/// shape is pinned in rhanis-ef8 (which also confirms integer typing on the wire).
 fn parse_asr_usage(event: &Value) -> Option<Usage> {
     let u = event.get("usage")?;
     let as_u64 = |v: Option<&Value>| v.and_then(Value::as_u64).unwrap_or(0);
@@ -517,17 +517,17 @@ fn parse_asr_usage(event: &Value) -> Option<Usage> {
 
     // Reconcile UP twice so a PARTIAL / mis-named / coarse-only usage OVER-counts
     // rather than dropping ASR cost (fail-closed; never bill less than what the
-    // server reported in ANY field — koe-pbe R-C / Codex HIGH):
+    // server reported in ANY field — rhanis-pbe R-C / Codex HIGH):
     //   1. coarse `input_tokens`: a remainder beyond the per-modality breakdown
     //      (a partial breakdown with only one sub-field, or an absent one) is billed
     //      at the audio input rate.
     //   2. `total_tokens`: any token in the coarse total NOT yet accounted for by the
     //      breakdown + output (e.g. a missing `output_tokens`, or our field-name
-    //      guesses turn out wrong — koe-ef8 pins the live shape) is also billed at the
+    //      guesses turn out wrong — rhanis-ef8 pins the live shape) is also billed at the
     //      audio input rate. ASR is far cheaper than the realtime audio rate, so
     //      bucketing any unclassified remainder there is a safe over-count.
     // (Token fields are read as integers; a non-integer field reads as 0 — the live
-    // wire is integer-typed per the GA `tokens` shape, pinned in koe-ef8.)
+    // wire is integer-typed per the GA `tokens` shape, pinned in rhanis-ef8.)
     let text_input_tokens = text_in;
     let text_output_tokens = output;
     let input_remainder = coarse_in.saturating_sub(audio_in.saturating_add(text_in));
@@ -546,7 +546,7 @@ fn parse_asr_usage(event: &Value) -> Option<Usage> {
     // No meterable token counts (e.g. a `duration` usage — only emitted for models
     // we never select — or junk, or an all-zero turn) → record the transcript and
     // meter nothing. The realtime model's own audio input (response.done) + the
-    // 30-min session timeout are the backstops; the live shape is pinned in koe-ef8.
+    // 30-min session timeout are the backstops; the live shape is pinned in rhanis-ef8.
     // Skipping an all-zero usage also avoids a no-op cost-update (new sequence, zero
     // spend) on the UI.
     if usage == Usage::default() {
@@ -557,7 +557,7 @@ fn parse_asr_usage(event: &Value) -> Option<Usage> {
 
 /// The finalized `transcript` text of a transcript-bearing frame, or `None` when
 /// it is missing or blank — so a silent / empty turn never becomes an empty
-/// conversation-log row (koe-emd). The text is kept verbatim (only its
+/// conversation-log row (rhanis-emd). The text is kept verbatim (only its
 /// non-blankness is checked); its size is already bounded by the
 /// `MAX_WS_TEXT_BYTES` frame cap applied in `run_read_loop` before parsing.
 fn transcript_text(event: &Value) -> Option<String> {
@@ -567,7 +567,7 @@ fn transcript_text(event: &Value) -> Option<String> {
     }
 }
 
-// ---- server error normalization (koe-nal) --------------------------------------
+// ---- server error normalization (rhanis-nal) --------------------------------------
 
 /// Max characters of a server error `code` kept for display (codes are short
 /// identifiers; anything longer is suspicious padding).
@@ -602,17 +602,17 @@ fn sanitize_server_text(s: &str, max_chars: usize) -> String {
 const MASK_TRANSPARENT: char = '\u{FFFD}';
 
 /// Masks key-shaped substrings before a server-controlled string may ride a UI
-/// payload or stderr (koe-nal R-B). An HONEST provider error already echoes
+/// payload or stderr (rhanis-nal R-B). An HONEST provider error already echoes
 /// partial key material ("Incorrect API key provided: sk-…") and a malicious
 /// provider can echo the full Bearer credential — and "the raw key never
-/// reaches the WebView / a Tauri event payload / a log line" is a hard koe
+/// reaches the WebView / a Tauri event payload / a log line" is a hard Rhanis
 /// boundary (CLAUDE.md BYOK discipline), kept even though the provider itself
 /// obviously already holds the key. Patterns (word-boundary anchored, masked
 /// whole — never partially preserved; bodies also count redaction punctuation
 /// `*` `.` `…`, so provider-redacted fragments stay masked):
 ///
 /// - `sk-` + 4+ body chars (OpenAI-style keys incl. redacted fragments)
-/// - `AIza` + 4+ body chars (Google API keys, koe-31u multi-provider)
+/// - `AIza` + 4+ body chars (Google API keys, rhanis-31u multi-provider)
 /// - `Bearer` (case-insensitive) + whitespace + 8+ non-space (echoed header)
 fn mask_key_material(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -682,7 +682,7 @@ fn mask_key_material(s: &str) -> String {
                     continue;
                 }
             }
-            // Google API key (koe-31u multi-provider). Same 4-char threshold
+            // Google API key (rhanis-31u multi-provider). Same 4-char threshold
             // rationale as `sk-`: the prefix is distinctive, and a
             // provider-redacted fragment ("AIza...WXYZ") is still key material
             // (Codex R-C round 3 — threshold 30 left the redacted tail
@@ -729,16 +729,16 @@ fn mask_key_material(s: &str) -> String {
     out
 }
 
-/// Whether a server error is the EXPECTED barge-in cancel race: koe-bx7 sends
+/// Whether a server error is the EXPECTED barge-in cancel race: rhanis-bx7 sends
 /// `response.cancel` ungated on every `speech_started`, so "there is no active
 /// response to cancel" answers are steady-state noise, not a failure (pinned in
-/// the `cancel_frame` trait doc and the koe-nal issue note). Deliberately
+/// the `cancel_frame` trait doc and the rhanis-nal issue note). Deliberately
 /// narrow — match the cancel-specific code, or the no-active-response phrasing
 /// ONLY when the message also speaks of cancellation AND is short (the genuine
 /// race answer is one short sentence; a long message that merely QUOTES both
 /// phrases — e.g. a validation error echoing attacker-influenced content —
 /// must still surface, R-B) — so a real failure cannot be laundered into
-/// silence. The phrase fallback exists only until koe-ef8 pins the live wire
+/// silence. The phrase fallback exists only until rhanis-ef8 pins the live wire
 /// code; widen/narrow only with that evidence.
 fn is_benign_cancel_error(code: Option<&str>, message: &str) -> bool {
     if let Some(c) = code {
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn initial_frames_enables_input_audio_transcription() {
-        // koe-pbe: the GA Realtime session config nests transcription at
+        // rhanis-pbe: the GA Realtime session config nests transcription at
         // `session.audio.input.transcription.model`. Without this the server never
         // emits `conversation.item.input_audio_transcription.completed`, so the
         // user half of the conversation log stays empty in production (dormant).
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn parse_frame_ga_audio_delta_is_ignored() {
-        // GA wire name (koe-bd7): like the beta name above, the GA
+        // GA wire name (rhanis-bd7): like the beta name above, the GA
         // `response.output_audio.delta` is consumed by the audio_handler seam;
         // the normalized path must keep ignoring it (pinned explicitly so a
         // future non-Ignored catch-all cannot change this silently).
@@ -980,7 +980,7 @@ mod tests {
         assert!(matches!(p.parse_frame(&ev).as_slice(), [ProviderEvent::Ignored]));
     }
 
-    // ---- server error frames (koe-nal) ------------------------------------------
+    // ---- server error frames (rhanis-nal) ------------------------------------------
 
     #[test]
     fn parse_frame_server_error_surfaces_code_and_message() {
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn parse_frame_server_error_cancel_code_is_benign() {
-        // The barge-in cancel race (koe-bx7): cancel sent with no active response
+        // The barge-in cancel race (rhanis-bx7): cancel sent with no active response
         // is steady-state noise — classified benign via the cancel-specific code.
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({
@@ -1029,7 +1029,7 @@ mod tests {
     #[test]
     fn parse_frame_server_error_cancel_message_without_code_is_benign() {
         // Same race, but classified from the message phrasing alone (the live
-        // code is pinned in koe-ef8; until then both signals are accepted).
+        // code is pinned in rhanis-ef8; until then both signals are accepted).
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({
             "type": "error",
@@ -1111,7 +1111,7 @@ mod tests {
     fn parse_frame_server_error_masks_echoed_key_material() {
         // An honest provider error echoes partial key material ("Incorrect API
         // key provided: sk-…"); a malicious one can echo the full credential.
-        // The BYOK key must never ride a Tauri event payload (koe-nal R-B).
+        // The BYOK key must never ride a Tauri event payload (rhanis-nal R-B).
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({
             "type": "error",
@@ -1258,7 +1258,7 @@ mod tests {
         }
     }
 
-    // ---- barge-in (koe-bx7) ----------------------------------------------------
+    // ---- barge-in (rhanis-bx7) ----------------------------------------------------
 
     #[test]
     fn parse_frame_maps_speech_started() {
@@ -1283,7 +1283,7 @@ mod tests {
         assert_eq!(v["type"], "response.cancel");
     }
 
-    // ---- transcript (koe-emd) ------------------------------------------------
+    // ---- transcript (rhanis-emd) ------------------------------------------------
 
     #[test]
     fn transcript_role_maps_to_recorder_role_string() {
@@ -1387,7 +1387,7 @@ mod tests {
         }
     }
 
-    // ---- ASR usage on the user `.completed` frame (koe-pbe) -------------------
+    // ---- ASR usage on the user `.completed` frame (rhanis-pbe) -------------------
 
     /// A canonical GA token-usage `.completed` frame (per OpenAI Realtime docs):
     /// the user transcript PLUS an ASR usage block billed at the ASR model's rate.
@@ -1409,7 +1409,7 @@ mod tests {
 
     #[test]
     fn parse_frame_user_completed_surfaces_transcript_and_asr_usage() {
-        // koe-pbe: the user `.completed` frame carries BOTH the transcript AND a
+        // rhanis-pbe: the user `.completed` frame carries BOTH the transcript AND a
         // separately-billed ASR usage. parse_frame must surface both, transcript
         // FIRST (so it is journalled before a budget gate could stop the loop),
         // usage second — each exactly once (no double-record / double-count).
@@ -1485,7 +1485,7 @@ mod tests {
 
     #[test]
     fn asr_usage_reconciles_against_total_tokens_no_undercount() {
-        // koe-pbe R-C (Codex HIGH): a usage missing `output_tokens` (or with mis-named
+        // rhanis-pbe R-C (Codex HIGH): a usage missing `output_tokens` (or with mis-named
         // fields) but reporting a larger `total_tokens` must STILL bill the
         // unaccounted tokens (at the audio rate), never silently drop them.
         let p = OpenAiRealtime::new();
@@ -1531,7 +1531,7 @@ mod tests {
         // Until the ASR usage block arrives (older shape / not sent), the transcript
         // still records. No usage = no metered cost for that turn — the realtime
         // model's own audio input (response.done) + the 30-min session timeout are
-        // the backstops; the exact live shape is pinned in koe-ef8.
+        // the backstops; the exact live shape is pinned in rhanis-ef8.
         let p = OpenAiRealtime::new();
         let ev = serde_json::json!({
             "type": "conversation.item.input_audio_transcription.completed",
@@ -1550,7 +1550,7 @@ mod tests {
         // never select, or junk) must NOT panic and must NOT silently fabricate a
         // zero Usage event that re-emits a no-op cost-update. The transcript still
         // records; the ASR cost for that turn is simply not metered (backstopped),
-        // and koe-ef8 pins the live shape so this path is not hit in practice.
+        // and rhanis-ef8 pins the live shape so this path is not hit in practice.
         let p = OpenAiRealtime::new();
         for usage in [
             serde_json::json!("not an object"),

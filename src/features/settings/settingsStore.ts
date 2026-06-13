@@ -36,13 +36,13 @@ interface SettingsState {
     recorderAdapter: string,
   ) => Promise<void>;
   saveBudget: (enabled: boolean, monthlyLimitUsd: number | null) => Promise<void>;
-  /** Persists the selected voice provider/model (koe-31u), then re-fetches. */
+  /** Persists the selected voice provider/model (rhanis-31u), then re-fetches. */
   saveVoiceProvider: (value: string) => Promise<void>;
-  /** Enables/disables a 手足 tool provider (koe-31u), then re-fetches. */
+  /** Enables/disables a 手足 tool provider (rhanis-31u), then re-fetches. */
   setToolProviderEnabled: (provider: ToolProvider, enabled: boolean) => Promise<void>;
-  /** Deletes a 手足 tool key + clears its flag atomically (koe-31u), then re-fetches. */
+  /** Deletes a 手足 tool key + clears its flag atomically (rhanis-31u), then re-fetches. */
   deleteToolProviderKey: (provider: ToolProvider) => Promise<void>;
-  /** Persists the whole permission policy (koe-351), then re-fetches. */
+  /** Persists the whole permission policy (rhanis-351), then re-fetches. */
   savePermissionPolicy: (policy: PermissionPolicy) => Promise<void>;
 }
 

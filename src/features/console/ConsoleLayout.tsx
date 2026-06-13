@@ -1,4 +1,4 @@
-// ConsoleLayout — the glass-box console shell (koe-ios.1).
+// ConsoleLayout — the glass-box console shell (rhanis-ios.1).
 //
 // Approved layout (docs/design/2026-06-10-glassbox-console-design-brief.md):
 // a collapsible left sidebar (brand / destinations / cost + settings at the
@@ -7,10 +7,10 @@
 //
 // Honesty constraints (wiring.md — no dead UI, no fake affordances):
 //  - No conversation-transcript stream reaches the frontend yet (history UI =
-//    koe-sh6), so the conversation area renders the status-aware greeting only
+//    rhanis-sh6), so the conversation area renders the status-aware greeting only
 //    — never a fabricated transcript.
 //  - Sidebar destinations whose features ship in separate issues (検索/履歴 =
-//    koe-sh6, オートメーション = koe-bu1, 手足ツール = koe-eal / koe-v5i,
+//    rhanis-sh6, オートメーション = rhanis-bu1, 手足ツール = rhanis-eal / rhanis-v5i,
 //    プロジェクト / タスクボード = post-E2E backlog) render as a non-interactive
 //    "近日追加" list — visible structure from the approved brief, not
 //    fake-clickable buttons.
@@ -62,7 +62,7 @@ export function ConsoleLayout() {
   useActivityEvents();
   // Subscribe to the backend session-status stream; drives sessionStore.
   useSessionEvents();
-  // Pull + subscribe to the live monthly cost snapshot; drives costStore (koe-9xi).
+  // Pull + subscribe to the live monthly cost snapshot; drives costStore (rhanis-9xi).
   useCostEvents();
 
   const status = useSessionStore((s) => s.status);
@@ -81,10 +81,10 @@ export function ConsoleLayout() {
   const sidebarVisible = sidebarOpen || overBudget;
 
   return (
-    <div className="koe-shell">
+    <div className="rhanis-shell">
       {sidebarVisible && (
-        <aside className="koe-sidebar" id="koe-sidebar" aria-label="サイドバー">
-          <div className="koe-side-brand">koe</div>
+        <aside className="rhanis-sidebar" id="rhanis-sidebar" aria-label="サイドバー">
+          <div className="rhanis-side-brand">Rhanis</div>
 
           {/* The one destination that works today: starting a conversation.
               Wired to the same store action as the voice orb; disabled unless
@@ -93,11 +93,11 @@ export function ConsoleLayout() {
               don't show 開始 next to the 上限を引き上げて stop notice). */}
           <button
             type="button"
-            className="koe-btn koe-btn-side"
+            className="rhanis-btn rhanis-btn-side"
             disabled={status !== "idle" || overBudget}
             onClick={() => void startSession()}
           >
-            <span className="koe-side-glyph" aria-hidden>
+            <span className="rhanis-side-glyph" aria-hidden>
               💬
             </span>
             <span>新しい会話</span>
@@ -106,17 +106,17 @@ export function ConsoleLayout() {
           {/* Deliberately NOT a <nav> landmark: these are upcoming
               destinations, not working navigation (honest semantics). The
               list becomes a real <nav> when the first destination ships. */}
-          <div className="koe-side-nav">
-            <p className="koe-side-caption" id="koe-side-planned-caption">
+          <div className="rhanis-side-nav">
+            <p className="rhanis-side-caption" id="rhanis-side-planned-caption">
               近日追加
             </p>
             <ul
-              className="koe-side-planned"
-              aria-labelledby="koe-side-planned-caption"
+              className="rhanis-side-planned"
+              aria-labelledby="rhanis-side-planned-caption"
             >
               {PLANNED_NAV.map((item) => (
-                <li key={item.label} className="koe-side-item">
-                  <span className="koe-side-glyph" aria-hidden>
+                <li key={item.label} className="rhanis-side-item">
+                  <span className="rhanis-side-glyph" aria-hidden>
                     {item.glyph}
                   </span>
                   <span>{item.label}</span>
@@ -125,19 +125,19 @@ export function ConsoleLayout() {
             </ul>
           </div>
 
-          <div className="koe-side-foot">
-            {/* Live monthly cost + over-budget stop / raise control (koe-9xi).
-                The brief's 残高+時間併記 is the M4 managed-credit form (koe-3x6);
+          <div className="rhanis-side-foot">
+            {/* Live monthly cost + over-budget stop / raise control (rhanis-9xi).
+                The brief's 残高+時間併記 is the M4 managed-credit form (rhanis-3x6);
                 M1 BYOK shows the real thing we have: monthly spend vs cap. */}
             <CostHeader />
             <button
               type="button"
-              className="koe-btn koe-btn-side"
+              className="rhanis-btn rhanis-btn-side"
               aria-expanded={showSettings}
-              aria-controls={showSettings ? "koe-settings-area" : undefined}
+              aria-controls={showSettings ? "rhanis-settings-area" : undefined}
               onClick={() => setShowSettings((v) => !v)}
             >
-              <span className="koe-side-glyph" aria-hidden>
+              <span className="rhanis-side-glyph" aria-hidden>
                 ⚙
               </span>
               <span>設定</span>
@@ -146,14 +146,14 @@ export function ConsoleLayout() {
         </aside>
       )}
 
-      <main className="koe-main">
-        <div className="koe-main-bar">
+      <main className="rhanis-main">
+        <div className="rhanis-main-bar">
           <button
             type="button"
-            className="koe-btn koe-btn-bar"
+            className="rhanis-btn rhanis-btn-bar"
             aria-label="サイドバーを開閉"
             aria-expanded={sidebarVisible}
-            aria-controls={sidebarVisible ? "koe-sidebar" : undefined}
+            aria-controls={sidebarVisible ? "rhanis-sidebar" : undefined}
             disabled={overBudget}
             onClick={() => setSidebarOpen((v) => !v)}
           >
@@ -162,32 +162,32 @@ export function ConsoleLayout() {
         </div>
 
         {showSettings && (
-          <div className="koe-main-settings" id="koe-settings-area">
+          <div className="rhanis-main-settings" id="rhanis-settings-area">
             <SettingsPanel onClose={() => setShowSettings(false)} />
           </div>
         )}
 
         {/* Conversation area — greeting only until a transcript stream exists
-            (koe-sh6); see the honesty note in the header comment. */}
-        <section className="koe-conversation" aria-label="会話">
-          <h1 className="koe-greeting">{GREETING[status]}</h1>
+            (rhanis-sh6); see the honesty note in the header comment. */}
+        <section className="rhanis-conversation" aria-label="会話">
+          <h1 className="rhanis-greeting">{GREETING[status]}</h1>
           {status === "idle" && (
-            <p className="koe-greeting-sub">
+            <p className="rhanis-greeting-sub">
               下の音声ボタンを押すと、声で話しかけられます
             </p>
           )}
         </section>
 
-        {/* Live activity panel — the hero (透明性＝主役). koe-activity-fill is
+        {/* Live activity panel — the hero (透明性＝主役). rhanis-activity-fill is
             passed in (not reached via a cross-feature descendant selector) so
-            ActivityLog owns its own class names (koe-iyr). */}
-        <section className="koe-activity-zone" aria-label="ライブ活動">
-          <ActivityLog className="koe-activity-fill" />
+            ActivityLog owns its own class names (rhanis-iyr). */}
+        <section className="rhanis-activity-zone" aria-label="ライブ活動">
+          <ActivityLog className="rhanis-activity-fill" />
         </section>
 
         {/* Voice orb (shrunken from the 2026-06-09 immersive orb) — the primary
             start/stop control, docked under the activity panel. */}
-        <footer className="koe-voice-dock">
+        <footer className="rhanis-voice-dock">
           <VoiceButton />
         </footer>
 

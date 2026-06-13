@@ -1,7 +1,7 @@
-// Tests for PermissionPolicyEditor (koe-351). The folder picker (pickFolder) and
+// Tests for PermissionPolicyEditor (rhanis-351). The folder picker (pickFolder) and
 // the persistence IPC are mocked; the editor's CRUD logic + the exact policy it
 // persists are what we verify here. Real folder-dialog launch is a Windows E2E
-// follow-up (koe-ef8 family) and is intentionally out of scope for this test.
+// follow-up (rhanis-ef8 family) and is intentionally out of scope for this test.
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 

@@ -1,4 +1,4 @@
-//! Human-in-the-loop approval gate (koe-1vi).
+//! Human-in-the-loop approval gate (rhanis-1vi).
 //!
 //! Classifies every tool call into one of three risk tiers (CLAUDE.md safety
 //! gate) and, for the tiers that need confirmation, asks the operator before the
@@ -10,7 +10,7 @@
 //! | CAUTION | write_file / open_url / open_app                 | notify, then run now      |
 //! | DANGER  | run_command / delete_file / external_upload      | confirm before running   |
 //!
-//! Per the user decision (memory `koe-caution-tier`): CAUTION is **notify-only**
+//! Per the user decision (memory `rhanis-caution-tier`): CAUTION is **notify-only**
 //! — the dispatcher emits a non-blocking `tool-event` notification and runs the
 //! tool immediately. Only DANGER goes through the human gate below.
 //!
@@ -29,7 +29,7 @@
 //!
 //! ## Wiring status
 //! [`ApprovalGate::request_approval`] and [`classify`] are the API the
-//! tool_dispatcher (koe-2gy) will call; they have no in-crate caller yet, so they
+//! tool_dispatcher (rhanis-2gy) will call; they have no in-crate caller yet, so they
 //! carry `#[allow(dead_code)]` naming that consumer (same interface-first
 //! convention as `secret_store::SecretStore::get_api_key`). The
 //! `resolve_tool_approval` command IS wired into `lib.rs` now, so the frontend
@@ -53,7 +53,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// decision) at once. A new DANGER request that would exceed this is refused
 /// immediately — fail-closed (never auto-approved) — instead of opening yet
 /// another modal. This caps the approval gate's own state against a burst of
-/// DANGER `function_call`s from a malicious/compromised model server (koe-rxh):
+/// DANGER `function_call`s from a malicious/compromised model server (rhanis-rxh):
 ///
 /// - **Modal flood** — structurally bounded: at most this many
 ///   `tool-approval-required` modals ever reach the operator at once.
@@ -62,14 +62,14 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// - **Dispatch-slot starvation** — *partially* mitigated, NOT fully closed:
 ///   each pending DANGER holds one in-flight dispatch slot for up to the 30s
 ///   deadline (tool_dispatcher). In steady state, capping pending approvals far
-///   below the dispatch cap (`MAX_INFLIGHT_DISPATCHES` = 64, koe-wj2) keeps most
+///   below the dispatch cap (`MAX_INFLIGHT_DISPATCHES` = 64, rhanis-wj2) keeps most
 ///   slots free. BUT this cap is enforced inside [`ApprovalGate::register`],
 ///   which a dispatch task only reaches AFTER session_manager has already
 ///   `spawn`ed it onto the in-flight JoinSet — so a fast back-to-back burst can
 ///   transiently fill all 64 slots before the over-cap tasks reach `register`
 ///   and decline, briefly skipping legitimate SAFE/CAUTION calls. Fully closing
 ///   that race needs a risk-aware admission BEFORE spawn (refuse an over-cap
-///   DANGER call without consuming a slot); tracked as follow-up koe-e2b.
+///   DANGER call without consuming a slot); tracked as follow-up rhanis-e2b.
 ///
 /// Chosen generously enough that a realistic batch of genuine DANGER operations
 /// (e.g. "delete these few files") is never refused, yet far below the dispatch
@@ -77,7 +77,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PENDING_APPROVALS: usize = 8;
 
 /// Hard cap on the redacted summary length before it crosses to the WebView.
-/// Defense-in-depth: the caller (koe-2gy tool_dispatcher) owns redaction, but a
+/// Defense-in-depth: the caller (rhanis-2gy tool_dispatcher) owns redaction, but a
 /// cap bounds a pathological/oversized summary from a misbehaving caller so it
 /// cannot bloat the IPC payload. This is NOT a substitute for redaction.
 const MAX_SUMMARY_LEN: usize = 500;
@@ -110,10 +110,10 @@ pub enum ApprovalRisk {
 
 impl ApprovalRisk {
     /// Whether this tier must be confirmed by a human (the 30s gate) before the
-    /// tool runs. Per the user decision (memory `koe-caution-tier`): **only
+    /// tool runs. Per the user decision (memory `rhanis-caution-tier`): **only
     /// DANGER** gates. SAFE runs immediately with no notification; CAUTION emits
     /// a non-blocking `tool-event` notification and then runs immediately (it
-    /// does NOT wait for approval). Consumed by the tool_dispatcher (koe-2gy) to
+    /// does NOT wait for approval). Consumed by the tool_dispatcher (rhanis-2gy) to
     /// route SAFE/CAUTION → run now vs DANGER → `request_approval`.
     pub fn requires_approval(self) -> bool {
         matches!(self, ApprovalRisk::Danger)
@@ -142,10 +142,10 @@ pub enum ApprovalOutcome {
 /// An **unknown** tool is classified `DANGER` (fail-closed): the gate must never
 /// silently auto-run something it does not recognise. `run_command` is always
 /// DANGER here; the shell DENY/ALLOW list is enforced separately at execution
-/// time (tool_dispatcher, koe-2gy), so a blocked command is rejected outright
+/// time (tool_dispatcher, rhanis-2gy), so a blocked command is rejected outright
 /// rather than merely prompting.
 ///
-/// Consumed by the tool_dispatcher (koe-2gy).
+/// Consumed by the tool_dispatcher (rhanis-2gy).
 pub fn classify(tool: &str) -> ApprovalRisk {
     match tool {
         "web_search" | "read_file" | "take_screenshot" | "write_note" => ApprovalRisk::Safe,
@@ -285,7 +285,7 @@ impl ApprovalGate {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Pending-approval cap (koe-rxh): refuse a new request that would exceed
+        // Pending-approval cap (rhanis-rxh): refuse a new request that would exceed
         // the cap WITHOUT reserving an id/sequence or opening a modal. Checked
         // under the same lock as the insert below, so two concurrent requests can
         // never both slip past the cap. The caller (`request_approval`) fails
@@ -329,12 +329,12 @@ impl ApprovalGate {
     }
 
     /// Emits an approval request and awaits the human decision (fail-closed,
-    /// 30s). Consumed by the tool_dispatcher (koe-2gy) for DANGER tools only
-    /// (CAUTION is notify-only and never calls this — koe-caution-tier).
+    /// 30s). Consumed by the tool_dispatcher (rhanis-2gy) for DANGER tools only
+    /// (CAUTION is notify-only and never calls this — rhanis-caution-tier).
     ///
     /// `display_summary` MUST be pre-redacted by the caller — at most the safe
     /// target descriptor of `display_descriptor` (home-relative path / first
-    /// command token / URL host, koe-whf); never a key, raw absolute path, or
+    /// command token / URL host, rhanis-whf); never a key, raw absolute path, or
     /// PII. It is shown (after a defensive length cap) in the modal. The cap is
     /// belt-and-suspenders; redaction remains the caller's job.
     pub async fn request_approval(
@@ -348,7 +348,7 @@ impl ApprovalGate {
 
         let (approval_id, sequence, rx) = match self.register() {
             Some(reg) => reg,
-            // Pending-approval cap reached (koe-rxh): refuse this DANGER request
+            // Pending-approval cap reached (rhanis-rxh): refuse this DANGER request
             // without emitting a modal. Fail-closed — the tool does not run — and
             // the in-flight dispatch slot is freed immediately, so a burst of
             // DANGER calls cannot starve legitimate SAFE/CAUTION dispatches or
@@ -450,7 +450,7 @@ impl ApprovalGate {
 }
 
 /// Tauri managed-state wrapper. `lib.rs` constructs one `ApprovalGate` (sharing
-/// the process `SequenceCounter`) and the tool_dispatcher (koe-2gy) reaches it
+/// the process `SequenceCounter`) and the tool_dispatcher (rhanis-2gy) reaches it
 /// via `tauri::State<'_, ManagedApprovalGate>`.
 pub struct ManagedApprovalGate(pub Arc<ApprovalGate>);
 
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn only_danger_requires_approval() {
-        // Per the user decision (koe-caution-tier): SAFE and CAUTION both run
+        // Per the user decision (rhanis-caution-tier): SAFE and CAUTION both run
         // immediately (CAUTION emits a non-blocking notification, no gate); only
         // DANGER goes through the 30s human gate.
         assert!(!ApprovalRisk::Safe.requires_approval());
@@ -763,7 +763,7 @@ mod tests {
         assert_eq!(g.resolve(&huge, ApprovalDecision::Approve), Err("unknown approval"));
     }
 
-    // ---- pending-approval cap (koe-rxh: modal-flood + starvation guard) -------
+    // ---- pending-approval cap (rhanis-rxh: modal-flood + starvation guard) -------
 
     #[test]
     fn register_refuses_new_requests_at_pending_cap() {

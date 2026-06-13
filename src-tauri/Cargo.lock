@@ -2630,37 +2630,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "koe"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "cpal",
- "dirs-next",
- "futures-util",
- "getrandom 0.2.17",
- "image",
- "iota_stronghold",
- "keyring",
- "libc",
- "reqwest 0.12.28",
- "rodio",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-stronghold",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
- "url",
- "xcap",
- "zeroize",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4149,6 +4118,37 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "rhanis"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "cpal",
+ "dirs-next",
+ "futures-util",
+ "getrandom 0.2.17",
+ "image",
+ "iota_stronghold",
+ "keyring",
+ "libc",
+ "reqwest 0.12.28",
+ "rodio",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-stronghold",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+ "xcap",
+ "zeroize",
 ]
 
 [[package]]

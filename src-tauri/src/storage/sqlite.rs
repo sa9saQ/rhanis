@@ -1,4 +1,4 @@
-//! SQLite-backed recorder (koe-nnk default).
+//! SQLite-backed recorder (rhanis-nnk default).
 //!
 //! Uses `rusqlite` with the `bundled` feature so SQLite is compiled in — no
 //! system library dependency, which keeps Windows builds reproducible. The
@@ -54,11 +54,11 @@ impl SqliteAdapter {
     }
 
     fn init(conn: Connection) -> Result<Self, RecorderError> {
-        // WAL lets a future read-only connection (koe-e3m diagnostics) avoid
+        // WAL lets a future read-only connection (rhanis-e3m diagnostics) avoid
         // SQLITE_BUSY against the writer. Best-effort: an in-memory DB reports
         // "memory" and ignores WAL, which must not fail open().
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        // Busy timeout so a concurrent writer — e.g. a SECOND koe process on the
+        // Busy timeout so a concurrent writer — e.g. a SECOND Rhanis process on the
         // same DB file — waits briefly for the write lock the `add_month_cost`
         // `BEGIN IMMEDIATE` transaction takes, instead of failing instantly. The
         // cost writes run on a blocking thread, so a short wait never stalls the
@@ -178,7 +178,7 @@ impl RecorderAdapter for SqliteAdapter {
         delta_nanodollars: u64,
     ) -> Result<u64, RecorderError> {
         let mut conn = self.lock()?;
-        // Additive ledger (koe-ixt): the monthly cost is the SUM of every session's
+        // Additive ledger (rhanis-ixt): the monthly cost is the SUM of every session's
         // per-`response.done` charge, so we ADD this delta to the stored total
         // rather than overwriting it. This sums two sessions' spend that overlap
         // during a stop->start handover (an older read loop draining late usage)
@@ -189,7 +189,7 @@ impl RecorderAdapter for SqliteAdapter {
         //
         // The read-modify-write runs inside a `BEGIN IMMEDIATE` transaction so it is
         // atomic ACROSS PROCESSES, not just within this adapter's connection Mutex:
-        // a second koe instance on the same DB file has its OWN connection (and
+        // a second Rhanis instance on the same DB file has its OWN connection (and
         // Mutex), so without a DB-level write lock the two `SELECT current` →
         // `UPDATE new_total` pairs could lost-update (one process's delta dropped →
         // undercount → fail-open on the cap). `IMMEDIATE` acquires the write lock up
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn persists_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe.db");
+        let path = dir.path().join("rhanis.db");
         {
             let a = SqliteAdapter::open(&path).expect("open 1");
             a.save_note("durable").unwrap();
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn add_month_cost_never_decreases_and_is_order_independent() {
-        // koe-ixt mechanism 5 (undercount / rollback). An additive ledger only ever
+        // rhanis-ixt mechanism 5 (undercount / rollback). An additive ledger only ever
         // grows within a month, so a LATE / out-of-order write (e.g. a stop->start
         // handover where an older session's late `response.done` add lands after a
         // newer session already added) can never roll the total backwards: it just
@@ -471,7 +471,7 @@ mod tests {
         // File-backed: the accumulated total (here a saturated u64::MAX) must
         // survive a restart exactly (persistence + the u64<->i64 bit round-trip).
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe.db");
+        let path = dir.path().join("rhanis.db");
         {
             let a = SqliteAdapter::open(&path).expect("open 1");
             a.add_month_cost(202605, u64::MAX).unwrap();
@@ -522,8 +522,8 @@ mod tests {
 
     #[test]
     fn add_month_cost_no_lost_update_across_adapters() {
-        // koe-ixt (Codex R-C): the additive read-modify-write must be atomic ACROSS
-        // PROCESSES, not just within one adapter's connection Mutex. Two koe
+        // rhanis-ixt (Codex R-C): the additive read-modify-write must be atomic ACROSS
+        // PROCESSES, not just within one adapter's connection Mutex. Two Rhanis
         // instances on the same DB file have SEPARATE connections, so without a
         // DB-level write lock their `SELECT current` -> `UPDATE new_total` pairs
         // could lost-update (one process's delta dropped -> undercount -> fail-open
@@ -531,7 +531,7 @@ mod tests {
         // concurrently: the `BEGIN IMMEDIATE` transaction + busy_timeout serialize
         // the writers, so the persisted total equals the SUM of every successful add.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe.db");
+        let path = dir.path().join("rhanis.db");
         let a = Arc::new(SqliteAdapter::open(&path).expect("open A"));
         let b = Arc::new(SqliteAdapter::open(&path).expect("open B"));
 

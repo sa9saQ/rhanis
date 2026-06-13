@@ -27,28 +27,33 @@ use zeroize::Zeroizing;
 const SNAPSHOT_KEY_LEN: usize = 32;
 
 /// Client path inside the Stronghold snapshot. Stable across versions so the
-/// snapshot keeps resolving after upgrades.
-const CLIENT_PATH: &[u8] = b"koe-secrets";
+/// snapshot keeps resolving after upgrades — set to `rhanis-secrets` at the
+/// koe→Rhanis pre-distribution rename and stable henceforth. koe was never
+/// shipped, and the bundle-identifier change to `com.zsaku.rhanis` already moves
+/// `app_local_data_dir` to a fresh directory (Tauri namespaces app data by the
+/// identifier), so there is no prior-user snapshot to preserve — only the dev's
+/// local test data, re-entered once. See the migration plan.
+const CLIENT_PATH: &[u8] = b"rhanis-secrets";
 
 /// Logical name of the OpenAI key record inside the store.
 pub const OPENAI_KEY_NAME: &str = "openai_api_key";
 
-// Sibling provider key records (koe-31u multi-provider foundation). OpenAI is
+// Sibling provider key records (rhanis-31u multi-provider foundation). OpenAI is
 // intentionally left BARE ("openai_api_key") so the existing stored key keeps
 // resolving — `session_manager` reads `get_api_key(OPENAI_KEY_NAME)` and a rename
 // would orphan it. New providers are namespaced with a `voice.` / `tool.` prefix
 // so a typo can never collide with the legacy bare name and the role of each
 // record is visible at a glance. All records share the one `CLIENT_PATH` /
 // snapshot / keychain key; they differ only by this byte-key. These are consumed
-// later (koe-zv3 reads the voice key, koe-eal reads the 手足 tool keys); for now
+// later (rhanis-zv3 reads the voice key, rhanis-eal reads the 手足 tool keys); for now
 // they exist so the namespacing primitive ([`provider_key_name`]) is complete.
-/// Voice provider = Google (Gemini Live). Consumed later by koe-zv3.
+/// Voice provider = Google (Gemini Live). Consumed later by rhanis-zv3.
 pub const GOOGLE_KEY_NAME: &str = "voice.google_api_key";
-/// 手足 tool key: XAI (Grok). Consumed later by koe-eal.
+/// 手足 tool key: XAI (Grok). Consumed later by rhanis-eal.
 pub const XAI_KEY_NAME: &str = "tool.xai_api_key";
-/// 手足 tool key: X (Twitter) API. Consumed later by koe-eal.
+/// 手足 tool key: X (Twitter) API. Consumed later by rhanis-eal.
 pub const X_API_KEY_NAME: &str = "tool.x_api_key";
-/// 手足 tool key: search provider. Consumed later by koe-8fw / koe-eal.
+/// 手足 tool key: search provider. Consumed later by rhanis-8fw / rhanis-eal.
 pub const SEARCH_KEY_NAME: &str = "tool.search_api_key";
 
 // ---------------------------------------------------------------------------
@@ -94,7 +99,7 @@ impl fmt::Debug for SecretString {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SecretError {
     /// No secret stored under the requested name. Returned by the internal
-    /// `get_api_key`; session_manager (koe-e3m) matches on it. `#[allow(dead_code)]`
+    /// `get_api_key`; session_manager (rhanis-e3m) matches on it. `#[allow(dead_code)]`
     /// until that consumer lands (part of the API contract, not skeleton).
     #[allow(dead_code)]
     NotFound,
@@ -127,7 +132,7 @@ impl std::error::Error for SecretError {}
 pub trait SecretStore: Send + Sync {
     fn save_api_key(&self, name: &str, key: SecretString) -> Result<(), SecretError>;
     /// Internal-only: must never be wired to a Tauri command. Consumed by the
-    /// session_manager (koe-e3m) to build the WebSocket `Authorization` header;
+    /// session_manager (rhanis-e3m) to build the WebSocket `Authorization` header;
     /// `#[allow(dead_code)]` until that PR lands (interface, not skeleton).
     #[allow(dead_code)]
     fn get_api_key(&self, name: &str) -> Result<SecretString, SecretError>;
@@ -457,7 +462,7 @@ pub async fn delete_openai_api_key(
 // `lib_rs_does_not_expose_get_command` locks this in.
 
 // ---------------------------------------------------------------------------
-// Multi-provider key commands (koe-31u). Same Day-0 invariants as the OpenAI
+// Multi-provider key commands (rhanis-31u). Same Day-0 invariants as the OpenAI
 // trio above — write + boolean presence only, no get-* anywhere.
 // ---------------------------------------------------------------------------
 
@@ -467,7 +472,7 @@ pub async fn delete_openai_api_key(
 /// the IPC boundary is attacker/model-influenced, so it is resolved through this
 /// CLOSED allowlist *before* any store operation: an unknown id returns a fixed
 /// error and never becomes an arbitrary record key, so the WebView cannot read,
-/// write, or delete a namespace that isn't enumerated here. koe-zv3 / koe-eal
+/// write, or delete a namespace that isn't enumerated here. rhanis-zv3 / rhanis-eal
 /// extend this by ADDING arms (and the matching `*_KEY_NAME` const), never by
 /// accepting a free-form name. `"openai"` maps to the legacy bare record so the
 /// existing key path is unchanged.
@@ -576,7 +581,7 @@ mod tests {
         password: Box<dyn SnapshotPassword>,
     ) -> (StrongholdSecretStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe-secrets.stronghold");
+        let path = dir.path().join("rhanis-secrets.stronghold");
         (StrongholdSecretStore::new(path, password), dir)
     }
 
@@ -675,7 +680,7 @@ mod tests {
     #[test]
     fn persists_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe-secrets.stronghold");
+        let path = dir.path().join("rhanis-secrets.stronghold");
         {
             let store = StrongholdSecretStore::new(path.clone(), Box::new(FixedPassword::new()));
             store
@@ -705,7 +710,7 @@ mod tests {
         // Snapshot exists but the keychain key is gone: must NOT silently report
         // "empty" or regenerate a key (which would orphan the snapshot).
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe-secrets.stronghold");
+        let path = dir.path().join("rhanis-secrets.stronghold");
         StrongholdSecretStore::new(path.clone(), Box::new(FixedPassword::new()))
             .save_api_key("openai", SecretString::new("sk-orphan".to_string()))
             .expect("seed snapshot");
@@ -765,7 +770,7 @@ mod tests {
         );
     }
 
-    // ---- Multi-provider key namespacing (koe-31u) --------------------------
+    // ---- Multi-provider key namespacing (rhanis-31u) --------------------------
 
     #[test]
     fn provider_key_name_maps_allowlisted_ids() {
@@ -853,7 +858,7 @@ mod tests {
         // A locked vault must surface as Err, not a silent `false` — same
         // fail-closed contract the OpenAI path has.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe-secrets.stronghold");
+        let path = dir.path().join("rhanis-secrets.stronghold");
         StrongholdSecretStore::new(path.clone(), Box::new(FixedPassword::new()))
             .save_api_key(provider_key_name("xai").unwrap(), SecretString::new("k".into()))
             .expect("seed snapshot");

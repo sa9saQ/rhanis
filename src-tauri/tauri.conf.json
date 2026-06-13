@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "koe",
+  "productName": "Rhanis Agent",
+  "mainBinaryName": "rhanis",
   "version": "0.1.0",
-  "identifier": "com.zsaku.koe",
+  "identifier": "com.zsaku.rhanis",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "koe",
+        "title": "Rhanis Agent",
         "width": 800,
         "height": 600
       }

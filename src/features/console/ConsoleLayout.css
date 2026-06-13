@@ -1,9 +1,9 @@
-/* Glass-box console shell (koe-ios.1) — sidebar + main column.
+/* Glass-box console shell (rhanis-ios.1) — sidebar + main column.
  * Anti-AI-smell: radii, gaps and paddings deliberately vary by element; no
  * uniform rhythm. All colors come from the App.css tokens so the OS-following
  * light/dark themes flow through automatically. */
 
-.koe-shell {
+.rhanis-shell {
   display: flex;
   min-height: 100vh;
   background: var(--desk-wash);
@@ -11,7 +11,7 @@
 
 /* ── Sidebar ── */
 
-.koe-sidebar {
+.rhanis-sidebar {
   width: 244px;
   flex: none;
   display: flex;
@@ -24,7 +24,7 @@
   overflow-y: auto; /* short windows: the foot (cost + 設定) must stay reachable */
 }
 
-.koe-side-brand {
+.rhanis-side-brand {
   padding-left: 8px;
   font-size: 15px;
   font-weight: 700;
@@ -32,13 +32,13 @@
   color: var(--text);
 }
 
-.koe-side-nav {
+.rhanis-side-nav {
   flex: 1;
   min-height: 0;
   overflow-y: auto; /* short windows: the planned list scrolls, the foot stays */
 }
 
-.koe-side-caption {
+.rhanis-side-caption {
   margin: 0 0 6px;
   padding-left: 8px;
   font-size: 11px;
@@ -47,7 +47,7 @@
   color: var(--muted);
 }
 
-.koe-side-planned {
+.rhanis-side-planned {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -56,7 +56,7 @@
   gap: 2px;
 }
 
-.koe-side-item {
+.rhanis-side-item {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -66,13 +66,13 @@
   color: var(--muted);
 }
 
-.koe-side-glyph {
+.rhanis-side-glyph {
   flex: none;
   width: 1.25em;
   text-align: center;
 }
 
-.koe-side-foot {
+.rhanis-side-foot {
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -80,10 +80,10 @@
   padding-top: 14px;
 }
 
-/* Sidebar button variant on the shared .koe-btn base (App.css) — defined HERE,
+/* Sidebar button variant on the shared .rhanis-btn base (App.css) — defined HERE,
  * not in settings.css, so the sidebar never depends on another feature's CSS
- * being loaded (the koe-iyr class of bug). */
-.koe-btn-side {
+ * being loaded (the rhanis-iyr class of bug). */
+.rhanis-btn-side {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -95,13 +95,13 @@
   text-align: left;
   font-weight: 600;
 }
-.koe-btn-side:hover:not(:disabled) {
+.rhanis-btn-side:hover:not(:disabled) {
   background: var(--panel-2);
 }
 
 /* ── Main column ── */
 
-.koe-main {
+.rhanis-main {
   flex: 1;
   min-width: 0;
   display: flex;
@@ -112,14 +112,14 @@
   overflow-y: auto;
 }
 
-.koe-main-bar {
+.rhanis-main-bar {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
 /* Top-bar icon button (sidebar toggle). */
-.koe-btn-bar {
+.rhanis-btn-bar {
   padding: 6px 12px;
   border-radius: 7px;
   background: transparent;
@@ -127,18 +127,18 @@
   font-size: 16px;
   line-height: 1;
 }
-.koe-btn-bar:hover:not(:disabled) {
+.rhanis-btn-bar:hover:not(:disabled) {
   background: var(--panel-2);
   color: var(--text);
 }
 
-.koe-main-settings {
+.rhanis-main-settings {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 12px;
 }
 
-.koe-conversation {
+.rhanis-conversation {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -147,7 +147,7 @@
   text-align: center;
 }
 
-.koe-greeting {
+.rhanis-greeting {
   margin: 0;
   font-size: 24px;
   font-weight: 650;
@@ -155,26 +155,26 @@
   color: var(--text);
 }
 
-.koe-greeting-sub {
+.rhanis-greeting-sub {
   margin: 0;
   font-size: 14px;
   color: var(--muted);
 }
 
-.koe-activity-zone {
+.rhanis-activity-zone {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
 }
 /* Passed to <ActivityLog className=…> — no descendant selector into another
- * feature's internal class names (the koe-iyr class of coupling). */
-.koe-activity-fill {
+ * feature's internal class names (the rhanis-iyr class of coupling). */
+.rhanis-activity-fill {
   flex: 1;
   min-height: 0;
 }
 
-.koe-voice-dock {
+.rhanis-voice-dock {
   display: flex;
   justify-content: center;
   padding: 4px 0 6px;

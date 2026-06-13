@@ -1,7 +1,7 @@
-//! Shared global activity-event sequence (koe-1vi).
+//! Shared global activity-event sequence (rhanis-1vi).
 //!
 //! A single process-wide monotonic counter so that `ToolEvent.sequence`
-//! (emitted by the tool_dispatcher, koe-2gy) and `ApprovalRequest.sequence`
+//! (emitted by the tool_dispatcher, rhanis-2gy) and `ApprovalRequest.sequence`
 //! (emitted by the approval gate, this PR) share ONE ordering space — exactly
 //! as `src/features/activity/types.ts` specifies ("Globally monotonic counter
 //! ... shared space with ToolEvent.sequence").
@@ -39,13 +39,13 @@ impl SequenceCounter {
     }
 }
 
-/// Tauri managed-state wrapper. The approval gate (koe-1vi) and the
-/// tool_dispatcher (koe-2gy) hold clones of the SAME `Arc<SequenceCounter>`;
-/// koe-2gy obtains it through `tauri::State<'_, ManagedSequenceCounter>` rather
+/// Tauri managed-state wrapper. The approval gate (rhanis-1vi) and the
+/// tool_dispatcher (rhanis-2gy) hold clones of the SAME `Arc<SequenceCounter>`;
+/// rhanis-2gy obtains it through `tauri::State<'_, ManagedSequenceCounter>` rather
 /// than importing the gate.
 ///
 /// `lib.rs` registers this now so the counter is shared from day one, but its
-/// only *reader* is the not-yet-merged tool_dispatcher (koe-2gy) — hence
+/// only *reader* is the not-yet-merged tool_dispatcher (rhanis-2gy) — hence
 /// `#[allow(dead_code)]` on the field (interface-first, like
 /// `secret_store::SecretStore::get_api_key`), not skeleton.
 pub struct ManagedSequenceCounter(#[allow(dead_code)] pub Arc<SequenceCounter>);

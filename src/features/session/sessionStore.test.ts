@@ -139,7 +139,7 @@ describe("startSession", () => {
     expect(mockStartSession).toHaveBeenCalledTimes(1);
   });
 
-  it("is a no-op when reconnecting (koe-byf: already an active session)", async () => {
+  it("is a no-op when reconnecting (rhanis-byf: already an active session)", async () => {
     act(() => {
       useSessionStore.getState().setFromEvent(statusEvent("reconnecting", 1));
     });
@@ -190,7 +190,7 @@ describe("stopSession", () => {
     expect(mockStopSession).not.toHaveBeenCalled();
   });
 
-  it("calls ipcStopSession when reconnecting (koe-byf: reconnecting is stoppable)", async () => {
+  it("calls ipcStopSession when reconnecting (rhanis-byf: reconnecting is stoppable)", async () => {
     act(() => {
       useSessionStore.getState().setFromEvent(statusEvent("reconnecting", 1));
     });
@@ -200,10 +200,10 @@ describe("stopSession", () => {
     expect(mockStopSession).toHaveBeenCalledTimes(1);
   });
 
-  it("calls ipcStopSession in loading state (koe-5fs: escape hatch for a hung 準備中)", async () => {
+  it("calls ipcStopSession in loading state (rhanis-5fs: escape hatch for a hung 準備中)", async () => {
     // Drive the store to 'loading' via a backend event (the case where the IPC
     // response arrives before the first event). The old guard made stop a no-op
-    // here; koe-5fs makes "loading" stoppable — run_session_supervised races
+    // here; rhanis-5fs makes "loading" stoppable — run_session_supervised races
     // connect() against the master stop (session_manager.rs ~1095), so a stop
     // mid-connect cleanly abandons the attempt instead of orphaning it, giving
     // the user an escape from a hung connect (symptom 4).
@@ -269,7 +269,7 @@ describe("setFromEvent", () => {
     expect(useSessionStore.getState().status).toBe("connected");
   });
 
-  it("transitions connected → reconnecting → connected (koe-byf)", () => {
+  it("transitions connected → reconnecting → connected (rhanis-byf)", () => {
     act(() => useSessionStore.getState().setFromEvent(statusEvent("connected", 1)));
     expect(useSessionStore.getState().status).toBe("connected");
 

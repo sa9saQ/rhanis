@@ -1,6 +1,6 @@
 /* Operator console panel. Radii vary by element on purpose (anti-AI-smell). */
 
-.koe-console {
+.rhanis-console {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -11,56 +11,56 @@
   min-height: 0;
 }
 
-.koe-console-head {
+.rhanis-console-head {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
-.koe-status-dot {
+.rhanis-status-dot {
   width: 11px;
   height: 11px;
   border-radius: 999px;
   background: var(--tone-idle);
   box-shadow: 0 0 0 4px color-mix(in srgb, currentcolor 18%, transparent);
 }
-.koe-tone-idle {
+.rhanis-tone-idle {
   color: var(--tone-idle);
   background: var(--tone-idle);
 }
-.koe-tone-connecting {
+.rhanis-tone-connecting {
   color: var(--tone-connecting);
   background: var(--tone-connecting);
-  animation: koe-pulse 1.3s var(--ease-spring) infinite;
+  animation: rhanis-pulse 1.3s var(--ease-spring) infinite;
 }
-/* koe-byf: reconnecting reuses the connecting hue (it IS re-connecting) with a
+/* rhanis-byf: reconnecting reuses the connecting hue (it IS re-connecting) with a
    faster pulse so it reads as distinct, active recovery rather than a steady link. */
-.koe-tone-reconnecting {
+.rhanis-tone-reconnecting {
   color: var(--tone-connecting);
   background: var(--tone-connecting);
-  animation: koe-pulse 0.9s var(--ease-spring) infinite;
+  animation: rhanis-pulse 0.9s var(--ease-spring) infinite;
 }
-.koe-tone-conversing {
+.rhanis-tone-conversing {
   color: var(--tone-conversing);
   background: var(--tone-conversing);
 }
-.koe-tone-working {
+.rhanis-tone-working {
   color: var(--tone-working);
   background: var(--tone-working);
-  animation: koe-pulse 1s var(--ease-spring) infinite;
+  animation: rhanis-pulse 1s var(--ease-spring) infinite;
 }
-.koe-tone-error {
+.rhanis-tone-error {
   color: var(--tone-error);
   background: var(--tone-error);
 }
 
-.koe-status-label {
+.rhanis-status-label {
   font-size: 15px;
   font-weight: 600;
   letter-spacing: 0.04em;
 }
 
-.koe-approval-badge {
+.rhanis-approval-badge {
   margin-left: auto;
   font-size: 12px;
   font-weight: 600;
@@ -70,11 +70,11 @@
   border-radius: 999px;
 }
 
-/* The COST styles (koe-9xi) moved to CostHeader.css — the component renders in
-   the console sidebar (koe-ios.1), so its styles ship with it instead of
-   depending on this file being loaded (the koe-iyr class of bug). */
+/* The COST styles (rhanis-9xi) moved to CostHeader.css — the component renders in
+   the console sidebar (rhanis-ios.1), so its styles ship with it instead of
+   depending on this file being loaded (the rhanis-iyr class of bug). */
 
-.koe-error-line {
+.rhanis-error-line {
   margin: 0;
   font-size: 13px;
   color: var(--tone-error);
@@ -84,8 +84,8 @@
   border-radius: 6px;
 }
 
-/* --- PROVIDER ERRORS (koe-nal): non-benign server error strip. ------------- */
-.koe-provider-errors {
+/* --- PROVIDER ERRORS (rhanis-nal): non-benign server error strip. ------------- */
+.rhanis-provider-errors {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -93,7 +93,7 @@
   flex-direction: column;
   gap: 5px;
 }
-.koe-provider-error-row {
+.rhanis-provider-error-row {
   display: flex;
   align-items: baseline;
   gap: 8px;
@@ -104,17 +104,17 @@
   padding: 7px 11px;
   /* Distinct radius from the session error line on purpose (anti-AI-smell). */
   border-radius: 5px;
-  animation: koe-rise var(--dur-enter) var(--ease-decel);
+  animation: rhanis-rise var(--dur-enter) var(--ease-decel);
 }
-.koe-provider-error-glyph {
+.rhanis-provider-error-glyph {
   flex: none;
 }
-.koe-provider-error-text {
+.rhanis-provider-error-text {
   overflow-wrap: anywhere;
 }
 
-/* --- THINKING (glass-box M1, koe-sua.1): the pre-tool disclosure window. --- */
-.koe-thinking {
+/* --- THINKING (glass-box M1, rhanis-sua.1): the pre-tool disclosure window. --- */
+.rhanis-thinking {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -122,7 +122,7 @@
   flex-direction: column;
   gap: 6px;
 }
-.koe-thinking-row {
+.rhanis-thinking-row {
   display: flex;
   align-items: baseline;
   gap: 8px;
@@ -132,25 +132,25 @@
   border-left: 3px solid color-mix(in srgb, var(--accent) 55%, transparent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   font-size: 13px;
-  animation: koe-rise var(--dur-enter) var(--ease-decel);
+  animation: rhanis-rise var(--dur-enter) var(--ease-decel);
 }
-.koe-thinking-glyph {
+.rhanis-thinking-glyph {
   flex: none;
 }
-.koe-thinking-plan {
+.rhanis-thinking-plan {
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.koe-thinking-tool {
+.rhanis-thinking-tool {
   flex: none;
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 600;
   color: var(--accent);
 }
-.koe-thinking-source {
+.rhanis-thinking-source {
   flex: none;
   font-size: 11px;
   color: var(--muted);
@@ -160,16 +160,16 @@
 }
 
 /* --- LIVE --- */
-.koe-live {
+.rhanis-live {
   min-height: 44px;
 }
-.koe-live-empty {
+.rhanis-live-empty {
   margin: 0;
   color: var(--muted);
   font-size: 14px;
   font-style: italic;
 }
-.koe-live-list {
+.rhanis-live-list {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -177,7 +177,7 @@
   flex-direction: column;
   gap: 8px;
 }
-.koe-live-action {
+.rhanis-live-action {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -185,36 +185,36 @@
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px 12px;
-  animation: koe-rise var(--dur-enter) var(--ease-decel);
+  animation: rhanis-rise var(--dur-enter) var(--ease-decel);
 }
-.koe-spinner {
+.rhanis-spinner {
   width: 14px;
   height: 14px;
   border-radius: 999px;
   border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
   border-top-color: var(--accent);
-  animation: koe-spin 0.7s linear infinite;
+  animation: rhanis-spin 0.7s linear infinite;
   flex: none;
 }
-.koe-live-tool {
+.rhanis-live-tool {
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--accent);
   font-weight: 600;
 }
-.koe-live-summary {
+.rhanis-live-summary {
   flex: 1;
   font-size: 14px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.koe-live-progress {
+.rhanis-live-progress {
   font-variant-numeric: tabular-nums;
   font-size: 12px;
   color: var(--muted);
 }
-.koe-live-elapsed {
+.rhanis-live-elapsed {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--muted);
@@ -222,7 +222,7 @@
 }
 
 /* --- LOG --- */
-.koe-log {
+.rhanis-log {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -230,18 +230,18 @@
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
-  /* The console is the hero panel of the koe-ios.1 layout and grows to fill
+  /* The console is the hero panel of the rhanis-ios.1 layout and grows to fill
    * the main column, so the log fills the panel instead of capping at a
    * viewport fraction (the old single-column 46vh cap). */
   flex: 1;
   min-height: 0;
 }
-.koe-log-empty {
+.rhanis-log-empty {
   color: var(--muted);
   font-size: 13px;
   padding: 8px 0;
 }
-.koe-log-row {
+.rhanis-log-row {
   display: flex;
   align-items: baseline;
   gap: 8px;
@@ -249,37 +249,37 @@
   border-radius: 6px;
   font-size: 13px;
 }
-.koe-log-row:nth-child(odd) {
+.rhanis-log-row:nth-child(odd) {
   background: color-mix(in srgb, var(--panel-2) 50%, transparent);
 }
-.koe-log-glyph {
+.rhanis-log-glyph {
   font-family: var(--font-mono);
   flex: none;
   width: 1.2em;
   text-align: center;
 }
-.koe-phase-done .koe-log-glyph {
+.rhanis-phase-done .rhanis-log-glyph {
   color: var(--tone-working);
 }
-.koe-phase-error .koe-log-glyph {
+.rhanis-phase-error .rhanis-log-glyph {
   color: var(--tone-error);
 }
-.koe-phase-start .koe-log-glyph,
-.koe-phase-progress .koe-log-glyph {
+.rhanis-phase-start .rhanis-log-glyph,
+.rhanis-phase-progress .rhanis-log-glyph {
   color: var(--accent);
 }
-.koe-log-tool {
+.rhanis-log-tool {
   font-family: var(--font-mono);
   color: var(--muted);
   flex: none;
 }
-.koe-log-summary {
+.rhanis-log-summary {
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.koe-log-detail {
+.rhanis-log-detail {
   color: var(--muted);
   font-size: 12px;
   flex: none;
@@ -289,12 +289,12 @@
   max-width: 14em;
 }
 
-@keyframes koe-spin {
+@keyframes rhanis-spin {
   to {
     transform: rotate(360deg);
   }
 }
-@keyframes koe-pulse {
+@keyframes rhanis-pulse {
   0%,
   100% {
     opacity: 1;
@@ -303,7 +303,7 @@
     opacity: 0.45;
   }
 }
-@keyframes koe-rise {
+@keyframes rhanis-rise {
   from {
     opacity: 0;
     transform: translateY(4px);
@@ -315,13 +315,13 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .koe-spinner,
-  .koe-tone-connecting,
-  .koe-tone-reconnecting,
-  .koe-tone-working,
-  .koe-live-action,
-  .koe-thinking-row,
-  .koe-provider-error-row {
+  .rhanis-spinner,
+  .rhanis-tone-connecting,
+  .rhanis-tone-reconnecting,
+  .rhanis-tone-working,
+  .rhanis-live-action,
+  .rhanis-thinking-row,
+  .rhanis-provider-error-row {
     animation: none;
   }
 }

@@ -1,4 +1,4 @@
-// Tests for VoiceProviderSelector (koe-31u). Mirrors AdapterSelector.test.tsx.
+// Tests for VoiceProviderSelector (rhanis-31u). Mirrors AdapterSelector.test.tsx.
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 

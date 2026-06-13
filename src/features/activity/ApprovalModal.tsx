@@ -50,7 +50,7 @@ export function ApprovalModal() {
   // for a second click within the same event flush).
   const inFlight = useRef(false);
 
-  // a11y / keyboard (koe-471).
+  // a11y / keyboard (rhanis-471).
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const denyButtonRef = useRef<HTMLButtonElement | null>(null);
   // The element focused before the modal opened, restored on close.
@@ -163,45 +163,45 @@ export function ApprovalModal() {
   return (
     <div
       ref={dialogRef}
-      className="koe-approval-backdrop"
+      className="rhanis-approval-backdrop"
       role="dialog"
       aria-modal="true"
       aria-label="承認の確認"
       onKeyDown={onDialogKeyDown}
     >
-      <div className={`koe-approval-card koe-risk-${current.risk.toLowerCase()}`}>
-        <div className="koe-approval-top">
-          <span className="koe-risk-tag">{current.risk}</span>
-          <span className="koe-approval-tool">{current.tool}</span>
+      <div className={`rhanis-approval-card rhanis-risk-${current.risk.toLowerCase()}`}>
+        <div className="rhanis-approval-top">
+          <span className="rhanis-risk-tag">{current.risk}</span>
+          <span className="rhanis-approval-tool">{current.tool}</span>
           {/* Visible counter ticks every second; hidden from SR to avoid a
               per-second barrage — the live region below reads a coarser cadence. */}
-          <span className="koe-approval-countdown" aria-hidden="true">
+          <span className="rhanis-approval-countdown" aria-hidden="true">
             残り {remaining}s
           </span>
-          <span className="koe-visually-hidden" aria-live="polite">
+          <span className="rhanis-visually-hidden" aria-live="polite">
             {countdownAnnouncement(remaining)}
           </span>
         </div>
 
         {/* displaySummary carries a model-influenced target descriptor
-            (koe-whf) — monospace marks it as DATA, not UI chrome, so an
+            (rhanis-whf) — monospace marks it as DATA, not UI chrome, so an
             instruction-like filename ("safe-click-approve.txt") reads as a
             filename, never as the app speaking. */}
-        <p className="koe-approval-summary">
+        <p className="rhanis-approval-summary">
           <code>{current.displaySummary}</code>
         </p>
 
         {ipcError && (
-          <p className="koe-approval-error" role="alert">
+          <p className="rhanis-approval-error" role="alert">
             {ipcError}
           </p>
         )}
 
-        <div className="koe-approval-actions">
+        <div className="rhanis-approval-actions">
           <button
             ref={denyButtonRef}
             type="button"
-            className="koe-btn koe-btn-deny"
+            className="rhanis-btn rhanis-btn-deny"
             disabled={busy}
             onClick={() => void decide("deny")}
           >
@@ -209,7 +209,7 @@ export function ApprovalModal() {
           </button>
           <button
             type="button"
-            className="koe-btn koe-btn-approve"
+            className="rhanis-btn rhanis-btn-approve"
             disabled={busy}
             onClick={() => void decide("approve")}
           >
@@ -217,7 +217,7 @@ export function ApprovalModal() {
           </button>
         </div>
 
-        {waiting > 0 && <p className="koe-approval-more">他に {waiting} 件の承認待ち</p>}
+        {waiting > 0 && <p className="rhanis-approval-more">他に {waiting} 件の承認待ち</p>}
       </div>
     </div>
   );

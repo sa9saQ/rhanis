@@ -9,7 +9,7 @@
 //    announcement of failures.
 //  - All interactive states are keyboard-reachable (button element, no div hack).
 //
-// Visual style follows the existing koe design:
+// Visual style follows the existing Rhanis design:
 //  - No Inter, no purple/blue gradient (anti-AI-smell).
 //  - Tokens from App.css (:root) — --accent, --tone-error, --ease-spring, etc.
 //  - Button radii differ from the panel (10px vs panel's 14px) on purpose.
@@ -42,7 +42,7 @@ const STATUS_META: Record<
     ariaLabel: "セッションを停止",
     tone: "connected",
   },
-  // koe-byf: a live, STOPPABLE state — the button shows a spinner but stays enabled
+  // rhanis-byf: a live, STOPPABLE state — the button shows a spinner but stays enabled
   // and acts as "stop" so the user is never trapped during a long reconnect.
   reconnecting: {
     label: "停止",
@@ -74,7 +74,7 @@ export function VoiceButton() {
           ariaLabel: "セッションを停止（リスナーエラー）",
         }
       : metaBase;
-  // `loading` DISABLES the button (first connect in flight). `reconnecting` (koe-byf)
+  // `loading` DISABLES the button (first connect in flight). `reconnecting` (rhanis-byf)
   // shows the same spinner / busy state but stays ENABLED so the user can stop a
   // recovering session — so split "show a spinner" (busy) from "is disabled".
   const isLoading = status === "loading";
@@ -100,10 +100,10 @@ export function VoiceButton() {
   }
 
   return (
-    <div className="koe-voice-button-wrap">
+    <div className="rhanis-voice-button-wrap">
       <button
         type="button"
-        className={`koe-voice-btn koe-voice-tone-${meta.tone}`}
+        className={`rhanis-voice-btn rhanis-voice-tone-${meta.tone}`}
         aria-label={meta.ariaLabel}
         aria-pressed={status === "connected" || status === "reconnecting"}
         aria-busy={busy ? "true" : undefined}
@@ -111,13 +111,13 @@ export function VoiceButton() {
         onClick={() => void handleClick()}
       >
         {busy && (
-          <span className="koe-voice-spinner" aria-hidden />
+          <span className="rhanis-voice-spinner" aria-hidden />
         )}
-        <span className="koe-voice-btn-label">{meta.label}</span>
+        <span className="rhanis-voice-btn-label">{meta.label}</span>
       </button>
 
       {status === "error" && error && (
-        <p className="koe-voice-error" role="alert">
+        <p className="rhanis-voice-error" role="alert">
           {error}
         </p>
       )}

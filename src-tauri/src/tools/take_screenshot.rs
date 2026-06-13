@@ -1,4 +1,4 @@
-//! `take_screenshot` tool (koe-s7i).
+//! `take_screenshot` tool (rhanis-s7i).
 //!
 //! A SAFE tool: captures a screenshot of the primary monitor and saves the
 //! PNG-encoded image to an allowlisted path, then returns an opaque reference
@@ -24,7 +24,7 @@
 //!   encoding, and size-cap logic can be unit-tested in WSL (which has no
 //!   display) without triggering the real capture.
 //! - **The raw OS path with username is NEVER returned to the model.** Only the
-//!   filename (e.g. `koe-screenshot-a3f2c1.png`) is returned; the absolute path
+//!   filename (e.g. `rhanis-screenshot-a3f2c1.png`) is returned; the absolute path
 //!   is kept in Rust state only and never leaves the process.
 //!
 //! # Tool arguments
@@ -81,8 +81,8 @@ pub struct Screenshot {
 /// Builds the `take_screenshot` [`ToolFn`].
 ///
 /// `save_base` is the directory under which screenshots are written. In
-/// production `lib.rs` passes the user's Documents directory (koe-s7i seam;
-/// koe-351 may expose a user-configurable path). The directory must already
+/// production `lib.rs` passes the user's Documents directory (rhanis-s7i seam;
+/// rhanis-351 may expose a user-configurable path). The directory must already
 /// exist and must be allowlisted for writes.
 pub fn take_screenshot_tool(save_base: PathBuf) -> ToolFn {
     let base = Arc::new(save_base);
@@ -102,7 +102,7 @@ pub fn take_screenshot_tool(save_base: PathBuf) -> ToolFn {
 
 /// Synchronous inner implementation (runs on a blocking thread via spawn_blocking).
 fn take_screenshot_sync(save_base: &Path) -> Result<String, String> {
-    // Build the output path: <base>/koe-screenshot-<random_hex>.png
+    // Build the output path: <base>/rhanis-screenshot-<random_hex>.png
     // The filename uses CSPRNG-generated random bytes to prevent filename
     // guessing attacks (a predictable timestamp can be raced by an attacker
     // who pre-places a symlink at the expected name).
@@ -153,7 +153,7 @@ fn random_screenshot_filename() -> Result<String, String> {
     getrandom::getrandom(&mut buf)
         .map_err(|_| "could not generate random filename".to_string())?;
     let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!("koe-screenshot-{hex}.png"))
+    Ok(format!("rhanis-screenshot-{hex}.png"))
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +338,7 @@ pub fn take_screenshot_schema() -> ToolSchema {
 /// Falls back to an empty path (which validate_write_path will reject — fail-closed)
 /// if the OS cannot resolve the directory.
 ///
-/// koe-351 will replace callers with a user-configurable path from JsonSettingsStore.
+/// rhanis-351 will replace callers with a user-configurable path from JsonSettingsStore.
 pub fn default_screenshot_dir() -> PathBuf {
     dirs_next::document_dir().unwrap_or_default()
 }
@@ -441,7 +441,7 @@ mod tests {
         let outside_file = outside_dir.path().join("exfil.bin");
         // The "attacker" pre-places a symlink at the target filename inside the base
         // dir pointing to a file outside the base.
-        let target = base_dir.path().join("koe-screenshot-aabbccdd.png");
+        let target = base_dir.path().join("rhanis-screenshot-aabbccdd.png");
         symlink(&outside_file, &target).unwrap();
 
         let shot = tiny_screenshot();
@@ -467,7 +467,7 @@ mod tests {
         let mut names = std::collections::HashSet::new();
         for _ in 0..100 {
             let name = random_screenshot_filename().expect("getrandom must succeed");
-            assert!(name.starts_with("koe-screenshot-"), "filename must have correct prefix");
+            assert!(name.starts_with("rhanis-screenshot-"), "filename must have correct prefix");
             assert!(name.ends_with(".png"), "filename must have .png extension");
             assert!(names.insert(name.clone()), "duplicate filename generated: {name}");
         }
@@ -489,7 +489,7 @@ mod tests {
         //
         // We cannot call take_screenshot_sync directly (it needs a display for xcap),
         // so we verify the JSON shape by constructing the expected value directly.
-        let filename = "koe-screenshot-aabbccdd1122.png".to_string();
+        let filename = "rhanis-screenshot-aabbccdd1122.png".to_string();
         let shot = tiny_screenshot();
         let response = serde_json::json!({
             "saved": true,
@@ -540,7 +540,7 @@ mod tests {
                 assert!(v.get("filename").is_some(), "success response must have 'filename'");
                 assert!(v.get("path").is_none(), "success response must NOT have 'path'");
                 let filename = v["filename"].as_str().unwrap_or("");
-                assert!(filename.starts_with("koe-screenshot-"), "filename has expected prefix");
+                assert!(filename.starts_with("rhanis-screenshot-"), "filename has expected prefix");
                 assert!(filename.ends_with(".png"), "filename has .png extension");
                 // The file must actually be inside the temp dir.
                 let saved_file = dir.path().join(filename);
@@ -563,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_rejects_base_that_does_not_exist() {
-        let non_existent = PathBuf::from("/tmp/koe-nonexistent-dir-12345");
+        let non_existent = PathBuf::from("/tmp/rhanis-nonexistent-dir-12345");
         let tool = take_screenshot_tool(non_existent);
         let result = tool(serde_json::json!({})).await;
         assert!(result.is_err(), "non-existent base must return Err");

@@ -1,33 +1,33 @@
-/* Settings panel + shared form vocabulary (koe-31u; dark-themed in koe-iyr).
+/* Settings panel + shared form vocabulary (rhanis-31u; dark-themed in rhanis-iyr).
  * Provides the input / button-variant / budget / policy classes used by BOTH the
  * settings panel and the first-run onboarding wizard (which imports this file).
- * The shared `.koe-btn` base lives in App.css (always-loaded base layer); this
- * file adds only VARIANTS (.koe-btn-primary / .koe-btn-danger / .koe-btn-icon)
+ * The shared `.rhanis-btn` base lives in App.css (always-loaded base layer); this
+ * file adds only VARIANTS (.rhanis-btn-primary / .rhanis-btn-danger / .rhanis-btn-icon)
  * plus layout/input classes. */
 
 /* Sub-theme tokens, scoped to the component roots — never a global override — so
- * they cannot repaint the rest of the dark desk (the koe-iyr theme-clash fix).
+ * they cannot repaint the rest of the dark desk (the rhanis-iyr theme-clash fix).
  * Each token aliases an App.css palette value, so the panel and the onboarding
- * wizard follow the OS light/dark palette with the rest of the app (koe-ios.1).
+ * wizard follow the OS light/dark palette with the rest of the app (rhanis-ios.1).
  * Contrast (AA-checked per palette in App.css):
- *   --koe-text on --panel ≈ 13:1 (AAA, dark) / ≈ 11:1 (light)
- *   --koe-text-muted on --panel ≈ 8:1 (dark) / ≈ 6.3:1 (light)
- *   --koe-danger (as text) on --panel-2 ≈ 5.4:1 (dark) / ≈ 4.9:1 (light). */
-.koe-settings-panel,
-.koe-onboarding-wizard,
-.koe-onboarding-gate-loading,
-.koe-onboarding-gate-error {
-  --koe-text: var(--text);
-  --koe-text-muted: var(--muted);
-  --koe-border: var(--border);
-  --koe-border-focus: var(--accent); /* focus ring = app accent (matches VoiceButton) */
-  --koe-danger: var(--tone-error);
-  --koe-surface: var(--panel);
-  --koe-surface-alt: var(--panel-2);
+ *   --rhanis-text on --panel ≈ 13:1 (AAA, dark) / ≈ 11:1 (light)
+ *   --rhanis-text-muted on --panel ≈ 8:1 (dark) / ≈ 6.3:1 (light)
+ *   --rhanis-danger (as text) on --panel-2 ≈ 5.4:1 (dark) / ≈ 4.9:1 (light). */
+.rhanis-settings-panel,
+.rhanis-onboarding-wizard,
+.rhanis-onboarding-gate-loading,
+.rhanis-onboarding-gate-error {
+  --rhanis-text: var(--text);
+  --rhanis-text-muted: var(--muted);
+  --rhanis-border: var(--border);
+  --rhanis-border-focus: var(--accent); /* focus ring = app accent (matches VoiceButton) */
+  --rhanis-danger: var(--tone-error);
+  --rhanis-surface: var(--panel);
+  --rhanis-surface-alt: var(--panel-2);
   --ko-ease-standard: var(--ease-standard);
 }
 
-.koe-settings-panel {
+.rhanis-settings-panel {
   display: flex;
   flex-direction: column;
   /* Deliberately non-uniform section rhythm (anti-AI-smell): the header sits
@@ -35,49 +35,49 @@
   gap: 28px;
   max-width: 34rem;
   padding: 24px;
-  color: var(--koe-text);
+  color: var(--rhanis-text);
   font-family: "Plus Jakarta Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", system-ui,
     sans-serif;
 }
 
-.koe-settings-header {
+.rhanis-settings-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
 }
 
-.koe-settings-title {
+.rhanis-settings-title {
   margin: 0;
   font-size: 1.35rem;
   font-weight: 650;
   letter-spacing: -0.01em;
 }
 
-.koe-settings-section {
+.rhanis-settings-section {
   display: flex;
   flex-direction: column;
   gap: 12px;
   padding: 18px 18px 20px;
-  background: var(--koe-surface);
-  border: 1px solid var(--koe-border);
+  background: var(--rhanis-surface);
+  border: 1px solid var(--rhanis-border);
   border-radius: 14px; /* cards: 14px (distinct from inputs/buttons) */
 }
 
-.koe-settings-section > h3 {
+.rhanis-settings-section > h3 {
   margin: 0;
   font-size: 1.02rem;
   font-weight: 600;
 }
 
-.koe-settings-hint {
+.rhanis-settings-hint {
   margin: 0;
   font-size: 0.85rem;
   line-height: 1.55;
-  color: var(--koe-text-muted);
+  color: var(--rhanis-text-muted);
 }
 
-.koe-settings-error {
+.rhanis-settings-error {
   margin: 0;
   padding: 8px 12px;
   font-size: 0.85rem;
@@ -87,166 +87,166 @@
   border-radius: 6px;
 }
 
-.koe-label {
+.rhanis-label {
   font-size: 0.9rem;
   font-weight: 550;
 }
 
 /* Voice provider selector — label + select stacked with a small gap. */
-.koe-voice-provider-selector {
+.rhanis-voice-provider-selector {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.koe-input,
-.koe-select {
+.rhanis-input,
+.rhanis-select {
   width: 100%;
   box-sizing: border-box;
   /* 16px so iOS Safari does not auto-zoom focused inputs (quality.md). */
   font-size: 16px;
-  color: var(--koe-text);
-  background: var(--koe-surface);
-  border: 1px solid var(--koe-border);
+  color: var(--rhanis-text);
+  background: var(--rhanis-surface);
+  border: 1px solid var(--rhanis-border);
   border-radius: 8px; /* inputs/selects: 8px */
   padding: 9px 11px;
   transition: border-color 150ms var(--ko-ease-standard);
 }
 
-.koe-input:focus,
-.koe-select:focus,
-.koe-tool-enable input:focus-visible {
-  outline: 2px solid var(--koe-border-focus);
+.rhanis-input:focus,
+.rhanis-select:focus,
+.rhanis-tool-enable input:focus-visible {
+  outline: 2px solid var(--rhanis-border-focus);
   outline-offset: 1px;
-  border-color: var(--koe-border-focus);
+  border-color: var(--rhanis-border-focus);
 }
 
-.koe-input:disabled,
-.koe-select:disabled {
-  background: var(--koe-surface-alt);
-  color: var(--koe-text-muted);
+.rhanis-input:disabled,
+.rhanis-select:disabled {
+  background: var(--rhanis-surface-alt);
+  color: var(--rhanis-text-muted);
   cursor: not-allowed;
 }
 
-/* Button VARIANTS only (base `.koe-btn` comes from App.css). */
-.koe-btn-primary {
-  /* AA-checked ink for the solid accent fill — same pair as .koe-btn-approve.
+/* Button VARIANTS only (base `.rhanis-btn` comes from App.css). */
+.rhanis-btn-primary {
+  /* AA-checked ink for the solid accent fill — same pair as .rhanis-btn-approve.
    * --on-accent flips with the OS palette (App.css). */
   color: var(--on-accent);
   background: var(--accent);
   border-color: transparent;
   border-radius: 9px;
 }
-.koe-btn-primary:hover:not(:disabled) {
+.rhanis-btn-primary:hover:not(:disabled) {
   /* Mixing toward --text raises contrast against --on-accent in BOTH palettes
      (lightens the fill on dark, darkens it on light). */
   background: color-mix(in srgb, var(--accent) 85%, var(--text));
 }
 /* Destructive action: solid tone-error with AA-checked ink — same button
- * language as .koe-btn-primary / .koe-btn-approve (--on-danger, App.css). */
-.koe-btn-danger {
+ * language as .rhanis-btn-primary / .rhanis-btn-approve (--on-danger, App.css). */
+.rhanis-btn-danger {
   color: var(--on-danger);
   background: var(--tone-error);
   border-color: transparent;
   border-radius: 9px;
 }
-.koe-btn-danger:hover:not(:disabled) {
+.rhanis-btn-danger:hover:not(:disabled) {
   background: color-mix(in srgb, var(--tone-error) 85%, var(--text));
 }
-.koe-btn-icon {
+.rhanis-btn-icon {
   border-radius: 999px; /* icon buttons: pill */
   padding: 6px 10px;
 }
 
 /* API key input rows */
-.koe-api-key-input {
+.rhanis-api-key-input {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
-.koe-api-key-row {
+.rhanis-api-key-row {
   display: flex;
   gap: 8px;
   align-items: stretch;
 }
-.koe-api-key-row .koe-input {
+.rhanis-api-key-row .rhanis-input {
   flex: 1;
 }
-.koe-api-key-status {
+.rhanis-api-key-status {
   margin: 0;
   font-size: 0.84rem;
   color: var(--tone-working); /* bright green, reads as success on the dark panel */
 }
-.koe-api-key-error {
+.rhanis-api-key-error {
   margin: 0;
   font-size: 0.84rem;
-  color: var(--koe-danger);
+  color: var(--rhanis-danger);
 }
-.koe-api-key-actions {
+.rhanis-api-key-actions {
   display: flex;
   gap: 10px;
 }
 
 /* 手足 tool rows — slightly inset to read as a sub-group. */
-.koe-tool-key-row {
+.rhanis-tool-key-row {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 12px;
-  background: var(--koe-surface-alt);
+  background: var(--rhanis-surface-alt);
   border-radius: 10px;
 }
-.koe-tool-enable {
+.rhanis-tool-enable {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   font-size: 0.88rem;
   /* Primary token (not muted): this enable label is an actionable control, so it
    * uses full-strength text on the alt surface (--panel-2) for emphasis. */
-  color: var(--koe-text);
+  color: var(--rhanis-text);
 }
-.koe-tool-key-row + .koe-tool-key-row {
+.rhanis-tool-key-row + .rhanis-tool-key-row {
   margin-top: 4px;
 }
 
 /* Budget controls */
-.koe-budget-option {
+.rhanis-budget-option {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   font-size: 0.92rem;
 }
-.koe-budget-amount {
+.rhanis-budget-amount {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-/* Permission policy editor (koe-351) */
-.koe-policy-editor {
+/* Permission policy editor (rhanis-351) */
+.rhanis-policy-editor {
   display: flex;
   flex-direction: column;
   gap: 22px;
 }
-.koe-policy-group {
+.rhanis-policy-group {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 14px;
-  background: var(--koe-surface-alt);
-  border: 1px solid var(--koe-border);
+  background: var(--rhanis-surface-alt);
+  border: 1px solid var(--rhanis-border);
   border-radius: 12px;
 }
-.koe-policy-group h4 {
+.rhanis-policy-group h4 {
   margin: 0;
   font-size: 0.96rem;
 }
-.koe-policy-subhead {
+.rhanis-policy-subhead {
   margin: 10px 0 0;
   font-size: 0.86rem;
-  color: var(--koe-text-muted);
+  color: var(--rhanis-text-muted);
 }
-.koe-policy-list {
+.rhanis-policy-list {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -254,44 +254,44 @@
   flex-direction: column;
   gap: 6px;
 }
-.koe-policy-item {
+.rhanis-policy-item {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 6px 10px;
-  background: var(--koe-surface);
-  border: 1px solid var(--koe-border);
+  background: var(--rhanis-surface);
+  border: 1px solid var(--rhanis-border);
   border-radius: 7px;
   font-size: 0.88rem;
 }
-.koe-policy-path {
+.rhanis-policy-path {
   flex: 1;
   overflow-wrap: anywhere;
   font-family: SFMono-Regular, "Cascadia Mono", Consolas, monospace;
   font-size: 0.82rem;
 }
-.koe-policy-danger {
+.rhanis-policy-danger {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   white-space: nowrap;
   font-size: 0.82rem;
-  color: var(--koe-text);
+  color: var(--rhanis-text);
 }
-.koe-policy-empty {
+.rhanis-policy-empty {
   padding: 6px 2px;
-  color: var(--koe-text-muted);
+  color: var(--rhanis-text-muted);
   font-size: 0.85rem;
 }
-.koe-policy-add {
+.rhanis-policy-add {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 4px;
 }
-.koe-policy-add .koe-input {
+.rhanis-policy-add .rhanis-input {
   flex: 1 1 12rem;
 }
-.koe-policy-warning {
-  color: var(--koe-danger);
+.rhanis-policy-warning {
+  color: var(--rhanis-danger);
 }

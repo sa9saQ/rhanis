@@ -1,7 +1,7 @@
 // Activity feature — the contract between the Rust backend and the Activity UI.
 //
 // These shapes are the source of truth that the backend tool_dispatcher
-// (koe-2gy) and approval_gate (koe-1vi) MUST emit/accept. They are defined here
+// (rhanis-2gy) and approval_gate (rhanis-1vi) MUST emit/accept. They are defined here
 // (frontend) first so the UI is not dead code: a dev-only mock emitter and the
 // unit tests exercise the exact same shapes the backend will produce.
 
@@ -16,7 +16,7 @@ export type ToolPhase = "start" | "progress" | "done" | "error";
  *
  * Payloads are pre-redacted by the backend: `displaySummary` / `detail` carry
  * at most a safe target descriptor (home-relative path, first command token,
- * URL host — koe-whf) and must never contain the API key, raw absolute paths,
+ * URL host — rhanis-whf) and must never contain the API key, raw absolute paths,
  * or PII (see CLAUDE.md).
  */
 export interface ToolEvent {
@@ -40,7 +40,7 @@ export interface ToolEvent {
 }
 
 /**
- * Phase of a `thinking-event` disclosure. M1 (koe-sua.1) emits only `"deciding"`
+ * Phase of a `thinking-event` disclosure. M1 (rhanis-sua.1) emits only `"deciding"`
  * — the model has chosen its next verifiable action and is about to take it. The
  * union is intentionally narrow: it carries exactly what the backend emits today,
  * so a future milestone (e.g. a post-action `"reflecting"`) extends it explicitly
@@ -53,15 +53,15 @@ export type ThinkingPhase = "deciding";
  * "thinking window" just BEFORE a tool runs — and, by construction, before that
  * tool's `tool-event` phase=start: the backend emits this synchronously in the
  * read loop before it spawns the dispatch that produces the tool-event, so a
- * disclosure always precedes the action it describes. This is koe's glass-box M1
- * (koe-sua.1): the operator sees *what koe is about to do and why* instead of a
+ * disclosure always precedes the action it describes. This is Rhanis's glass-box M1
+ * (rhanis-sua.1): the operator sees *what Rhanis is about to do and why* instead of a
  * silent pause.
  *
  * Verifiable-action-first: `plan` is a redacted, tool-derived one-line of the
  * NEXT action ("ウェブを検索しています"); `tool` / `source` are the verifiable act
  * (which tool, what kind of source). The model's raw chain-of-thought is NEVER
  * included — disclosed CoT can be up to 36% unfaithful (Turpin et al. 2305.04388),
- * so koe discloses checkable behaviour, not narration. Payloads are pre-redacted
+ * so Rhanis discloses checkable behaviour, not narration. Payloads are pre-redacted
  * by the backend (no API key / absolute path / PII / tool arguments — see
  * CLAUDE.md).
  *
@@ -97,7 +97,7 @@ export interface ThinkingEvent {
    */
   source?: string;
   /**
-   * Reserved for the calibrated discrete confidence label (koe-sua.2). Always
+   * Reserved for the calibrated discrete confidence label (rhanis-sua.2). Always
    * unset in M1 — the calibration layer that would earn a trustworthy label does
    * not exist yet, so the backend never fabricates one here.
    */
@@ -111,7 +111,7 @@ export interface ThinkingEvent {
  * forward-looking superset: in M1 the backend only ever emits an
  * `ApprovalRequest` for **DANGER** (the 30s human gate). CAUTION is
  * notify-only — it rides a non-blocking `tool-event` (with a `detail` note) and
- * never produces an `ApprovalRequest` (user decision `koe-caution-tier`). The
+ * never produces an `ApprovalRequest` (user decision `rhanis-caution-tier`). The
  * `"CAUTION"` member is retained for a future milestone that may surface CAUTION
  * in the approval UI.
  */
@@ -142,13 +142,13 @@ export type ApprovalDecision = "approve" | "deny";
 
 /**
  * Emitted by the backend on the `provider-error` channel when the realtime
- * server reports a NON-benign `error` frame (koe-nal) — e.g. a rejected
+ * server reports a NON-benign `error` frame (rhanis-nal) — e.g. a rejected
  * `session.update`, which silently disables tools / ASR / journaling while
  * audio keeps flowing. Deliberately NOT a `session-status: error`: that state
  * is the TERMINAL contract below, and a mid-session error frame does not end
  * the session. The backend pre-sanitizes + length-caps `code`/`message`
  * (server-controlled strings; control/bidi chars are already U+FFFD) and
- * suppresses the expected barge-in cancel race (koe-bx7) before emitting.
+ * suppresses the expected barge-in cancel race (rhanis-bx7) before emitting.
  * Same dedup/ordering discipline as {@link ToolEvent}: `eventId` de-duplicates,
  * `sequence` (the same globally-monotonic counter) orders.
  */
@@ -167,7 +167,7 @@ export interface ProviderErrorEvent {
 
 /**
  * Raw connection state reported by the backend on `session-status`.
- * `reconnecting` (koe-byf) is emitted by the session supervisor while it
+ * `reconnecting` (rhanis-byf) is emitted by the session supervisor while it
  * exponential-backoff-retries a recoverable transport drop; the session is NOT
  * over (neither `connected` nor a terminal `idle`/`error`).
  */
@@ -186,7 +186,7 @@ export interface SessionStatusEvent {
 }
 
 /**
- * A point-in-time view of this month's spend + budget state (koe-9xi). Mirrors
+ * A point-in-time view of this month's spend + budget state (rhanis-9xi). Mirrors
  * Rust `cost_tracker::CostSnapshot`; field names are snake_case (the backend uses
  * no serde rename). Arrives two ways, both folded through the SAME store guard:
  * the `get_cost_snapshot` command (pull, on mount) and the `cost-update` event
@@ -226,7 +226,7 @@ export interface CostSnapshot {
 export type DisplayStatus =
   | "idle" // 待機
   | "connecting" // 準備
-  | "reconnecting" // 再接続中 (koe-byf)
+  | "reconnecting" // 再接続中 (rhanis-byf)
   | "conversing" // 会話
   | "working" // 作業
   | "error"; // エラー

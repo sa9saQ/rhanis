@@ -219,7 +219,7 @@ describe("deleteOpenaiApiKey", () => {
   });
 });
 
-describe("multi-provider key + voice/tool commands (koe-31u)", () => {
+describe("multi-provider key + voice/tool commands (rhanis-31u)", () => {
   it("setVoiceProvider invokes set_voice_provider with {value}", async () => {
     await setVoiceProvider("openai/gpt-realtime-2");
     expect(invoke).toHaveBeenCalledWith(COMMAND.setVoiceProvider, {

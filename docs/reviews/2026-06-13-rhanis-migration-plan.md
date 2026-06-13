@@ -1,0 +1,68 @@
+# koe → Rhanis 全統一リネーム 手順書 (rhanis-zs8)
+
+決定: 2026-06-13 (user) / 実行: 2026-06-14 / SoT: `rhanis-zs8`（旧 `koe-zs8`）+ 本ファイル
+関連: 製品名確定 = `docs/reviews/2026-06-13-product-name-rhanis.md`（`rhanis-0xy`）
+
+## 決定（最上位）
+
+- **製品名 = 「Rhanis Agent」**（短縮呼称・音声ウェイクワード = 「Rhanis」）。
+- **「koe」は旧開発コードネーム。2026-06-13 の `rhanis-zs8` 決定で「コードネーム継続」案を撤回し、bd prefix・リポジトリ名・内部識別子も含め全て Rhanis / rhanis に全統一**（旧 `koe-52p`/`koe-0xy` の「内部は koe 継続」記述を上書き）。
+- 盲目的な `s/koe/rhanis/g` は禁止。`koe-` は ①bd ID ②CSS クラス ③crate/識別子 で意味が違い、さらに ④外部競合製品 `koe.ai`/`koe.fm`/`koe.live` と ⑤リネーム対象外の研究フォルダ `~/research/koe-*` が混在するため、surface 別に処理した。
+
+## Surface マップと処理結果
+
+| # | Surface | 旧 | 新 | 担当 | 状態 |
+|---|---|---|---|---|---|
+| A | tauri productName | `koe` | `Rhanis Agent` | Claude | ✅ |
+| A | tauri identifier | `com.zsaku.koe` | `com.zsaku.rhanis` | Claude | ✅ |
+| A | tauri mainBinaryName | (なし) | `rhanis`（新規追加） | Claude | ✅ |
+| A | tauri window title | `koe` | `Rhanis Agent` | Claude | ✅ |
+| A | package.json name | `koe` | `rhanis` | Claude | ✅ |
+| A | Cargo package / lib | `koe` / `koe_lib` | `rhanis` / `rhanis_lib`（+main.rs, Cargo.lock 同期） | Claude | ✅ |
+| B | SQLite DB ファイル名 | `koe.db` | `rhanis.db` | Claude | ✅ |
+| B | Stronghold スナップショット / partition / keychain | `koe-secrets.stronghold` / `b"koe-secrets"` / `com.zsaku.koe` | `rhanis-secrets.stronghold` / `b"rhanis-secrets"` / `com.zsaku.rhanis` | Claude | ✅ |
+| B | 設定ファイル | `koe-settings.json` | `rhanis-settings.json` | Claude | ✅ |
+| B | screenshot prefix / audio thread 名 | `koe-screenshot-` / (なし) | `rhanis-screenshot-` / `rhanis-audio` | Claude | ✅ |
+| C | CSS クラス / DOM id / aria | `.koe-*` | `.rhanis-*`（全 *.css + className/id/aria-controls + 連動 test） | Claude | ✅ |
+| C | UI 文字列 | サイドバーbrand・オンボ見出し/本文・e2e assert | `Rhanis` | Claude | ✅ |
+| D | bd ID prefix | `koe-` | `rhanis-`（`bd rename-prefix`、159 件、foreign 混入 0） | Claude | ⏳ commit3 |
+| D | コード/設定コメント内 bd-ID | `koe-<id>` | `rhanis-<id>` | Claude | ✅ |
+| E | project CLAUDE.md / AGENTS.md | `koe` | `Rhanis`（メタ文は手動修正、研究パス保護） | Claude | ✅ |
+| E | ci.yml / .gitignore コメント | `koe` | `Rhanis`（機能影響なし） | Claude | ✅ |
+| E | ローカル html ドラフト | `docs/koe-*.html` | `docs/rhanis-*.html`（gitignored、mv+内容変換） | Claude | ✅ |
+| F | グローバル `~/.claude` | plan / loop / lessons / memory | `Rhanis`/`rhanis-` | Claude | ⏳ |
+| G | project `.claude/loop.md` | `koe` | `rhanis`（git 未追跡） | Claude | ⏳ |
+| H | GitHub repo 名 | `sa9saQ/koe` | `sa9saQ/rhanis` | **user** | 🤝 handoff |
+| H | git remote / `.beads/config.yaml` sync.remote | `.../koe.git` | `.../rhanis.git` | **user**（repo rename 後） | 🤝 handoff |
+| H | プロジェクトフォルダ | `~/projects/koe` | `~/projects/rhanis` | **user**（WSL cwd 制約で Claude 不可） | 🤝 handoff |
+| H | Claude memory dir（4個） | `-home-zsaku-projects-koe{,-3su,-ef8-ci,-src-tauri-src}` | `...-rhanis...` | **user** + 再起動 | 🤝 handoff |
+
+## 意図的に変更しない（記録）
+
+**永続ストアのデータディレクトリ挙動（重要・Codex R-C 指摘で確定）**: Tauri は `app_local_data_dir` 等を `${local_data_dir}/${bundle_identifier}` で名前空間化する（`appLogDir` = `${configDir}/${bundleIdentifier}/logs` が実例、context7 確認済み）。バンドル識別子を `com.zsaku.koe` → `com.zsaku.rhanis` に変えた時点で**データディレクトリ自体が新しい場所へ移る**ため、内部ファイル名（snapshot/settings/db）を koe に保っても旧データは参照されない。かつ **koe は一度も配布されていない**（`com.zsaku.koe` のデータディレクトリを持つのは開発機のみ）= 移行すべき実ユーザーは 0、孤児化するのは dev のローカルテストデータだけ（BYOK キー・設定の一回限り再入力）。→ **永続ストア識別子は新しい rhanis ディレクトリと整合させ `rhanis-*` に統一**（`rhanis-secrets.stronghold` / `secret_store.rs::CLIENT_PATH = b"rhanis-secrets"` / `lib.rs::KEYCHAIN_SERVICE = "com.zsaku.rhanis"` / `rhanis-settings.json` / `rhanis.db`）、移行コードは不要（配布前）。`secret_store.rs` の「Stable across versions」契約は、この pre-distribution リネームで rhanis 値に確定し以後不変として満たす。経緯: R-B.5（CodeRabbit CLI）が CLIENT_PATH 単独の互換破壊を major 指摘 → 一旦 koe 据え置きに revert → Codex R-C が「identifier 変更でディレクトリごと移動するので file 名据え置きは無意味、かつ実ユーザー 0」と指摘し **rhanis 統一が正**と確定。
+
+- **`.beads/metadata.json` の `dolt_database: "koe"`**: 内部 Dolt DB のストレージ名。`bd rename-prefix` は issue ID を変えるが Dolt DB 名は変えず、手で書き換えると embedded Dolt と齟齬し bd 破損リスク。対外露出なしのため**据え置き**。
+- **外部競合製品 `koe.ai` / `koe.fm` / `koe.live`**: 命名研究で「koe が衝突する既存製品」として登場する第三者製品。リネームすると事実を破壊するため**保護（不変）**。
+- **研究フォルダ `~/research/koe-voice-agent-novelty-2026` / `~/research/koe-integration-tech-2026-06`**: 本リネームの対象外（research アーカイブ）。パス参照は**保護（不変）**。
+- **過去の研究/レビュー/設計ドキュメント（`docs/research/**`, `docs/reviews/2026-06-04..06-11`, `docs/design/**`）**: 時点記録（point-in-time）として**原則保持**。製品名 prose とともに外部 `koe.*` 参照を多数含むため盲目的置換は危険。bd-ID は旧 `koe-<id>` のまま残るが、`bd rename-prefix` 後も suffix 一致で機械的に対応可（`koe-ef8` ⇔ `rhanis-ef8`）。**全面書き換えが必要なら別途依頼**（外部 koe.* を保護した慎重なパスが必要）。
+
+## 実行順序
+
+1. **commit1（コード識別子+UI、A/B/C/D-comment）** ✅ — `cargo test 526 / vitest 271 / tsc` green で検証済み。
+2. **commit2（docs: CLAUDE.md / AGENTS.md / ci.yml / .gitignore / 命名doc / 本手順書）** ⏳
+3. **commit3（bd rename-prefix koe→rhanis + jsonl 同梱）** ⏳ — foreign 混入 0 を `bd info`/jsonl prefix 分布で照合済み。
+4. **グローバル `~/.claude`（F）+ project loop.md（G）** ⏳ — 直接編集（PR 外）。
+5. **R-B（review-loop skill）→ R-C（codex-review skill）→ push → PR → 自律マージ** ⏳
+6. **handoff（H）= user 操作** 🤝 — 順序: GitHub rename → remote/`.beads/config.yaml` 更新 → フォルダ mv → memory dir mv → 再起動 → 検証（`bd ready` が `rhanis-` + 過去 memory 読込 + CI 緑）。step 5-6 は会話断絶を伴うため最後。
+
+## 検証
+
+- フロント: `pnpm test`（vitest）/ `./node_modules/.bin/tsc --noEmit`。
+- Rust: `cargo test --manifest-path src-tauri/Cargo.toml`（WSL は CLAUDE.md Testing の ALSA workaround）。バイナリ名が `rhanis` になることを doc-test 出力で確認。
+- 残存照合: `git grep -in koe -- '*.rs' '*.css' '*.ts' '*.tsx' '*.js' '*.toml' '*.json'` が「意図的据え置き（dolt_database / 外部 koe.* / 研究パス / 過去 docs）」以外 0。
+
+## ロールバック
+
+- commit1-2: `git revert` で復元可（コード/ docs）。
+- commit3（bd）: `bd rename-prefix koe-` で逆変換可（Dolt DB はローカルで可逆、jsonl 再 export）。
+- handoff（H）: GitHub repo は再 rename 可、フォルダ/memory は逆 mv 可。

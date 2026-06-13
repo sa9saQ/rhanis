@@ -22,7 +22,7 @@ import {
 import type { SessionConnState, SessionStatusEvent } from "../activity/types";
 
 /**
- * The session lifecycle status as seen by the UI. `reconnecting` (koe-byf) is a
+ * The session lifecycle status as seen by the UI. `reconnecting` (rhanis-byf) is a
  * live, STOPPABLE state (the supervisor is retrying a recoverable drop) — distinct
  * from the initial `loading` (which disables the button while first connecting).
  */
@@ -69,7 +69,7 @@ function mapConnState(state: SessionConnState): SessionStatus {
       return "loading";
     case "connected":
       return "connected";
-    // koe-byf: a distinct status (not "loading") so the UI keeps the session
+    // rhanis-byf: a distinct status (not "loading") so the UI keeps the session
     // stoppable while recovering and can show "再接続中" rather than "準備中…".
     case "reconnecting":
       return "reconnecting";
@@ -112,7 +112,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   startSession: async () => {
     const { status, listenerFailed } = get();
-    // reconnecting is already an active session (koe-byf) — start is a no-op, like
+    // reconnecting is already an active session (rhanis-byf) — start is a no-op, like
     // connected. (stopSession below does NOT bail on reconnecting, so it stays
     // stoppable.)
     if (
@@ -174,7 +174,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // That path clears the status guards below (not "idle", not "loading",
     // listenerFailed=true), so only the stop-specific double-stop guard applies.
     if (stopInFlight) return;
-    // STOPPABLE during "loading" (koe-5fs): the previous guard also bailed on
+    // STOPPABLE during "loading" (rhanis-5fs): the previous guard also bailed on
     // "loading" to avoid racing a connecting backend, but that left a hung
     // "準備中…" with no escape (symptom 4). Stopping is safe now —
     // run_session_supervised races connect() against the master stop via

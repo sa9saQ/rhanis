@@ -1,4 +1,4 @@
-//! Safe target descriptors for human-facing disclosure (koe-whf).
+//! Safe target descriptors for human-facing disclosure (rhanis-whf).
 //!
 //! The approval modal and the ActivityLog previously showed only `run {tool}` —
 //! the operator approved a DANGER op without seeing WHAT it targets, which
@@ -33,7 +33,7 @@
 //!   non-default port IS shown (`host:8080`) — it changes where the browser
 //!   lands, so omitting it would under-disclose.
 //! - `open_app`: the app name string (`name` key only — align with the real
-//!   schema when the tool lands, koe-p1a).
+//!   schema when the tool lands, rhanis-p1a).
 //! - content-only / target-free tools (`write_note`, `web_search`,
 //!   `take_screenshot`, unknown): NO descriptor — note text and search queries
 //!   are *content*, not a target, and must never be echoed into summaries.
@@ -64,7 +64,7 @@ const UNC_HOST_MAX_CHARS: usize = 24;
 pub(crate) fn run_summary(tool: &str, args: &Value) -> String {
     // The tool name is model-controlled too — an unknown (hostile) name reaches
     // the DANGER modal fail-closed. Same hygiene as the descriptor; the broader
-    // payload-field hardening is koe-eh4.
+    // payload-field hardening is rhanis-eh4.
     let tool = sanitize_display(tool);
     match descriptor(&tool, args) {
         Some(d) => format!("run {tool}: {d}"),
@@ -75,7 +75,7 @@ pub(crate) fn run_summary(tool: &str, args: &Value) -> String {
 /// Derives the safe descriptor for one tool call, or `None` for tools whose
 /// args are content (never displayed) or when the expected arg is missing /
 /// not a string / empty (fail-quiet: the summary falls back to the plain
-/// pre-koe-whf `run {tool}` floor — a malformed arg must not break dispatch,
+/// pre-rhanis-whf `run {tool}` floor — a malformed arg must not break dispatch,
 /// and the gate itself never depends on this string).
 fn descriptor(tool: &str, args: &Value) -> Option<String> {
     let raw = match tool {
@@ -84,7 +84,7 @@ fn descriptor(tool: &str, args: &Value) -> Option<String> {
         "read_file" | "write_file" | "delete_file" => path_descriptor(str_arg(args, "path")?),
         // open_url's key is parity-locked against the policy below.
         // external_upload is not implemented yet — this mapping IS the UX
-        // contract: when the tool lands (koe-p1a) its destination MUST be the
+        // contract: when the tool lands (rhanis-p1a) its destination MUST be the
         // "url" key and join policy_target + the parity test, otherwise the
         // modal could show a decoy host for the one DANGER op that has no
         // independent policy/IO backstop (red-team, PR #57).
@@ -412,7 +412,7 @@ fn command_descriptor_for(raw: &str, windows: bool) -> Option<String> {
 /// descriptor — the replacement marks make tampering visible to the human.
 /// `pub(crate)`: `realtime_provider::parse_frame` applies the same hygiene to
 /// server-controlled error code/message strings before they ride a UI payload
-/// (koe-nal).
+/// (rhanis-nal).
 pub(crate) fn sanitize_display(s: &str) -> String {
     s.chars()
         .map(|c| if is_display_hostile(c) { '\u{FFFD}' } else { c })

@@ -1,18 +1,18 @@
-// Styling contract for the first-run onboarding + settings panel (koe-iyr).
+// Styling contract for the first-run onboarding + settings panel (rhanis-iyr).
 //
 // jsdom does NOT resolve computed/pixel styles or `var()`, so these tests assert
 // the things that ACTUALLY caused the "raw HTML form" / "white box on a dark
 // desk" regression at a structural level instead of comparing pixels:
 //   1. the onboarding CSS is on the component's import (load) path;
-//   2. every koe-* class the onboarding AND settings components use is DEFINED on
-//      that path (the real root cause was undefined .koe-onboarding-* classes);
+//   2. every rhanis-* class the onboarding AND settings components use is DEFINED on
+//      that path (the real root cause was undefined .rhanis-onboarding-* classes);
 //   3. settings.css no longer ships a global :root override (the dark/light mix);
 //   4. the onboarding components actually mount the layout classes (used ⟺ defined).
 //
-// Selector lookups run on COMMENT-STRIPPED css, so a `.koe-foo` mentioned only in
+// Selector lookups run on COMMENT-STRIPPED css, so a `.rhanis-foo` mentioned only in
 // a comment is never mistaken for a real definition (R-C[MEDIUM]).
 //
-// The final pixel-level look is validated on Windows E2E (koe-ef8); see the PR.
+// The final pixel-level look is validated on Windows E2E (rhanis-ef8); see the PR.
 
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -50,7 +50,7 @@ const onboardingCss = readOrEmpty("features/settings/onboarding.css");
 // Reachable on the ONBOARDING render path: App.css (always) + settings.css +
 // onboarding.css (both imported by OnboardingGate).
 const onboardingPathCss = stripComments([appCss, settingsCss, onboardingCss].join("\n"));
-// Reachable in the SETTINGS panel: App.css (.koe-btn base) + settings.css.
+// Reachable in the SETTINGS panel: App.css (.rhanis-btn base) + settings.css.
 const settingsPathCss = stripComments([appCss, settingsCss].join("\n"));
 const settingsCssCode = stripComments(settingsCss);
 
@@ -61,8 +61,8 @@ const settingsPanelSrc = read("features/settings/SettingsPanel.tsx");
 const voiceSelectorSrc = read("features/settings/VoiceProviderSelector.tsx");
 const policyEditorSrc = read("features/settings/PermissionPolicyEditor.tsx");
 
-/** koe-* tokens from `className="..."` string literals only — `id="..."`
- *  attributes (e.g. koe-budget-amount-input) are intentionally excluded. */
+/** rhanis-* tokens from `className="..."` string literals only — `id="..."`
+ *  attributes (e.g. rhanis-budget-amount-input) are intentionally excluded. */
 function usedClasses(...srcs: string[]): string[] {
   const out = new Set<string>();
   const re = /className="([^"]*)"/g;
@@ -70,7 +70,7 @@ function usedClasses(...srcs: string[]): string[] {
     let m: RegExpExecArray | null;
     while ((m = re.exec(src)) !== null) {
       for (const tok of m[1].split(/\s+/)) {
-        if (tok.startsWith("koe-")) out.add(tok);
+        if (tok.startsWith("rhanis-")) out.add(tok);
       }
     }
   }
@@ -78,7 +78,7 @@ function usedClasses(...srcs: string[]): string[] {
 }
 
 /** True if `cls` is defined as a selector in `css`. The negative lookahead stops
- *  `.koe-btn` from matching inside `.koe-btn-primary`. */
+ *  `.rhanis-btn` from matching inside `.rhanis-btn-primary`. */
 function isDefined(cls: string, css: string): boolean {
   return new RegExp(`\\.${cls}(?![\\w-])`).test(css);
 }
@@ -86,17 +86,17 @@ function undefinedAmong(srcs: string[], css: string): string[] {
   return usedClasses(...srcs).filter((c) => !isDefined(c, css));
 }
 
-describe("onboarding styling — load path & class contract (koe-iyr)", () => {
+describe("onboarding styling — load path & class contract (rhanis-iyr)", () => {
   it("OnboardingGate imports both the shared settings styles and the onboarding layout", () => {
     expect(onboardingGateSrc).toMatch(/import\s+["']\.\/settings\.css["']/);
     expect(onboardingGateSrc).toMatch(/import\s+["']\.\/onboarding\.css["']/);
   });
 
-  it("every koe-* class used by the onboarding flow is defined on the onboarding CSS path", () => {
+  it("every rhanis-* class used by the onboarding flow is defined on the onboarding CSS path", () => {
     expect(undefinedAmong([onboardingGateSrc, budgetSrc, apiKeySrc], onboardingPathCss)).toEqual([]);
   });
 
-  it("every koe-* class used by the settings panel is defined on the settings CSS path", () => {
+  it("every rhanis-* class used by the settings panel is defined on the settings CSS path", () => {
     expect(
       undefinedAmong([settingsPanelSrc, voiceSelectorSrc, policyEditorSrc], settingsPathCss),
     ).toEqual([]);
@@ -111,19 +111,19 @@ describe("onboarding styling — load path & class contract (koe-iyr)", () => {
   });
 
   it("the settings/onboarding sub-theme tokens are scoped to the component roots", () => {
-    // --koe-surface stays defined (dark, aliased to the app palette) but under
+    // --rhanis-surface stays defined (dark, aliased to the app palette) but under
     // the component-root selector list, never a bare global override.
-    expect(settingsCssCode).toMatch(/--koe-surface\s*:/);
-    expect(settingsCssCode).toMatch(/\.koe-onboarding-wizard[^{]*\{[^}]*--koe-surface/s);
+    expect(settingsCssCode).toMatch(/--rhanis-surface\s*:/);
+    expect(settingsCssCode).toMatch(/\.rhanis-onboarding-wizard[^{]*\{[^}]*--rhanis-surface/s);
   });
 });
 
-describe("onboarding components render their layout classes (koe-iyr)", () => {
+describe("onboarding components render their layout classes (rhanis-iyr)", () => {
   it("BudgetOnboarding mounts its onboarding layout classes", () => {
     const { container } = render(<BudgetOnboarding onBudgetChosen={() => {}} />);
-    expect(container.querySelector(".koe-budget-onboarding")).not.toBeNull();
-    expect(container.querySelector(".koe-onboarding-title")).not.toBeNull();
-    expect(container.querySelector(".koe-onboarding-desc")).not.toBeNull();
-    expect(container.querySelector(".koe-budget-fieldset")).not.toBeNull();
+    expect(container.querySelector(".rhanis-budget-onboarding")).not.toBeNull();
+    expect(container.querySelector(".rhanis-onboarding-title")).not.toBeNull();
+    expect(container.querySelector(".rhanis-onboarding-desc")).not.toBeNull();
+    expect(container.querySelector(".rhanis-budget-fieldset")).not.toBeNull();
   });
 });

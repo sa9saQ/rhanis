@@ -260,7 +260,7 @@ describe("ingestThinkingEvent — thinking trace (glass-box M1)", () => {
   it("carries a redacted plan + verifiable act, never a raw-CoT field", () => {
     // The shape itself enforces verifiable-action-first: a ThinkingEvent has no
     // free-text reasoning field. Assert the disclosure is exactly plan + tool /
-    // source, and that the calibration label (koe-sua.2) stays unset in M1.
+    // source, and that the calibration label (rhanis-sua.2) stays unset in M1.
     const s = useActivityStore.getState();
     s.ingestThinkingEvent(think({ eventId: "t1", actionId: "a1", sequence: 1 }));
     const t = selectRecentThinking(useActivityStore.getState())[0];
@@ -341,7 +341,7 @@ describe("ingestThinkingEvent — thinking trace (glass-box M1)", () => {
   });
 });
 
-describe("ingestProviderError — provider error strip (koe-nal)", () => {
+describe("ingestProviderError — provider error strip (rhanis-nal)", () => {
   it("folds errors newest-first via the selector, ordered by sequence", () => {
     const s = useActivityStore.getState();
     s.ingestProviderError(perr({ eventId: "p2", sequence: 20 }));
@@ -392,7 +392,7 @@ describe("ingestProviderError — provider error strip (koe-nal)", () => {
     expect(selectDisplayStatus(useActivityStore.getState())).toBe("conversing");
   });
 
-  it("drops a late-DELIVERED error from before the clear (old session, koe-nal R-C)", () => {
+  it("drops a late-DELIVERED error from before the clear (old session, rhanis-nal R-C)", () => {
     const s = useActivityStore.getState();
     // The new session starts: clear happens at status sequence 5.
     s.setSessionStatus({ state: "connecting", sequence: 5 });
@@ -422,7 +422,7 @@ describe("selectDisplayStatus — derived state machine", () => {
     expect(selectDisplayStatus(useActivityStore.getState())).toBe("connecting");
   });
 
-  it("reconnecting maps to reconnecting, not idle/conversing (koe-byf)", () => {
+  it("reconnecting maps to reconnecting, not idle/conversing (rhanis-byf)", () => {
     setConn("reconnecting");
     expect(selectDisplayStatus(useActivityStore.getState())).toBe("reconnecting");
     // It is NOT a terminal state: connState is set and no sticky error is created.

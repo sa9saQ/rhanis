@@ -1,26 +1,26 @@
-//! Tool dispatcher (koe-2gy): routes one Realtime `function_call` to a tool.
+//! Tool dispatcher (rhanis-2gy): routes one Realtime `function_call` to a tool.
 //!
 //! Flow per call (`dispatch_impl`):
 //! 1. `classify(tool)` → risk tier.
 //! 2. Emit a redacted `tool-event` phase=start (CAUTION rides a non-blocking
-//!    `detail` note here — it never waits for approval, per `koe-caution-tier`).
+//!    `detail` note here — it never waits for approval, per `rhanis-caution-tier`).
 //! 3. For `run_command`, enforce the shell DENY_LIST (token-level) BEFORE anything.
 //! 4. Bound the incoming args size (external, attacker-influenced input).
 //!    Then reject an UNREGISTERED tool with phase=error BEFORE the gate
-//!    (koe-r2o — the old Ok-stub showed phase=done for a no-op, and the
+//!    (rhanis-r2o — the old Ok-stub showed phase=done for a no-op, and the
 //!    operator must never be interrupted to approve something that cannot run).
 //! 5. Route by tier: SAFE/CAUTION run immediately; DANGER → human gate, a decline
 //!    returns `"user declined"` as the tool output.
-//! 6. Run the registered tool (koe-s7i plugs real tools in).
+//! 6. Run the registered tool (rhanis-s7i plugs real tools in).
 //! 7. Emit phase=done|error and return the `conversation.item.create` +
-//!    `response.create` frames for `session_manager` (koe-e3m) to send.
+//!    `response.create` frames for `session_manager` (rhanis-e3m) to send.
 //!
 //! **AppHandle is abstracted behind [`DispatchIo`]** (emit + approval request) so
 //! the whole flow is unit-testable in WSL without a live Tauri handle or socket.
 //! Production wires [`AppDispatchIo`] (real `AppHandle` + `ApprovalGate`).
 //!
 //! Redaction: `displaySummary` is `run {tool}` plus a SAFE target descriptor
-//! (home-relative path / first command token / URL host — koe-whf, see
+//! (home-relative path / first command token / URL host — rhanis-whf, see
 //! [`crate::display_descriptor`]); raw args and tool output never appear there
 //! (no key / full absolute path / PII). Tool output is hard-capped
 //! ([`MAX_TOOL_OUTPUT_LEN`]) as defense-in-depth on top of each tool's own
@@ -29,9 +29,9 @@
 //! transaction N/A · idempotency_key N/A (in-process tool routing, not billing).
 
 // The dispatcher's production path (`RealToolDispatcher::dispatch` and its
-// helpers) has no in-crate caller until session_manager (koe-e3m) wires its read
+// helpers) has no in-crate caller until session_manager (rhanis-e3m) wires its read
 // loop to it; the entire flow is exercised by this module's tests. Allow
-// dead_code module-wide until koe-e3m lands, then drop this so any genuine dead
+// dead_code module-wide until rhanis-e3m lands, then drop this so any genuine dead
 // code resurfaces.
 #![allow(dead_code)]
 
@@ -62,7 +62,7 @@ const MAX_TOOL_OUTPUT_LEN: usize = 16 * 1024;
 
 /// Hard cap on the tool name length. The name is model-controlled and flows into
 /// `ToolEvent.tool`; bound it like the args/output caps. `pub(crate)` so the
-/// session_manager conversation journal (koe-emd) bounds the same model-controlled
+/// session_manager conversation journal (rhanis-emd) bounds the same model-controlled
 /// field with the same limit instead of re-introducing a magic number.
 pub(crate) const MAX_TOOL_NAME_LEN: usize = 256;
 
@@ -101,7 +101,7 @@ pub struct ToolEvent {
     pub progress: Option<f64>,
 }
 
-// ---- Tool registry (the seam koe-s7i plugs into) -----------------------------
+// ---- Tool registry (the seam rhanis-s7i plugs into) -----------------------------
 
 /// A type-erased async tool: receives the raw args JSON, returns
 /// `Ok(output_string)` or `Err(error_string)`. The output string is the tool's
@@ -114,7 +114,7 @@ struct RegisteredTool {
     schema: ToolSchema,
 }
 
-/// Maps tool name → (impl, schema). koe-s7i calls [`ToolRegistry::register`] for
+/// Maps tool name → (impl, schema). rhanis-s7i calls [`ToolRegistry::register`] for
 /// each real tool during `lib.rs` setup; the schema travels with the impl so
 /// `tool_schemas()` (sent in `session.update`) has a single source of truth.
 #[derive(Default)]
@@ -199,13 +199,13 @@ impl DispatchIo for AppDispatchIo {
 // ---- RealToolDispatcher ------------------------------------------------------
 
 /// The real dispatcher wired in production. Implements [`DispatcherSeam`] so
-/// `session_manager` (koe-e3m) calls it through `ManagedDispatcher` with no
+/// `session_manager` (rhanis-e3m) calls it through `ManagedDispatcher` with no
 /// import cycle.
 pub struct RealToolDispatcher {
     io: Arc<dyn DispatchIo>,
     seq: Arc<SequenceCounter>,
     registry: Arc<ToolRegistry>,
-    /// User permission policy seam (koe-351). Read per-dispatch so a settings
+    /// User permission policy seam (rhanis-351). Read per-dispatch so a settings
     /// edit takes effect immediately; a load failure fails closed (see
     /// `SettingsPolicyProvider` / `PolicyState::Unavailable`).
     policy: Arc<dyn PolicyProvider>,
@@ -259,7 +259,7 @@ async fn dispatch_impl(
     }
     let risk = classify(&name);
 
-    // One safe, human-meaningful summary per call (koe-whf): the SAME string is
+    // One safe, human-meaningful summary per call (rhanis-whf): the SAME string is
     // shown in every phase event AND the approval modal, and it derives from the
     // SAME parsed `args` the policy and the tool consume (no display/exec skew).
     // Computing it before the args-size check below is safe: production frames
@@ -292,14 +292,14 @@ async fn dispatch_impl(
         return function_call_output(&call_id, error_output("arguments too large"));
     }
 
-    // (4.5) Unregistered tool: fail VISIBLY before the human gate (koe-r2o).
+    // (4.5) Unregistered tool: fail VISIBLY before the human gate (rhanis-r2o).
     // The old stub returned Ok (phase=done) — an approved DANGER op that
     // silently no-ops is indistinguishable from a successful one in the
     // ActivityLog, a lie in a product whose thesis is calibrated transparency.
     // Checking BEFORE the gate also means the operator is never interrupted to
     // approve something that cannot run. After the deny-list (3) on purpose:
     // a deny-listed command reports the security block, not "not implemented"
-    // (the more safety-relevant signal wins). koe-s7i fills the registry in.
+    // (the more safety-relevant signal wins). rhanis-s7i fills the registry in.
     let Some(tool) = registry.get(&name) else {
         io.emit_tool_event(make_event(
             &seq, &name, &call_id, "error",
@@ -309,7 +309,7 @@ async fn dispatch_impl(
     };
 
     // (5) Gate decision = built-in tier COMPOSED with the user permission policy
-    // (koe-351). The policy can only ADD safety: `AutoApprove` skips the gate for
+    // (rhanis-351). The policy can only ADD safety: `AutoApprove` skips the gate for
     // an allow-listed target; `Default` keeps the tier behaviour (DANGER gates,
     // SAFE/CAUTION run); `RequireApproval` forces the gate even for a tier that
     // would otherwise run (deny-list / baseline / unresolved path / strict URL /
@@ -325,7 +325,7 @@ async fn dispatch_impl(
         // The approval-required event is always DANGER-tier: requiring confirmation
         // IS the danger UX, and the frontend `ApprovalRisk` union only carries
         // CAUTION/DANGER (never SAFE). The summary carries only the safe target
-        // descriptor (home-relative path / first token / host — koe-whf), never
+        // descriptor (home-relative path / first token / host — rhanis-whf), never
         // the raw args. A decline blocks the tool (fail-closed).
         let outcome = io
             .request_approval(name.clone(), ApprovalRisk::Danger, summary.clone())
@@ -439,7 +439,7 @@ fn args_too_large(args: &Value) -> bool {
 ///
 /// DENY check is step 3 in the dispatch flow; the ALLOW_LIST (`command_is_allowed`
 /// in `tools/mod.rs`) is step 5.5 — called after this AND after the 30s human
-/// gate (koe-s7i). Per CLAUDE.md: "DENY_LIST … を先に判定、その後 ALLOW_LIST ホワイトリスト".
+/// gate (rhanis-s7i). Per CLAUDE.md: "DENY_LIST … を先に判定、その後 ALLOW_LIST ホワイトリスト".
 fn command_is_denied(args: &Value) -> bool {
     let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
     let low = cmd.to_ascii_lowercase();
@@ -459,7 +459,7 @@ fn command_is_denied(args: &Value) -> bool {
 }
 
 /// Unguessable per-emit event id (`evt-` + 128-bit hex). A CSPRNG failure panics
-/// this dispatch future; session_manager (koe-e3m) MUST run each dispatch in its
+/// this dispatch future; session_manager (rhanis-e3m) MUST run each dispatch in its
 /// own `tokio::spawn` task so the panic stays contained to that one call rather
 /// than tearing down the read loop.
 fn gen_event_id() -> String {
@@ -525,7 +525,7 @@ mod tests {
         }
     }
 
-    /// Returns a fixed [`PolicyState`] (koe-351). The default tests use an empty
+    /// Returns a fixed [`PolicyState`] (rhanis-351). The default tests use an empty
     /// loaded policy (auto-approve nothing → existing tier behaviour preserved).
     struct MockPolicyProvider(crate::permission_policy::PolicyState);
     impl PolicyProvider for MockPolicyProvider {
@@ -557,7 +557,7 @@ mod tests {
     }
 
     /// Registry with a trivial Ok tool registered under `name` — for tests whose
-    /// POINT is the gate / policy / descriptor flow, not the tool body (koe-r2o
+    /// POINT is the gate / policy / descriptor flow, not the tool body (rhanis-r2o
     /// made the unregistered path a pre-gate error, so flow tests must register
     /// the tool they exercise).
     fn registry_with(name: &str) -> Arc<ToolRegistry> {
@@ -610,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn unregistered_tool_fails_visibly_not_stub_ok() {
-        // koe-r2o: the old stub returned Ok + phase=done — "executed" in the
+        // rhanis-r2o: the old stub returned Ok + phase=done — "executed" in the
         // ActivityLog while nothing ran, a lie in a glass-box product. An
         // unregistered tool must surface phase=error + a fixed detail, and the
         // model must receive an error frame.
@@ -630,7 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn unregistered_danger_tool_fails_before_the_human_gate() {
-        // koe-r2o: the registry check runs BEFORE the approval gate — the
+        // rhanis-r2o: the registry check runs BEFORE the approval gate — the
         // operator is never interrupted to approve something that cannot run.
         // Declined MockIo proves the gate was not consulted: if it were, the
         // output would be "user declined", not "tool not implemented".
@@ -647,7 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn caution_tool_emits_caution_note_and_runs_without_gate() {
-        // write_file is CAUTION (registered here — koe-r2o): the point is it
+        // write_file is CAUTION (registered here — rhanis-r2o): the point is it
         // RUNS (reaches done) without an approval gate, with a caution note.
         let io = MockIo::new(ApprovalOutcome::Declined); // would block if gated
         let res = run(&io, registry_with("write_file"), call("write_file", serde_json::json!({}))).await;
@@ -681,7 +681,7 @@ mod tests {
     async fn run_command_denylist_blocks_before_gate() {
         // Even with approval granted, a deny-listed command never runs.
         // Registry intentionally EMPTY (do NOT "fix" to registry_with): with
-        // koe-r2o this also pins deny-list (3) firing BEFORE the unregistered
+        // rhanis-r2o this also pins deny-list (3) firing BEFORE the unregistered
         // check (4.5) — the security block must win over "tool not implemented".
         let io = MockIo::new(ApprovalOutcome::Approved);
         let res = run(&io, Arc::new(ToolRegistry::new()), call("run_command", serde_json::json!({"command": "rm -rf /"}))).await;
@@ -745,7 +745,7 @@ mod tests {
         assert!(out.contains("too large"));
     }
 
-    // ---- koe-whf: safe target descriptors in the gate + the log ----
+    // ---- rhanis-whf: safe target descriptors in the gate + the log ----
 
     #[tokio::test]
     async fn approval_summary_shows_home_relative_target() {
@@ -933,7 +933,7 @@ mod tests {
         assert!(out.contains("too long"));
     }
 
-    // ---- permission policy composition (koe-351) -----------------------------
+    // ---- permission policy composition (rhanis-351) -----------------------------
     //
     // These prove the policy layer actually changes the gate decision in the
     // dispatcher, including via the REAL settings store (the end-to-end wiring
@@ -998,7 +998,7 @@ mod tests {
     #[tokio::test]
     async fn denied_folder_via_real_settings_store_forces_gate() {
         let data = tempfile::tempdir().unwrap();
-        let path = data.path().join("koe-settings.json");
+        let path = data.path().join("rhanis-settings.json");
         let store: Arc<dyn SettingsStore> = Arc::new(JsonSettingsStore::new(path));
 
         let work = tempfile::tempdir().unwrap();
@@ -1032,7 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn allow_danger_via_real_settings_store_auto_executes() {
         let data = tempfile::tempdir().unwrap();
-        let path = data.path().join("koe-settings.json");
+        let path = data.path().join("rhanis-settings.json");
         let store: Arc<dyn SettingsStore> = Arc::new(JsonSettingsStore::new(path));
 
         let work = tempfile::tempdir().unwrap();

@@ -1,13 +1,13 @@
 # 製品名の確定: Rhanis （ラニス）
 
-確定日: 2026-06-13 / 決定者: user / 記録: koe-0xy
+確定日: 2026-06-13 / 決定者: user / 記録: rhanis-0xy
 
 ## 結論
 
 **フルの製品名 = 「Rhanis Agent」**（ラニスエージェント。user 確定 2026-06-13）。別表記 = Rhanis AI。
 **短縮呼称・音声ウェイクワード = 「Rhanis」**（ラニス）。= 二層運用（フル名でロゴ/ストア表記、短縮で日常呼称・"Hey Rhanis"。cf. "Hey Google" / 製品名 Google Assistant）。
 識別力の源は固有名詞 **Rhanis**（Agent は説明的接尾語）なので、商標出願の核は Rhanis。
-**「Koe」 は開発コードネームに降格**（bd prefix・リポジトリ名・内部識別子は当面 koe を継続使用、対外的な製品名のみ Rhanis Agent）。
+**「Koe」 は当初開発コードネームとして継続予定だったが、2026-06-13 の `rhanis-zs8` 決定でこの案を撤回**（user 判断）→ **bd prefix・リポジトリ名・内部識別子もすべて Rhanis / rhanis に全統一**（対外製品名 = Rhanis Agent、内部識別子・bd prefix = rhanis）。実コード反映は 2026-06-14 のリネームで完了（下記「残課題」参照）。
 
 ## 由来とコンセプト整合
 
@@ -34,8 +34,8 @@ Koe が音声 AI 領域で 3 製品衝突（koe.ai voice changer / koe.fm / koe.
 
 ## 残課題（実装・法務反映、製品名を参照する後続）
 
-- **商標の精密調査（要・専門家）**: 称呼類似（Lannister 等の音近接、類 9 ソフトウェア / 類 42 SaaS）の最終判定は弁理士の領分。一次検索はクリアだが、出願前に専門調査を通すこと。`koe-n6s`（法務）に連動。
+- **商標の精密調査（要・専門家）**: 称呼類似（Lannister 等の音近接、類 9 ソフトウェア / 類 42 SaaS）の最終判定は弁理士の領分。一次検索はクリアだが、出願前に専門調査を通すこと。`rhanis-n6s`（法務）に連動。
 - **ドメイン取得**: rhanis.ai を主、rhanis.app / .io と rhanisagent.com を防御的に確保（Cloudflare Registrar、CLAUDE.md スタック方針）。
 - **ハンドル確保**: GitHub org `rhanis-ai`、X `@rhanis` 系、npm scope `@rhanis`。
-- **実コードへの反映は M1.5 配布タスクで段階的に**: `src-tauri/tauri.conf.json` の `productName`、バンドル識別子、`package.json` の name 等は署名証明書（`koe-44h`）・ストア登録・配布（`koe-8h0`）と整合を取る必要があるため、配布準備のまとまった作業で一括変更する（今は決定記録のみ、コード未変更）。
-- **ピッチ / コピーへの反映**: `koe-20f`（競合対応・ピッチ）で "Rhanis — see what your AI is doing" 系の brand story を確定。
+- **実コードへの反映は完了（命名確定 2026-06-13 → 実装反映 2026-06-14、`rhanis-zs8`）**: `src-tauri/tauri.conf.json`（`productName`=`Rhanis Agent` / `mainBinaryName`=`rhanis` / `identifier`=`com.zsaku.rhanis` / window title=`Rhanis Agent`）、`package.json` name=`rhanis`、Cargo crate 名 `rhanis` / `rhanis_lib`、SQLite DB `rhanis.db`、CSS クラス `.rhanis-*` をリネーム済み。署名証明書（`rhanis-44h`）・ストア登録・配布（`rhanis-8h0`）は M1.5 でこの識別子（`com.zsaku.rhanis`）を踏襲する。
+- **ピッチ / コピーへの反映**: `rhanis-20f`（競合対応・ピッチ）で "Rhanis — see what your AI is doing" 系の brand story を確定。

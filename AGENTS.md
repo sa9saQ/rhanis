@@ -1,6 +1,6 @@
-# koe - Codex Review Instructions
+# Rhanis - Codex Review Instructions
 
-Codex (gpt-5.5) によるレビュー時の **koe 固有** の焦点を記す。グローバル AGENTS.md / `~/.claude/CLAUDE.md` のルールは繰り返さない。
+Codex (gpt-5.5) によるレビュー時の **Rhanis 固有** の焦点を記す。グローバル AGENTS.md / `~/.claude/CLAUDE.md` のルールは繰り返さない。
 
 ## Project Context
 - **What**: 起動しっぱなしのリアルタイム音声 AI 秘書（Tauri デスクトップ）。GPT-Realtime-2 で連続会話しながら、裏で PC 操作 / 検索 / 記録を並行実行し、AI が今何をしているかを画面で可視化する
