@@ -1,4 +1,4 @@
-//! `read_file` tool (koe-s7i).
+//! `read_file` tool (rhanis-s7i).
 //!
 //! A SAFE tool: reads an existing file within a user-controlled allowlist of
 //! directories (M1 default: Documents + Desktop) and returns its content to the
@@ -45,12 +45,12 @@
 //!   The dispatcher already enforces this via `error_output`; each `Err(..)`
 //!   branch here returns a short fixed string.
 //!
-//! # Allowlist seam for koe-351
+//! # Allowlist seam for rhanis-351
 //! M1 hard-codes the allowlist as `[Documents, Desktop]` relative to the OS user
-//! home directory. koe-351 will replace this with a user-configurable policy
+//! home directory. rhanis-351 will replace this with a user-configurable policy
 //! stored in `JsonSettingsStore`. The seam is the `allowed_bases` parameter of
 //! `read_file_tool`: production wires it from `dirs::document_dir()` /
-//! `dirs::desktop_dir()`, and koe-351 will instead pass the user's stored list.
+//! `dirs::desktop_dir()`, and rhanis-351 will instead pass the user's stored list.
 //! Do NOT inline the resolution logic into the function body — keep the parameter
 //! clean for that swap.
 //!
@@ -121,8 +121,8 @@ pub const MAX_READ_BYTES: u64 = 12 * 1024; // 12 KiB (fits inside dispatcher's 1
 /// Builds the `read_file` [`ToolFn`] with the given allowlist of base paths.
 ///
 /// `allowed_bases` MUST already be canonical (resolved) paths. In production
-/// `lib.rs` passes the result of `document_dir()` / `desktop_dir()` (koe-s7i
-/// seam; koe-351 replaces with user-configurable list).
+/// `lib.rs` passes the result of `document_dir()` / `desktop_dir()` (rhanis-s7i
+/// seam; rhanis-351 replaces with user-configurable list).
 pub fn read_file_tool(allowed_bases: Vec<PathBuf>) -> ToolFn {
     let allowed = Arc::new(allowed_bases);
     Arc::new(move |args: Value| {
@@ -793,10 +793,10 @@ pub fn open_no_symlinks_and_read(
 
 // Windows: component walk anchored at the validated base directory HANDLE.
 //
-// SCOPE NOTE (koe-8kw): a fully handle-rooted `NtCreateFile` walk (using
+// SCOPE NOTE (rhanis-8kw): a fully handle-rooted `NtCreateFile` walk (using
 // OBJECT_ATTRIBUTES.RootDirectory so each step is opened RELATIVE to the
 // previous handle, eliminating the per-component absolute re-resolution below)
-// is tracked separately under koe-8kw — it needs a real Windows host to
+// is tracked separately under rhanis-8kw — it needs a real Windows host to
 // implement and verify. This function keeps the current best-effort strategy:
 // absolute per-component opens with FILE_FLAG_OPEN_REPARSE_POINT +
 // reparse-point rejection at every step (see the Step 3 comment below).
@@ -1120,7 +1120,7 @@ pub fn read_file_schema() -> ToolSchema {
 /// than growing an unresolvable base that `within_any_allowed` would silently skip
 /// anyway.
 ///
-/// `koe-351` will replace callers of this function with a per-user configurable
+/// `rhanis-351` will replace callers of this function with a per-user configurable
 /// policy fetched from `JsonSettingsStore`.
 pub fn default_read_allowlist() -> Vec<PathBuf> {
     let mut bases = Vec::new();

@@ -20,7 +20,7 @@ interface SettingsPanelProps {
 // 手足 (tool) providers shown in the settings list. The provider id matches the
 // backend allowlist. Adding a tool = appending here (plus the secret_store
 // allowlist + a ToolProviderFlags field). Keys are STORED now but only USED once
-// koe-eal wires the tools — made explicit to the user in the section hint below.
+// rhanis-eal wires the tools — made explicit to the user in the section hint below.
 const TOOL_KEYS: { provider: keyof ToolProviderFlags; label: string; placeholder?: string }[] = [
   { provider: "xai", label: "XAI (Grok) APIキー", placeholder: "xai-…" },
   // X / search keys have no well-known prefix → a neutral placeholder (not the
@@ -29,7 +29,7 @@ const TOOL_KEYS: { provider: keyof ToolProviderFlags; label: string; placeholder
   { provider: "search", label: "検索 API キー", placeholder: "API キーを貼り付け" },
 ];
 
-const TOOL_KEYS_HINT_ID = "koe-tool-keys-hint";
+const TOOL_KEYS_HINT_ID = "rhanis-tool-keys-hint";
 
 const DEFAULT_VOICE_PROVIDER_MODEL = "openai/gpt-realtime-2";
 
@@ -109,20 +109,20 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
   }
 
   return (
-    <div className="koe-settings-panel" role="region" aria-label="設定">
-      <div className="koe-settings-header">
-        <h2 className="koe-settings-title">設定</h2>
+    <div className="rhanis-settings-panel" role="region" aria-label="設定">
+      <div className="rhanis-settings-header">
+        <h2 className="rhanis-settings-title">設定</h2>
         <button
           type="button"
           onClick={onClose}
-          className="koe-btn koe-btn-icon"
+          className="rhanis-btn rhanis-btn-icon"
           aria-label="閉じる"
         >
           ✕
         </button>
       </div>
 
-      <section className="koe-settings-section">
+      <section className="rhanis-settings-section">
         <h3>声のプロバイダ</h3>
         <VoiceProviderSelector value={voiceModel} onChange={(v) => void handleVoiceChange(v)} />
         <ApiKeyInput
@@ -133,15 +133,15 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
         />
       </section>
 
-      <section className="koe-settings-section">
+      <section className="rhanis-settings-section">
         <h3>手足ツール（API キー）</h3>
-        <p id={TOOL_KEYS_HINT_ID} className="koe-settings-hint">
-          これらのキーは保存されますが、AI が裏で実際に使う機能は順次追加します（koe-eal）。
+        <p id={TOOL_KEYS_HINT_ID} className="rhanis-settings-hint">
+          これらのキーは保存されますが、AI が裏で実際に使う機能は順次追加します（rhanis-eal）。
         </p>
         {TOOL_KEYS.map(({ provider, label, placeholder }) => {
           const keyStored = toolHasKey[provider] ?? false;
           return (
-            <div key={provider} className="koe-tool-key-row">
+            <div key={provider} className="rhanis-tool-key-row">
               <ApiKeyInput
                 provider={provider}
                 label={label}
@@ -151,13 +151,13 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                 onDelete={() => deleteToolProviderKey(provider)}
                 describedById={TOOL_KEYS_HINT_ID}
               />
-              <label className="koe-tool-enable">
+              <label className="rhanis-tool-enable">
                 <input
                   type="checkbox"
                   checked={toolFlags[provider] ?? false}
                   // Can't enable a tool with no stored credential — enabling a
                   // key-less provider would leave a flag a future consumer
-                  // (koe-eal) trusts with nothing behind it.
+                  // (rhanis-eal) trusts with nothing behind it.
                   disabled={!keyStored}
                   onChange={(e) => void handleToolToggle(provider, e.target.checked)}
                   aria-describedby={TOOL_KEYS_HINT_ID}
@@ -170,24 +170,24 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
       </section>
 
       {actionError && (
-        <p role="alert" className="koe-settings-error">
+        <p role="alert" className="rhanis-settings-error">
           {actionError}
         </p>
       )}
 
-      <section className="koe-settings-section">
+      <section className="rhanis-settings-section">
         <h3>許可ポリシー（フォルダ / URL）</h3>
-        <p className="koe-settings-hint">
+        <p className="rhanis-settings-hint">
           AI が自動で触ってよい場所・サイト（許可）と、必ず確認させる場所（禁止）を決めます。優先順位は
           「禁止 &gt; 許可 &gt; 既定」で、SSH 鍵や認証情報などは設定に関係なく常に保護されます。
         </p>
         <PermissionPolicyEditor />
       </section>
 
-      <section className="koe-settings-section">
+      <section className="rhanis-settings-section">
         <h3>月次予算</h3>
 
-        <label className="koe-budget-option">
+        <label className="rhanis-budget-option">
           <input
             type="checkbox"
             checked={budgetEnabled}
@@ -198,10 +198,10 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
         </label>
 
         {budgetEnabled && (
-          <div className="koe-budget-amount">
-            <label htmlFor="koe-settings-budget-input">月額上限（USD）</label>
+          <div className="rhanis-budget-amount">
+            <label htmlFor="rhanis-settings-budget-input">月額上限（USD）</label>
             <input
-              id="koe-settings-budget-input"
+              id="rhanis-settings-budget-input"
               type="number"
               min="0.01"
               max="1000000"
@@ -209,13 +209,13 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
               value={newLimitStr}
               onChange={(e) => setNewLimitStr(e.target.value)}
               disabled={savingBudget}
-              className="koe-input"
+              className="rhanis-input"
             />
           </div>
         )}
 
         {budgetError && (
-          <p role="alert" className="koe-settings-error">
+          <p role="alert" className="rhanis-settings-error">
             {budgetError}
           </p>
         )}
@@ -224,7 +224,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
           type="button"
           onClick={() => void handleSaveBudget()}
           disabled={savingBudget}
-          className="koe-btn koe-btn-primary"
+          className="rhanis-btn rhanis-btn-primary"
         >
           {savingBudget ? "保存中…" : "予算を保存"}
         </button>

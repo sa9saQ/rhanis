@@ -1,6 +1,6 @@
 // Dev-only panel that synthesizes backend events, so the operator console can
-// be exercised on Windows before the Rust tool_dispatcher (koe-2gy) and
-// approval_gate (koe-1vi) exist. Render it only behind `import.meta.env.DEV`.
+// be exercised on Windows before the Rust tool_dispatcher (rhanis-2gy) and
+// approval_gate (rhanis-1vi) exist. Render it only behind `import.meta.env.DEV`.
 
 import { useActivityStore } from "./activityStore";
 import type { ApprovalRisk, SessionConnState } from "./types";
@@ -48,7 +48,7 @@ function emitMockToolRun(): void {
 }
 
 /**
- * Demonstrates the glass-box M1 disclosure (koe-sua.1): a thinking-event is
+ * Demonstrates the glass-box M1 disclosure (rhanis-sua.1): a thinking-event is
  * pushed FIRST, then ~400ms later (inside the 300–700ms thinking window) the
  * tool goes live — mirroring the backend's "disclose before you act" ordering so
  * the operator console can be exercised on Windows before a live session exists.
@@ -117,8 +117,8 @@ function setStatus(state: SessionConnState): void {
 
 export function DevMockEmitter() {
   return (
-    <div className="koe-devmock" aria-label="開発用モック">
-      <span className="koe-devmock-label">dev mock</span>
+    <div className="rhanis-devmock" aria-label="開発用モック">
+      <span className="rhanis-devmock-label">dev mock</span>
       <button type="button" onClick={emitMockToolRun}>
         tool 実行
       </button>

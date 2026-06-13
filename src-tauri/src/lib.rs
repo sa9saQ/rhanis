@@ -40,14 +40,14 @@ use storage::{
 use tool_dispatcher::{AppDispatchIo, RealToolDispatcher, ToolRegistry};
 
 /// Keychain identifiers for the Stronghold snapshot decryption key.
-const KEYCHAIN_SERVICE: &str = "com.zsaku.koe";
+const KEYCHAIN_SERVICE: &str = "com.zsaku.Rhanis";
 const KEYCHAIN_SNAPSHOT_ACCOUNT: &str = "stronghold-snapshot-key";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        // Dialog plugin (koe-351): registered so the Rust side can open a native
+        // Dialog plugin (rhanis-351): registered so the Rust side can open a native
         // folder picker for the permission-policy editor. Reached ONLY through our
         // own `pick_folder` command (below) — the WebView is NOT granted any
         // `dialog:*` capability, so it gains no direct dialog command surface (same
@@ -62,7 +62,7 @@ pub fn run() {
             // is held in the OS keychain (never on disk in plain).
             let data_dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            let snapshot_path = data_dir.join("koe-secrets.stronghold");
+            let snapshot_path = data_dir.join("rhanis-secrets.stronghold");
 
             let password = Box::new(KeychainPassword::new(
                 KEYCHAIN_SERVICE,
@@ -71,17 +71,17 @@ pub fn run() {
             let store = StrongholdSecretStore::new(snapshot_path, password);
             app.manage(ManagedSecretStore(Arc::new(store)));
 
-            // Recorder storage (koe-nnk): notes / conversation log / cost
+            // Recorder storage (rhanis-nnk): notes / conversation log / cost
             // snapshots in a Rust-owned SQLite DB beside the secret snapshot.
-            // No WebView SQL surface; consumers (write_note tool koe-s7i,
-            // session_manager koe-e3m) reach it via tauri::State<ManagedRecorder>.
+            // No WebView SQL surface; consumers (write_note tool rhanis-s7i,
+            // session_manager rhanis-e3m) reach it via tauri::State<ManagedRecorder>.
             let recorder: Arc<dyn RecorderAdapter> =
-                Arc::new(SqliteAdapter::open(&data_dir.join("koe.db"))?);
+                Arc::new(SqliteAdapter::open(&data_dir.join("rhanis.db"))?);
             app.manage(ManagedRecorder(Arc::clone(&recorder)));
 
-            // Approval gate (koe-1vi). One process-wide activity-event sequence
+            // Approval gate (rhanis-1vi). One process-wide activity-event sequence
             // is shared between the gate (ApprovalRequest.sequence) and the
-            // future tool_dispatcher (koe-2gy, ToolEvent.sequence) — koe-2gy
+            // future tool_dispatcher (rhanis-2gy, ToolEvent.sequence) — rhanis-2gy
             // obtains it via tauri::State<ManagedSequenceCounter>, not by
             // importing the gate, so the two never grow divergent counters.
             let sequence = Arc::new(SequenceCounter::new());
@@ -94,19 +94,19 @@ pub fn run() {
             let gate = Arc::new(ApprovalGate::new(Arc::clone(&sequence)));
             app.manage(ManagedApprovalGate(Arc::clone(&gate)));
 
-            // Settings persistence (koe-200 + koe-351): onboarding flag + budget +
+            // Settings persistence (rhanis-200 + rhanis-351): onboarding flag + budget +
             // recorder + voice/tool selections + permission policy. Rust-owned
             // JSON; no WebView file surface. Built BEFORE the dispatcher so the
             // permission-policy provider can share the SAME store Arc (so a policy
             // edit via `set_permission_policy` is seen by the next dispatch).
-            let settings_path = data_dir.join("koe-settings.json");
+            let settings_path = data_dir.join("rhanis-settings.json");
             let settings_store: Arc<dyn SettingsStore> =
                 Arc::new(JsonSettingsStore::new(settings_path));
             app.manage(ManagedSettings::new(Arc::clone(&settings_store)));
 
-            // Tool dispatcher (koe-2gy). Shares the one gate + sequence, emits
+            // Tool dispatcher (rhanis-2gy). Shares the one gate + sequence, emits
             // tool-events via the real AppHandle, and composes the user permission
-            // policy (koe-351) read from the shared settings store on each dispatch.
+            // policy (rhanis-351) read from the shared settings store on each dispatch.
             let io = Arc::new(AppDispatchIo::new(app.handle().clone(), Arc::clone(&gate)));
             let mut registry = ToolRegistry::new();
             tools::register_m1_tools(&mut registry, Arc::clone(&recorder));
@@ -115,11 +115,11 @@ pub fn run() {
                 RealToolDispatcher::new(io, Arc::clone(&sequence), Arc::new(registry), policy);
             app.manage(ManagedDispatcher(Arc::new(dispatcher)));
 
-            // Realtime session (koe-e3m): the RealToolDispatcher managed above
-            // (koe-2gy) is read by session_manager via tauri::State<ManagedDispatcher>.
+            // Realtime session (rhanis-e3m): the RealToolDispatcher managed above
+            // (rhanis-2gy) is read by session_manager via tauri::State<ManagedDispatcher>.
             app.manage(ManagedSession::new());
 
-            // Audio bridge (koe-flu): cpal mic capture + rodio playback.
+            // Audio bridge (rhanis-flu): cpal mic capture + rodio playback.
             // Start/stop is driven by session_manager (start_session / stop_session)
             // via tauri::State<ManagedAudioBridge>. The bridge is idle until a
             // session begins; device open happens inside start_session.
@@ -153,7 +153,7 @@ pub fn run() {
 }
 
 /// Opens the OS native folder picker and returns the chosen absolute path (or
-/// `None` if the user cancelled). koe-351: the permission-policy editor calls
+/// `None` if the user cancelled). rhanis-351: the permission-policy editor calls
 /// this via `invoke("pick_folder")`. The dialog runs entirely Rust-side (the
 /// WebView has no `dialog:*` capability); only the resulting path string crosses
 /// the IPC boundary. A non-filesystem result (should not happen for a folder) is

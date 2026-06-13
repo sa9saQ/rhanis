@@ -1,11 +1,11 @@
-//! `web_search` tool (koe-s7i).
+//! `web_search` tool (rhanis-s7i).
 //!
 //! A SAFE tool: takes `{ "query": "…" }`, calls a search API, and returns a
 //! compact list of result titles + snippets + URLs to the model.
 //!
-//! # Provider status (follow-up required: koe-8fw)
+//! # Provider status (follow-up required: rhanis-8fw)
 //! The concrete search provider (Bing Web Search v7 was retired 2025-08 along
-//! with the Bing Search API v7) must be chosen in koe-8fw. The `BingProvider`
+//! with the Bing Search API v7) must be chosen in rhanis-8fw. The `BingProvider`
 //! implementation below is a placeholder that builds and compiles but will
 //! receive a 404 / auth error at runtime until the endpoint and key are updated.
 //! Because of this, `register_m1_tools` (in `tools/mod.rs`) does NOT advertise
@@ -28,9 +28,9 @@
 //!
 //! # M1 key status
 //! M1 has no user-facing key input surface (`BING_API_KEY` env var is the
-//! development path). A settings-UI entry is tracked under koe-351. Until that
+//! development path). A settings-UI entry is tracked under rhanis-351. Until that
 //! lands, production can either inject the key at build time via an env var or
-//! the feature degrades to a clean error. The provider trait seam allows koe-351
+//! the feature degrades to a clean error. The provider trait seam allows rhanis-351
 //! to swap in the key without changing this file.
 //!
 //! # Testing without a real network
@@ -39,16 +39,16 @@
 //!
 //! transaction N/A · idempotency_key N/A (stateless read, not billing).
 //!
-//! # Dead-code allowance (koe-8fw)
+//! # Dead-code allowance (rhanis-8fw)
 //! `configured_search_provider()` (in `tools/mod.rs`) no longer wires
 //! `BingProvider` into the ship path — the Bing Web Search v7 endpoint was
 //! retired 2025-08, so registering it would advertise a dead tool. The provider
 //! type, its constructor, `from_env()`, the response structs, the body-cap
-//! helper, and the request constants are intentionally KEPT here for koe-8fw to
+//! helper, and the request constants are intentionally KEPT here for rhanis-8fw to
 //! reuse once a working endpoint is wired (the task is to swap the endpoint, not
 //! rewrite the tool). Because they are not called on the ship path, the compiler
 //! flags them as dead code; this module-scoped allow silences those expected
-//! warnings. koe-8fw will re-wire the provider and remove this attribute.
+//! warnings. rhanis-8fw will re-wire the provider and remove this attribute.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -145,7 +145,7 @@ impl BingProvider {
 
     /// Returns a `BingProvider` configured from the `BING_API_KEY` environment
     /// variable, or `None` if the variable is absent or empty (M1 development
-    /// path; koe-351 replaces with Stronghold key retrieval).
+    /// path; rhanis-351 replaces with Stronghold key retrieval).
     pub fn from_env() -> Option<Self> {
         let key = std::env::var("BING_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
         Self::new(key).ok()
@@ -507,9 +507,9 @@ mod tests {
         assert!(BingProvider::new("fake-key-for-test").is_ok());
     }
 
-    // ---- BingProvider::from_env (koe-8fw seam, NOT wired into the ship path) --
+    // ---- BingProvider::from_env (rhanis-8fw seam, NOT wired into the ship path) --
     //
-    // `from_env()` is intentionally kept in the codebase for koe-8fw to reuse,
+    // `from_env()` is intentionally kept in the codebase for rhanis-8fw to reuse,
     // but `configured_search_provider()` (tools/mod.rs) no longer calls it on the
     // ship path — the Bing v7 endpoint is retired, so wiring it would re-advertise
     // a dead tool. This test documents + locks `from_env`'s contract: present &

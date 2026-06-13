@@ -1,9 +1,9 @@
-// Live monthly-cost header (koe-9xi). Shows "今月: $X.XX / 上限 $Y.YY" (or 上限なし
+// Live monthly-cost header (rhanis-9xi). Shows "今月: $X.XX / 上限 $Y.YY" (or 上限なし
 // when the budget is disabled), folding the costStore snapshot that arrives via
 // pull (get_cost_snapshot) + push (cost-update). When the backend reports
 // over_budget it renders a stop notice + an inline "raise the cap" recovery form.
 //
-// Invariant (koe-9xi): `over_budget` is decided in Rust (u64). This component only
+// Invariant (rhanis-9xi): `over_budget` is decided in Rust (u64). This component only
 // DISPLAYS the backend's bool + the f64 USD fields — it never recomputes the
 // over-budget state. FAIL-CLOSED display: on a load failure with no snapshot it
 // shows an explicit "取得できません", never a fabricated $0.
@@ -72,7 +72,7 @@ export function CostHeader() {
   // quiet placeholder while the first pull is in flight.
   if (!snapshot) {
     return (
-      <span className="koe-cost koe-cost-unknown">
+      <span className="rhanis-cost rhanis-cost-unknown">
         {loadError ? "今月: 取得できません" : "今月: …"}
       </span>
     );
@@ -84,18 +84,18 @@ export function CostHeader() {
       : " / 上限なし";
 
   return (
-    <div className="koe-cost">
-      <span className="koe-cost-line">{`今月: ${usd(snapshot.used_usd)}${capLabel}`}</span>
+    <div className="rhanis-cost">
+      <span className="rhanis-cost-line">{`今月: ${usd(snapshot.used_usd)}${capLabel}`}</span>
 
       {snapshot.over_budget && (
-        <div className="koe-cost-overbudget">
-          <p className="koe-cost-stop" role="alert">
+        <div className="rhanis-cost-overbudget">
+          <p className="rhanis-cost-stop" role="alert">
             予算上限に達したため会話を停止しました。続けるには上限を引き上げてください。
           </p>
-          <form className="koe-cost-raise" onSubmit={(e) => void handleRaise(e)}>
-            <label htmlFor="koe-raise-limit">新しい月額上限（USD）</label>
+          <form className="rhanis-cost-raise" onSubmit={(e) => void handleRaise(e)}>
+            <label htmlFor="rhanis-raise-limit">新しい月額上限（USD）</label>
             <input
-              id="koe-raise-limit"
+              id="rhanis-raise-limit"
               type="number"
               min="0.01"
               max="1000000"
@@ -103,14 +103,14 @@ export function CostHeader() {
               value={limitStr}
               onChange={(e) => setLimitStr(e.target.value)}
               disabled={busy}
-              className="koe-cost-input"
+              className="rhanis-cost-input"
             />
-            <button type="submit" disabled={busy} className="koe-cost-raise-btn">
+            <button type="submit" disabled={busy} className="rhanis-cost-raise-btn">
               {busy ? "保存中…" : "上限を引き上げる"}
             </button>
           </form>
           {raiseError && (
-            <p className="koe-cost-error" role="alert">
+            <p className="rhanis-cost-error" role="alert">
               {raiseError}
             </p>
           )}

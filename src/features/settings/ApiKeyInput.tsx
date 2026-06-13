@@ -57,7 +57,7 @@ export function ApiKeyInput({
   const inFlightSave = useRef(false);
   const inFlightDelete = useRef(false);
   // Unique per provider so multiple inputs on the same panel don't collide on id.
-  const fieldId = `koe-api-key-field-${provider}`;
+  const fieldId = `rhanis-api-key-field-${provider}`;
 
   async function handleSave() {
     if (inFlightSave.current || !value.trim()) return;
@@ -117,18 +117,18 @@ export function ApiKeyInput({
   }
 
   return (
-    <div className="koe-api-key-input">
-      <label htmlFor={fieldId} className="koe-label">
+    <div className="rhanis-api-key-input">
+      <label htmlFor={fieldId} className="rhanis-label">
         {label}
       </label>
 
       {hasKey && (
-        <p className="koe-api-key-status">
+        <p className="rhanis-api-key-status">
           ✓ APIキーが保存されています
         </p>
       )}
 
-      <div className="koe-api-key-row">
+      <div className="rhanis-api-key-row">
         <input
           id={fieldId}
           type={show ? "text" : "password"}
@@ -138,31 +138,31 @@ export function ApiKeyInput({
           autoComplete="off"
           disabled={saving}
           aria-describedby={describedById}
-          className="koe-input"
+          className="rhanis-input"
         />
         <button
           type="button"
           onClick={() => setShow((v) => !v)}
           aria-label={show ? "非表示" : "表示"}
           disabled={saving}
-          className="koe-btn koe-btn-icon"
+          className="rhanis-btn rhanis-btn-icon"
         >
           {show ? "非表示" : "表示"}
         </button>
       </div>
 
       {error && (
-        <p className="koe-api-key-error" role="alert">
+        <p className="rhanis-api-key-error" role="alert">
           {error}
         </p>
       )}
 
-      <div className="koe-api-key-actions">
+      <div className="rhanis-api-key-actions">
         <button
           type="button"
           onClick={() => void handleSave()}
           disabled={saving || !value.trim()}
-          className="koe-btn koe-btn-primary"
+          className="rhanis-btn rhanis-btn-primary"
         >
           {saving ? "保存中…" : "保存"}
         </button>
@@ -172,7 +172,7 @@ export function ApiKeyInput({
             type="button"
             onClick={() => void handleDelete()}
             disabled={deleting}
-            className="koe-btn koe-btn-danger"
+            className="rhanis-btn rhanis-btn-danger"
             aria-label="削除"
           >
             {deleting ? "削除中…" : "削除"}

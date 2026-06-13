@@ -1,6 +1,6 @@
 /* DANGER/CAUTION approval — deliberately interruptive, distinct radius/motion. */
 
-.koe-approval-backdrop {
+.rhanis-approval-backdrop {
   position: fixed;
   inset: 0;
   background: color-mix(in srgb, #0a0c0f 72%, transparent);
@@ -10,10 +10,10 @@
   justify-content: center;
   padding: 24px;
   z-index: 50;
-  animation: koe-fade var(--dur-enter) var(--ease-decel);
+  animation: rhanis-fade var(--dur-enter) var(--ease-decel);
 }
 
-.koe-approval-card {
+.rhanis-approval-card {
   width: min(440px, 100%);
   background: var(--panel);
   border: 1px solid var(--border);
@@ -21,18 +21,18 @@
   border-radius: 18px;
   padding: 22px 22px 18px;
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
-  animation: koe-pop var(--dur-enter) var(--ease-spring);
+  animation: rhanis-pop var(--dur-enter) var(--ease-spring);
 }
-.koe-approval-card.koe-risk-danger {
+.rhanis-approval-card.rhanis-risk-danger {
   border-top-color: var(--tone-error);
 }
 
-.koe-approval-top {
+.rhanis-approval-top {
   display: flex;
   align-items: center;
   gap: 10px;
 }
-.koe-risk-tag {
+.rhanis-risk-tag {
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 700;
@@ -42,17 +42,17 @@
   color: var(--on-warn);
   background: var(--tone-connecting);
 }
-.koe-risk-danger .koe-risk-tag {
+.rhanis-risk-danger .rhanis-risk-tag {
   background: var(--tone-error);
   /* --on-danger replaces the old #fff, which was ~2.4:1 on #f0706a (below AA). */
   color: var(--on-danger);
 }
-.koe-approval-tool {
+.rhanis-approval-tool {
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--accent);
 }
-.koe-approval-countdown {
+.rhanis-approval-countdown {
   margin-left: auto;
   font-family: var(--font-mono);
   font-size: 12px;
@@ -60,22 +60,22 @@
   font-variant-numeric: tabular-nums;
 }
 
-.koe-approval-summary {
+.rhanis-approval-summary {
   margin: 16px 0 20px;
   font-size: 15px;
   line-height: 1.55;
   color: var(--text);
 }
 
-/* The summary is model-influenced data (a target descriptor, koe-whf): render
+/* The summary is model-influenced data (a target descriptor, rhanis-whf): render
    it as code so persuasive text inside a filename cannot pass as UI chrome. */
-.koe-approval-summary code {
+.rhanis-approval-summary code {
   font-family: var(--font-mono);
   font-size: 13.5px;
   overflow-wrap: anywhere;
 }
 
-.koe-approval-error {
+.rhanis-approval-error {
   margin: 0 0 14px;
   font-size: 13px;
   color: var(--tone-error);
@@ -85,38 +85,38 @@
   border-radius: 6px;
 }
 
-.koe-approval-actions {
+.rhanis-approval-actions {
   display: flex;
   gap: 10px;
   justify-content: flex-end;
 }
-/* The shared `.koe-btn` base (+ :disabled + reduced-motion) now lives in the
+/* The shared `.rhanis-btn` base (+ :disabled + reduced-motion) now lives in the
    always-loaded base layer (App.css). This file keeps only the modal's button
    VARIANTS. */
-.koe-btn-deny {
+.rhanis-btn-deny {
   background: var(--panel-2);
   color: var(--text);
 }
-.koe-btn-deny:hover:not(:disabled) {
+.rhanis-btn-deny:hover:not(:disabled) {
   background: var(--border);
 }
-.koe-btn-approve {
+.rhanis-btn-approve {
   background: var(--accent);
   color: var(--on-accent);
   border-color: transparent;
 }
-.koe-btn-approve:hover:not(:disabled) {
+.rhanis-btn-approve:hover:not(:disabled) {
   transform: translateY(-1px);
 }
 
-.koe-approval-more {
+.rhanis-approval-more {
   margin: 14px 0 0;
   font-size: 12px;
   color: var(--muted);
   text-align: right;
 }
 
-@keyframes koe-fade {
+@keyframes rhanis-fade {
   from {
     opacity: 0;
   }
@@ -124,7 +124,7 @@
     opacity: 1;
   }
 }
-@keyframes koe-pop {
+@keyframes rhanis-pop {
   from {
     opacity: 0;
     transform: scale(0.96) translateY(8px);
@@ -136,9 +136,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .koe-approval-backdrop,
-  .koe-approval-card {
+  .rhanis-approval-backdrop,
+  .rhanis-approval-card {
     animation: none;
   }
-  /* `.koe-btn` reduced-motion is handled in the base layer (App.css). */
+  /* `.rhanis-btn` reduced-motion is handled in the base layer (App.css). */
 }

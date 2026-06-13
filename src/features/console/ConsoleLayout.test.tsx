@@ -1,4 +1,4 @@
-// TDD tests for ConsoleLayout (koe-ios.1) — the glass-box console skeleton:
+// TDD tests for ConsoleLayout (rhanis-ios.1) — the glass-box console skeleton:
 // collapsible left sidebar (brand / planned destinations / cost + settings at
 // the bottom) and the right main column (status-aware greeting → live activity
 // panel → voice orb). Brief: docs/design/2026-06-10-glassbox-console-design-brief.md
@@ -101,7 +101,7 @@ describe("ConsoleLayout — shell", () => {
 
     const sidebar = screen.getByRole("complementary", { name: "サイドバー" });
     expect(sidebar).toBeInTheDocument();
-    expect(screen.getByText("koe")).toBeInTheDocument();
+    expect(screen.getByText("Rhanis")).toBeInTheDocument();
 
     // 新しい会話 works today: a real button, enabled while idle.
     expect(

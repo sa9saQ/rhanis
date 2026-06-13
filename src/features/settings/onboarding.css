@@ -1,21 +1,21 @@
-/* First-run onboarding layout (koe-iyr).
+/* First-run onboarding layout (rhanis-iyr).
  *
  * The onboarding wizard is the user's very first impression, so its layout
  * classes are defined HERE and loaded directly by OnboardingGate — not left to
  * whichever feature stylesheet happens to be in the boot bundle. The shared form
- * vocabulary (.koe-input / .koe-btn* / .koe-budget-option / .koe-budget-amount /
- * .koe-label / .koe-api-key-*) comes from settings.css, which OnboardingGate also
- * imports; the `.koe-btn` base comes from App.css.
+ * vocabulary (.rhanis-input / .rhanis-btn* / .rhanis-budget-option / .rhanis-budget-amount /
+ * .rhanis-label / .rhanis-api-key-*) comes from settings.css, which OnboardingGate also
+ * imports; the `.rhanis-btn` base comes from App.css.
  *
  * Palette: the app's "control desk" tokens (App.css), which follow the OS
- * light/dark scheme (koe-ios.1) — the wizard always matches the running app. */
+ * light/dark scheme (rhanis-ios.1) — the wizard always matches the running app. */
 
 /* Full-viewport centered stage — shared by the wizard and the gate's loading /
- * error states. The radial wash mirrors the console shell (`.koe-shell`) so the
+ * error states. The radial wash mirrors the console shell (`.rhanis-shell`) so the
  * first paint already feels like the app. */
-.koe-onboarding-wizard,
-.koe-onboarding-gate-loading,
-.koe-onboarding-gate-error {
+.rhanis-onboarding-wizard,
+.rhanis-onboarding-gate-loading,
+.rhanis-onboarding-gate-error {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
@@ -28,11 +28,11 @@
 }
 
 /* The wizard breathes a little more between its heading and the active step. */
-.koe-onboarding-wizard {
+.rhanis-onboarding-wizard {
   gap: 24px;
 }
 
-.koe-onboarding-heading {
+.rhanis-onboarding-heading {
   margin: 0;
   font-size: clamp(1.6rem, 3vw, 2.1rem);
   font-weight: 650;
@@ -44,8 +44,8 @@
 /* Step containers — a bounded dark card so the form never sprawls on a wide
  * window. Radius 16px is deliberately distinct from the approval card (18px) and
  * the settings card (14px) — anti-AI-smell varied radii. */
-.koe-budget-onboarding,
-.koe-onboarding-apikey-step {
+.rhanis-budget-onboarding,
+.rhanis-onboarding-apikey-step {
   width: min(440px, 100%);
   display: flex;
   flex-direction: column;
@@ -57,14 +57,14 @@
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
 }
 
-/* Step heading + lede (used by both steps via koe-onboarding-title/-desc). */
-.koe-onboarding-title {
+/* Step heading + lede (used by both steps via rhanis-onboarding-title/-desc). */
+.rhanis-onboarding-title {
   margin: 0;
   font-size: 1.25rem;
   font-weight: 600;
   color: var(--text);
 }
-.koe-onboarding-desc {
+.rhanis-onboarding-desc {
   margin: 0;
   font-size: 0.92rem;
   line-height: 1.6;
@@ -72,7 +72,7 @@
 }
 
 /* Radio group — strip the native fieldset chrome and stack the options. */
-.koe-budget-fieldset {
+.rhanis-budget-fieldset {
   margin: 0;
   padding: 0;
   border: 0;
@@ -84,7 +84,7 @@
 /* Finalize error inside the api-key step — the app's error-banner pattern
  * (tone-error text on a translucent wash + left rule; matches VoiceButton /
  * ApprovalModal). */
-.koe-onboarding-error {
+.rhanis-onboarding-error {
   margin: 0;
   font-size: 0.88rem;
   color: var(--tone-error);
@@ -95,8 +95,8 @@
 }
 
 /* The load-failure screen's message reads as an error; the retry below it is a
- * plain `.koe-btn`. */
-.koe-onboarding-gate-error p {
+ * plain `.rhanis-btn`. */
+.rhanis-onboarding-gate-error p {
   margin: 0;
   max-width: 32rem;
   text-align: center;

@@ -127,7 +127,7 @@ impl BudgetConfig {
     /// 渡せる。session_manager は usage 受信ごとに共有コストスナップショットを
     /// 読み戻してこの判定を行うため、stop→start handover で古いセッションが
     /// 遅延 usage を処理し続けても、新しいセッションが古い local baseline で
-    /// fail-open することを防ぐ（koe-ixt 機序4）。超過判定の単一の真実源であり、
+    /// fail-open することを防ぐ（rhanis-ixt 機序4）。超過判定の単一の真実源であり、
     /// [`CostTracker::is_over_budget`] はこれに委譲する。
     pub fn is_over(&self, total_nanodollars: u64) -> bool {
         self.enabled && total_nanodollars >= self.monthly_limit_nanodollars
@@ -160,9 +160,9 @@ pub struct CostTracker {
     pub current_month: u32,
     pub month_total_nanodollars: u64,
     /// Carry state for spend not yet durably persisted to the additive ledger after a
-    /// transient `add_month_cost` failure (koe-ixt). Held HERE — in the cross-session
+    /// transient `add_month_cost` failure (rhanis-ixt). Held HERE — in the cross-session
     /// `CostTracker` shared by every connection — rather than in `run_read_loop`'s
-    /// locals, so a WebSocket reconnect (koe-byf) does NOT drop the unpersisted spend:
+    /// locals, so a WebSocket reconnect (rhanis-byf) does NOT drop the unpersisted spend:
     /// dropping it would undercount the ledger across the reconnect = fail-open (the
     /// user could spend past their cap by the lost amount). The next usage frame (this
     /// or the next connection) retries the WHOLE carried amount and the budget gate
@@ -173,9 +173,9 @@ pub struct CostTracker {
     pub pending_month: u32,
     #[serde(default)]
     pub pending_nanodollars: u64,
-    /// Consecutive `add_month_cost` failures (koe-ixt fail-closed backstop). Also held
+    /// Consecutive `add_month_cost` failures (rhanis-ixt fail-closed backstop). Also held
     /// here so the "N failures → stop" guard survives reconnects rather than resetting
-    /// per connection (koe-byf).
+    /// per connection (rhanis-byf).
     #[serde(default)]
     pub save_failures: u32,
 }
@@ -218,7 +218,7 @@ impl CostTracker {
     /// 予算超過か。`enabled = false` なら常に false（無制限）。
     /// 上限ちょうどに達した時点で「超過」とみなす（fail-closed 寄り）。
     /// 判定本体は [`BudgetConfig::is_over`] に委譲する（session_manager が
-    /// 世代横断の永続合計で判定する経路と同一の述語を使うため、koe-ixt）。
+    /// 世代横断の永続合計で判定する経路と同一の述語を使うため、rhanis-ixt）。
     pub fn is_over_budget(&self) -> bool {
         self.config.is_over(self.month_total_nanodollars)
     }
@@ -242,7 +242,7 @@ impl CostTracker {
     }
 }
 
-/// ある時点の「今月の使用額 + 予算状態」を frontend に渡す単一の DTO（koe-9xi）。
+/// ある時点の「今月の使用額 + 予算状態」を frontend に渡す単一の DTO（rhanis-9xi）。
 ///
 /// pull（`get_cost_snapshot` コマンド、起動直後の確定値）と push（session_manager の
 /// `cost-update` emit、会話中のライブ更新）が **この同一コンストラクタ**で組むので、
@@ -255,7 +255,7 @@ impl CostTracker {
 ///   （判定は u64、表示のみ f64）。
 /// - `used_nanodollars` は **権威ある整数合計**（pull は `load_cost_snapshot` の値、
 ///   push は additive ledger の戻り値 = 世代横断合計）。session-local tracker の
-///   total を表示権威にしない（koe-ixt）。
+///   total を表示権威にしない（rhanis-ixt）。
 /// - payload は **数値と bool のみ**。API キー・パス・PII を一切含めない。
 /// - `sequence` は共有 [`crate::events::SequenceCounter`] から採番した単調増加値。
 ///   frontend (costStore) は `sequence` が小さい古い snapshot を捨てるので、古い
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn new_tracker_starts_with_empty_reconnect_carry() {
-        // koe-byf: the reconnect-survival carry (unpersisted spend + failure count) is
+        // rhanis-byf: the reconnect-survival carry (unpersisted spend + failure count) is
         // empty on a fresh tracker and is independent of the running total. Its
         // retry-whole-amount / month-scope / fail-closed LOGIC lives in
         // session_manager's handle_event (tested there); CostTracker only HOLDS this
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn budget_config_is_over_gates_on_arbitrary_total_fail_closed() {
-        // koe-ixt: the session loop gates the budget on the GLOBAL persisted total
+        // rhanis-ixt: the session loop gates the budget on the GLOBAL persisted total
         // (>= a single session's local total) read back from the shared cost
         // snapshot, so the predicate must accept an arbitrary total with the same
         // fail-closed semantics as is_over_budget.

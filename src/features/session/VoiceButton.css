@@ -1,4 +1,4 @@
-/* VoiceButton — the voice orb (koe-ios.1): the start/stop control for the
+/* VoiceButton — the voice orb (rhanis-ios.1): the start/stop control for the
  * Realtime session, shrunk from the 2026-06-09 immersive orb into a circular
  * state indicator (brief 2026-06-10: "orb は廃止でなく縮小"). The breathing
  * craft survives here: a slow halo pulse while idle, a fuller, faster pulse
@@ -9,7 +9,7 @@
  * uniform value). Ink on the solid accent fill uses --on-accent (AA-checked in
  * both palettes, App.css). */
 
-.koe-voice-button-wrap {
+.rhanis-voice-button-wrap {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -17,7 +17,7 @@
 }
 
 /* ── Base orb ── */
-.koe-voice-btn {
+.rhanis-voice-btn {
   display: inline-flex;
   flex-direction: column;
   align-items: center;
@@ -42,78 +42,78 @@
   user-select: none;
 }
 
-.koe-voice-btn:focus-visible {
+.rhanis-voice-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
 
-.koe-voice-btn:disabled {
+.rhanis-voice-btn:disabled {
   cursor: not-allowed;
   opacity: 0.6;
 }
 
-.koe-voice-btn:not(:disabled):active {
+.rhanis-voice-btn:not(:disabled):active {
   transform: scale(0.97);
 }
 
 /* ── Tone variants ── */
 
 /* idle — neutral, low saturation, slow breathing halo: invites action. */
-.koe-voice-tone-idle {
+.rhanis-voice-tone-idle {
   background: var(--panel-2);
   border-color: var(--border);
   color: var(--text);
-  animation: koe-orb-breathe 4.6s var(--ease-standard) infinite;
+  animation: rhanis-orb-breathe 4.6s var(--ease-standard) infinite;
 }
-.koe-voice-tone-idle:not(:disabled):hover {
+.rhanis-voice-tone-idle:not(:disabled):hover {
   border-color: var(--accent);
   color: var(--accent);
 }
 
 /* loading / reconnecting — muted, spinner carries the motion (no halo). */
-.koe-voice-tone-loading {
+.rhanis-voice-tone-loading {
   background: var(--panel-2);
   border-color: var(--border);
   color: var(--muted);
 }
 
 /* connected — solid accent at full saturation, livelier pulse. */
-.koe-voice-tone-connected {
+.rhanis-voice-tone-connected {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--on-accent);
-  animation: koe-orb-live 2.4s var(--ease-standard) infinite;
+  animation: rhanis-orb-live 2.4s var(--ease-standard) infinite;
 }
-.koe-voice-tone-connected:not(:disabled):hover {
+.rhanis-voice-tone-connected:not(:disabled):hover {
   /* Mixing toward --text raises contrast against --on-accent in BOTH palettes
      (lightens the fill on dark, darkens it on light). */
   background: color-mix(in srgb, var(--accent) 85%, var(--text));
 }
 
 /* error — danger ring, invites retry. */
-.koe-voice-tone-error {
+.rhanis-voice-tone-error {
   background: var(--panel-2);
   border-color: var(--tone-error);
   color: var(--tone-error);
 }
-.koe-voice-tone-error:not(:disabled):hover {
+.rhanis-voice-tone-error:not(:disabled):hover {
   background: color-mix(in srgb, var(--tone-error) 12%, transparent);
 }
 
 /* ── Spinner (loading / reconnecting) ── */
-.koe-voice-spinner {
+.rhanis-voice-spinner {
   display: inline-block;
   width: 16px;
   height: 16px;
   border-radius: 999px;
   border: 2px solid color-mix(in srgb, var(--muted) 30%, transparent);
   border-top-color: var(--muted);
-  animation: koe-voice-spin 0.7s linear infinite;
+  animation: rhanis-voice-spin 0.7s linear infinite;
   flex: none;
 }
 
 /* ── Error message ── */
-.koe-voice-error {
+.rhanis-voice-error {
   margin: 0;
   font-size: 13px;
   color: var(--tone-error);
@@ -126,14 +126,14 @@
 }
 
 /* ── Animations ── */
-@keyframes koe-voice-spin {
+@keyframes rhanis-voice-spin {
   to {
     transform: rotate(360deg);
   }
 }
 
 /* Breathing halo (idle): a soft ring exhaled from the rim. */
-@keyframes koe-orb-breathe {
+@keyframes rhanis-orb-breathe {
   0%,
   100% {
     box-shadow: 0 0 0 0 color-mix(in srgb, var(--tone-idle) 35%, transparent);
@@ -144,7 +144,7 @@
 }
 
 /* Live pulse (connected): fuller, faster ring in the accent. */
-@keyframes koe-orb-live {
+@keyframes rhanis-orb-live {
   0%,
   100% {
     box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent);
@@ -155,10 +155,10 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .koe-voice-spinner {
+  .rhanis-voice-spinner {
     animation: none;
   }
-  .koe-voice-btn {
+  .rhanis-voice-btn {
     transition: none;
     /* Halo pulses off; states stay readable through color + label + border. */
     animation: none;

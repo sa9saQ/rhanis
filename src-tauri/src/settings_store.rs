@@ -1,4 +1,4 @@
-//! App settings persistence — Rust-owned JSON at `app_local_data_dir/koe-settings.json`.
+//! App settings persistence — Rust-owned JSON at `app_local_data_dir/rhanis-settings.json`.
 //!
 //! # Design
 //! - Settings are stored as JSON in the per-user app data dir. No WebView SQL
@@ -12,7 +12,7 @@
 //!   then `fs::rename` over the target (atomic on the same filesystem). The fsync
 //!   makes the content power-cut durable on every OS; the rename gets a best-effort
 //!   parent-dir fsync on Linux/macOS — a Windows write-through durable rename is
-//!   tracked as koe-z2f. A `save_lock` serialises concurrent saves on the temp path.
+//!   tracked as rhanis-z2f. A `save_lock` serialises concurrent saves on the temp path.
 //!
 //! transaction N/A · idempotency_key N/A (local settings file, not billing)
 
@@ -35,7 +35,7 @@ use crate::secret_store::{
 // ---------------------------------------------------------------------------
 
 /// Persisted application settings. Serialised as JSON to
-/// `app_local_data_dir/koe-settings.json` via [`JsonSettingsStore`].
+/// `app_local_data_dir/rhanis-settings.json` via [`JsonSettingsStore`].
 ///
 /// Non-safety fields carry serde defaults (so a future-added field does not fail
 /// an older file), but [`budget`](AppSettings::budget) is **required** — it is a
@@ -47,7 +47,7 @@ pub struct AppSettings {
     /// Whether the user has completed first-run onboarding (budget choice +
     /// API key entry). The UI gate blocks the activity console until this is
     /// `true`. Backend enforcement is `session_manager`'s responsibility
-    /// (koe-e3m — deliberate seam, not skeleton). Defaults to `false`
+    /// (rhanis-e3m — deliberate seam, not skeleton). Defaults to `false`
     /// (fail-closed: a missing flag means "not onboarded").
     #[serde(default)]
     pub onboarding_completed: bool,
@@ -62,8 +62,8 @@ pub struct AppSettings {
     pub recorder_adapter: String,
 
     /// Selected voice provider/model as a single `"provider/model"` string
-    /// (e.g. `"openai/gpt-realtime-2"`). koe-31u only PERSISTS this; the actual
-    /// connection switch is koe-zv3 (which parses it). Non-safety metadata, so it
+    /// (e.g. `"openai/gpt-realtime-2"`). rhanis-31u only PERSISTS this; the actual
+    /// connection switch is rhanis-zv3 (which parses it). Non-safety metadata, so it
     /// carries a serde default — an older settings file migrates silently.
     #[serde(default = "default_voice_provider_model")]
     pub voice_provider_model: String,
@@ -75,7 +75,7 @@ pub struct AppSettings {
     #[serde(default)]
     pub tool_providers: ToolProviderFlags,
 
-    /// User permission policy (koe-351): folder/URL allow + deny lists layered on
+    /// User permission policy (rhanis-351): folder/URL allow + deny lists layered on
     /// top of the built-in risk gate. Absent → [`PermissionPolicy::default()`] (an
     /// empty policy that auto-approves NOTHING), so an older file migrates safely
     /// and a missing policy is fail-closed by construction — unlike `budget`, the
@@ -84,8 +84,8 @@ pub struct AppSettings {
     pub permission_policy: PermissionPolicy,
 }
 
-/// Per-provider enable flags for the 手足 (tool) keys (koe-31u). Keys live in the
-/// secret store; this only records "the user wants this tool active". koe-eal
+/// Per-provider enable flags for the 手足 (tool) keys (rhanis-31u). Keys live in the
+/// secret store; this only records "the user wants this tool active". rhanis-eal
 /// consumes these to decide which tools to register. Non-safety metadata, fully
 /// defaulted so an older file (without this object) loads as all-disabled.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -164,7 +164,7 @@ pub trait SettingsStore: Send + Sync {
 /// Persists settings as a JSON file at `path`. Saves write a `.tmp` sibling,
 /// `fsync` it, then `rename` over the target — an atomic swap on the same
 /// filesystem, so a **process** crash mid-save never leaves a partially-written
-/// live file (koe-6ee). The temp-file `fsync` makes the file **content** durable
+/// live file (rhanis-6ee). The temp-file `fsync` makes the file **content** durable
 /// across a power cut on every platform. On Linux/macOS the rename is additionally
 /// hardened by a best-effort parent-directory fsync (a durability upgrade whose
 /// error is ignored, not a fail-closed guarantee); on **Windows**
@@ -173,13 +173,13 @@ pub trait SettingsStore: Send + Sync {
 /// is NOT write-through — a power cut in the narrow window after `save` returns
 /// could revert to the prior settings. A Windows write-through durable rename
 /// (`MoveFileExW` + `MOVEFILE_WRITE_THROUGH`) needs Windows verification and is
-/// tracked as koe-z2f.
+/// tracked as rhanis-z2f.
 ///
 /// `save_lock` serialises `save` calls. The temp path is a fixed sibling, so two
 /// concurrent saves would otherwise interleave writes into it and a rename could
 /// publish a torn mix. [`ManagedSettings`] already serialises compound
 /// load-modify-save sequences, but this lock also covers any direct `save` call.
-/// The lock is **per-process** (per store instance): koe runs as a single desktop
+/// The lock is **per-process** (per store instance): Rhanis runs as a single desktop
 /// instance with a single-writer settings UI, so a second concurrent process is
 /// out of scope here — unlike the cost ledger, which guards money and therefore
 /// uses cross-process SQLite atomics.
@@ -247,7 +247,7 @@ impl SettingsStore for JsonSettingsStore {
         // directory can be opened read-only and fsync'd); on Windows a directory
         // cannot be opened as a File, so File::open returns Err and this is a no-op
         // — there the rename is consistent (NTFS journaling) but not write-through;
-        // a Windows write-through durable rename is tracked as koe-z2f. The error is
+        // a Windows write-through durable rename is tracked as rhanis-z2f. The error is
         // intentionally ignored: this is a durability *upgrade* on top of the
         // already-durable temp-file fsync, never a reason to fail a save.
         if let Some(p) = parent {
@@ -329,7 +329,7 @@ impl ManagedSettings {
 }
 
 /// Bridges the settings store to the tool dispatcher's [`PolicyProvider`] seam
-/// (koe-351). Reads the policy from the store on EACH dispatch so a UI edit takes
+/// (rhanis-351). Reads the policy from the store on EACH dispatch so a UI edit takes
 /// effect immediately. A load failure (corrupt/unreadable) maps to
 /// [`PolicyState::Unavailable`] — NOT an empty policy — so a transient failure
 /// cannot silently drop the user's deny list (the dispatcher then forces a human
@@ -364,7 +364,7 @@ pub async fn get_app_settings(
 /// - A BYOK key must already be stored (`has_api_key`) — onboarding is only
 ///   "complete" with a key, so neither the UI flow nor a direct IPC call can
 ///   leave the console reachable keyless. (Deleting the key *after* onboarding
-///   is handled by the session-start gate in koe-e3m.)
+///   is handled by the session-start gate in rhanis-e3m.)
 /// - `recorder_adapter` must be `"sqlite"` (M1 only).
 /// - If `enabled`, `monthly_limit_usd` must be `Some`, `> 0`, and `<= 1_000_000`.
 /// - If `!enabled` (explicit unlimited), the limit is stored as `0`.
@@ -433,8 +433,8 @@ pub async fn set_recorder_adapter(
     })
 }
 
-/// Sets the selected voice provider/model (koe-31u). PERSISTS only — the actual
-/// connection switch is koe-zv3. Validated against the known set so a direct IPC
+/// Sets the selected voice provider/model (rhanis-31u). PERSISTS only — the actual
+/// connection switch is rhanis-zv3. Validated against the known set so a direct IPC
 /// call cannot store an unsupported value (fail-closed). Preserves other fields.
 #[tauri::command]
 pub async fn set_voice_provider(
@@ -448,7 +448,7 @@ pub async fn set_voice_provider(
     })
 }
 
-/// Enables/disables a 手足 (tool) provider (koe-31u). Records intent only — the
+/// Enables/disables a 手足 (tool) provider (rhanis-31u). Records intent only — the
 /// key itself is managed via the secret-store commands. Unknown providers are
 /// rejected (fixed error, fail-closed). Flips only the targeted flag.
 #[tauri::command]
@@ -463,7 +463,7 @@ pub async fn set_tool_provider_enabled(
     // Backend invariant: a tool can only be enabled while its key is actually
     // stored. Don't trust the UI's disabled checkbox — a direct or stale WebView
     // call must not persist a credential-less "enabled" provider for the future
-    // tool path (koe-eal) to trust. The key-presence check AND the flag write
+    // tool path (rhanis-eal) to trust. The key-presence check AND the flag write
     // run under ONE settings-lock hold, so a concurrent delete_tool_provider_key
     // can't slip between them. Fail-closed: an Err from has_api_key (locked
     // vault) blocks the enable too.
@@ -499,7 +499,7 @@ pub async fn delete_tool_provider_key(
     })
 }
 
-/// Replaces the whole permission policy (koe-351). The policy is validated
+/// Replaces the whole permission policy (rhanis-351). The policy is validated
 /// (bounds + host well-formedness) BEFORE persisting, so a malformed policy from
 /// a direct/stale IPC call is rejected with a fixed message and never written;
 /// the existing fail-closed evaluation (baseline + deny always win) does the rest
@@ -550,11 +550,11 @@ fn validate_recorder_adapter(name: &str) -> Result<(), String> {
     }
 }
 
-/// The voice provider/model strings koe recognises. koe-31u only PERSISTS the
-/// choice (koe-zv3 acts on it). Both are listed so a value the UI offers now
-/// (OpenAI) or a value a later koe-zv3 build writes (Google) validates; the M1 UI
+/// The voice provider/model strings Rhanis recognises. rhanis-31u only PERSISTS the
+/// choice (rhanis-zv3 acts on it). Both are listed so a value the UI offers now
+/// (OpenAI) or a value a later rhanis-zv3 build writes (Google) validates; the M1 UI
 /// presents Google as a disabled preview. The exact Google model id is confirmed
-/// when koe-zv3 wires the Gemini Live connection.
+/// when rhanis-zv3 wires the Gemini Live connection.
 const KNOWN_VOICE_PROVIDER_MODELS: &[&str] =
     &["openai/gpt-realtime-2", "google/gemini-2.5-flash-live"];
 
@@ -607,7 +607,7 @@ fn validate_app_settings(s: &AppSettings) -> Result<(), SettingsError> {
     } else if s.budget.monthly_limit_nanodollars != 0 {
         return Err(SettingsError::Corrupt);
     }
-    // Permission policy bounds + host well-formedness (koe-351). A tampered file
+    // Permission policy bounds + host well-formedness (rhanis-351). A tampered file
     // with an over-cap list or a malformed host entry fails closed on load, the
     // same posture as the budget bounds above. The UI keeps legit input valid.
     if validate_permission_policy(&s.permission_policy).is_err() {
@@ -625,7 +625,7 @@ fn build_budget_config(enabled: bool, monthly_limit_usd: Option<f64>) -> Result<
             return Err("invalid budget amount".to_string());
         }
         let nano = usd_to_nanodollars(usd).ok_or("invalid budget amount")?;
-        // A positive USD below 0.5 nanodollars (< 5e-10 USD) rounds to 0 (koe-he8).
+        // A positive USD below 0.5 nanodollars (< 5e-10 USD) rounds to 0 (rhanis-he8).
         // Persisting `enabled` + `limit = 0` is a degenerate cap: `is_over` returns
         // true for any total (blocks everything immediately), and the load-time
         // validator (`validate_app_settings`) rejects `enabled` + zero limit as
@@ -656,7 +656,7 @@ mod tests {
 
     fn temp_store() -> (JsonSettingsStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe-settings.json");
+        let path = dir.path().join("rhanis-settings.json");
         (JsonSettingsStore::new(path), dir)
     }
 
@@ -862,12 +862,12 @@ mod tests {
         // The fixed temp path is shared, so save_lock must serialise concurrent
         // saves — otherwise interleaved writes + rename could publish a torn file.
         // Many threads hammering save() must always leave a loadable (untorn) file
-        // and clean up the temp sibling (koe-6ee).
+        // and clean up the temp sibling (rhanis-6ee).
         use std::sync::Arc;
         use std::thread;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonSettingsStore::new(dir.path().join("koe-settings.json")));
+        let store = Arc::new(JsonSettingsStore::new(dir.path().join("rhanis-settings.json")));
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -940,7 +940,7 @@ mod tests {
 
     #[test]
     fn budget_enabled_tiny_positive_rounding_to_zero_is_err() {
-        // koe-he8: a positive USD below 0.5 nanodollars (< 5e-10 USD) rounds to 0.
+        // rhanis-he8: a positive USD below 0.5 nanodollars (< 5e-10 USD) rounds to 0.
         // It passes `usd > 0.0` but would persist enabled + limit=0 — a degenerate
         // "always over budget" cap that the load validator rejects as Corrupt. The
         // write path must reject it too (builder/validator parity).
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn budget_enabled_smallest_nonzero_nanodollar_is_ok() {
-        // The flip side of the koe-he8 guard: a USD that rounds to >= 1 nanodollar
+        // The flip side of the rhanis-he8 guard: a USD that rounds to >= 1 nanodollar
         // is still accepted, so the fix rejects only the rounds-to-zero case and
         // does not over-restrict legitimate (if tiny) caps.
         let cfg = build_budget_config(true, Some(1.0e-6)).expect("1e-6 USD = 1000 nano");
@@ -986,11 +986,11 @@ mod tests {
         assert!(validate_recorder_adapter("").is_err());
     }
 
-    // ---- Multi-provider settings (koe-31u) --------------------------------
+    // ---- Multi-provider settings (rhanis-31u) --------------------------------
 
     #[test]
     fn load_migrates_file_without_voice_or_tool_fields() {
-        // An already-onboarded user's file predates koe-31u: no
+        // An already-onboarded user's file predates rhanis-31u: no
         // voice_provider_model, no tool_providers. It MUST load with the new
         // fields defaulted (not fail), or the migration would brick the app.
         let (store, _dir) = temp_store();
@@ -1080,7 +1080,7 @@ mod tests {
         // can't lose each other's updates (R-C / Codex High).
         let dir = tempfile::tempdir().expect("tempdir");
         let store: Arc<dyn SettingsStore> =
-            Arc::new(JsonSettingsStore::new(dir.path().join("koe-settings.json")));
+            Arc::new(JsonSettingsStore::new(dir.path().join("rhanis-settings.json")));
         store.save(&AppSettings::default()).expect("seed");
         let managed = ManagedSettings::new(Arc::clone(&store));
 
@@ -1151,8 +1151,8 @@ mod tests {
             "set_voice_provider",
             "set_tool_provider_enabled",
             "delete_tool_provider_key",
-            "set_permission_policy", // koe-351
-            "pick_folder",           // koe-351 folder picker
+            "set_permission_policy", // rhanis-351
+            "pick_folder",           // rhanis-351 folder picker
         ] {
             assert!(
                 code.contains(cmd),
@@ -1170,11 +1170,11 @@ mod tests {
         );
     }
 
-    // ---- Permission policy (koe-351) --------------------------------------
+    // ---- Permission policy (rhanis-351) --------------------------------------
 
     #[test]
     fn load_migrates_file_without_permission_policy() {
-        // A file predating koe-351 (no permission_policy) must load with an empty
+        // A file predating rhanis-351 (no permission_policy) must load with an empty
         // policy (auto-approve nothing), not fail.
         let (store, _dir) = temp_store();
         std::fs::write(
@@ -1222,7 +1222,7 @@ mod tests {
     #[test]
     fn settings_policy_provider_loaded_and_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("koe-settings.json");
+        let path = dir.path().join("rhanis-settings.json");
         let store: Arc<dyn SettingsStore> = Arc::new(JsonSettingsStore::new(path.clone()));
         let policy = PermissionPolicy {
             allowed_url_hosts: vec!["openai.com".into()],

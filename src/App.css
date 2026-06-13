@@ -1,4 +1,4 @@
-/* koe — glass-box console theme (koe-ios.1).
+/* Rhanis — glass-box console theme (rhanis-ios.1).
  * Anti-AI-smell: no Inter, no purple→blue gradient, solid accent, varied radii
  * and motion. Warm "control desk" surfaces (never pure black / pure white).
  *
@@ -110,9 +110,9 @@ body {
    in a feature stylesheet — because it is used by the console shell, the approval
    modal, the settings panel AND the first-run onboarding. Keeping it here means
    none of those screens depend on another feature's CSS happening to be loaded
-   (the class of bug koe-iyr fixes). Feature stylesheets add only their own
-   VARIANTS (.koe-btn-approve / .koe-btn-primary / .koe-btn-side / .koe-btn-bar). */
-.koe-btn {
+   (the class of bug rhanis-iyr fixes). Feature stylesheets add only their own
+   VARIANTS (.rhanis-btn-approve / .rhanis-btn-primary / .rhanis-btn-side / .rhanis-btn-bar). */
+.rhanis-btn {
   font-family: var(--font-ui);
   font-size: 14px;
   font-weight: 600;
@@ -123,20 +123,20 @@ body {
   transition: transform var(--dur-hover) var(--ease-spring),
     background var(--dur-hover) var(--ease-decel);
 }
-.koe-btn:disabled {
+.rhanis-btn:disabled {
   opacity: 0.5;
   cursor: progress;
 }
 /* Keyboard focus ring on the accent — the base button had none, so it fell back
    to the low-contrast UA default on the dark surface. Mirrors VoiceButton. */
-.koe-btn:focus-visible {
+.rhanis-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 /* Visually hidden but exposed to assistive tech (SR-only). Used for the approval
    countdown live region and the budget onboarding legend. */
-.koe-visually-hidden {
+.rhanis-visually-hidden {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -152,7 +152,7 @@ body {
 @media (prefers-reduced-motion: reduce) {
   /* Honour reduced-motion for the shared button primitive at the base layer, so
      it holds even if no feature stylesheet is loaded on the current screen. */
-  .koe-btn {
+  .rhanis-btn {
     transition: none;
   }
 }

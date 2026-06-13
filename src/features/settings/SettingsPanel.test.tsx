@@ -1,4 +1,4 @@
-// TDD tests for SettingsPanel component (koe-31u: voice provider + 手足 tools).
+// TDD tests for SettingsPanel component (rhanis-31u: voice provider + 手足 tools).
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -86,7 +86,7 @@ describe("SettingsPanel", () => {
 
   it("shows the 'saved but not yet active' hint for the 手足 tools", async () => {
     await renderPanel();
-    expect(screen.getByText(/koe-eal/)).toBeInTheDocument();
+    expect(screen.getByText(/rhanis-eal/)).toBeInTheDocument();
   });
 
   it("persists a voice provider change via the store → ipc", async () => {
@@ -140,7 +140,7 @@ describe("SettingsPanel", () => {
     await renderPanel();
     // Delete the XAI key → ApiKeyInput fires onKeyStatusChange(false), which must
     // also clear the now-orphaned enable flag (no "enabled but key-less" state).
-    const xaiRow = screen.getByText("XAI (Grok) APIキー").closest(".koe-tool-key-row")!;
+    const xaiRow = screen.getByText("XAI (Grok) APIキー").closest(".rhanis-tool-key-row")!;
     const deleteBtn = xaiRow.querySelector('button[aria-label="削除"]')! as HTMLButtonElement;
     await act(async () => {
       fireEvent.click(deleteBtn);

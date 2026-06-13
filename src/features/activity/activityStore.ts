@@ -9,7 +9,7 @@
 //  - Fold per-`actionId`, guarding each action against *stale* updates with its
 //    own `lastSequence` (a single action's events are monotonic), so an
 //    out-of-order older event cannot resurrect a finished action.
-//  - koe runs continuously, so the dedup set and the action map are bounded to
+//  - Rhanis runs continuously, so the dedup set and the action map are bounded to
 //    the retained-event window — they must not grow without limit.
 
 import { create } from "zustand";
@@ -30,7 +30,7 @@ export const EVENT_CAP = 100;
 
 /**
  * Max number of thinking disclosures retained in the visible trace (glass-box
- * M1, koe-sua.1). Smaller than {@link EVENT_CAP}: the trace is a short "what koe
+ * M1, rhanis-sua.1). Smaller than {@link EVENT_CAP}: the trace is a short "what Rhanis
  * is thinking right now" window, not a full audit log, and is bounded so a
  * continuously-running session cannot grow it without limit.
  */
@@ -46,7 +46,7 @@ export const THINKING_CAP = 50;
 export const MAX_ACTIONS = 256;
 
 /**
- * Max number of provider/server errors retained (koe-nal). Small: these are
+ * Max number of provider/server errors retained (rhanis-nal). Small: these are
  * rare, high-signal rows ("session.update rejected"), not a stream — but a
  * misbehaving server must still not grow the list without limit.
  */
@@ -66,13 +66,13 @@ interface ActivityState {
   approvalQueue: ApprovalRequest[];
   /**
    * Live thinking trace, ordered ascending by `sequence`, capped at
-   * {@link THINKING_CAP} (glass-box M1, koe-sua.1).
+   * {@link THINKING_CAP} (glass-box M1, rhanis-sua.1).
    */
   thinking: ThinkingEvent[];
   /** De-duplication set of seen thinking `eventId`s, bounded to the retained window. */
   seenThinkingIds: Set<string>;
   /**
-   * Non-benign provider/server errors (koe-nal), ordered ascending by
+   * Non-benign provider/server errors (rhanis-nal), ordered ascending by
    * `sequence`, capped at {@link PROVIDER_ERROR_CAP}. Sticky across a session
    * (an error explaining why tools went quiet must outlive the moment), cleared
    * when a NEW session starts connecting.
@@ -86,7 +86,7 @@ interface ActivityState {
    * the backend's generation gate) can still be DELIVERED after the new
    * session's `connecting` cleared the strip — its lower sequence identifies
    * it as stale (the backend stamps the shared counter at emit time), and
-   * `ingestProviderError` drops it (koe-nal R-C).
+   * `ingestProviderError` drops it (rhanis-nal R-C).
    */
   providerErrorClearSequence: number;
   /** Highest `sequence` seen across all tool events. */
@@ -247,7 +247,7 @@ export const useActivityStore = create<ActivityState>((set) => ({
       };
     }),
 
-  // Fold a thinking disclosure (glass-box M1, koe-sua.1) into the live trace.
+  // Fold a thinking disclosure (glass-box M1, rhanis-sua.1) into the live trace.
   // A flat, append-and-sort trace — NOT folded per action like tool events —
   // because a disclosure is a point-in-time "about to do X", not a lifecycle.
   // Same dedup/order discipline as tool events: drop a duplicate `eventId`,
@@ -279,7 +279,7 @@ export const useActivityStore = create<ActivityState>((set) => ({
       return { ...state, thinking, seenThinkingIds };
     }),
 
-  // Same dedup/order/cap discipline as the thinking trace (koe-nal). No action
+  // Same dedup/order/cap discipline as the thinking trace (rhanis-nal). No action
   // correlation: a provider error is session-scoped, not tied to a tool call.
   ingestProviderError: (event) =>
     set((state) => {
@@ -309,7 +309,7 @@ export const useActivityStore = create<ActivityState>((set) => ({
         return state;
       }
       // Drop stale pending disclosures whenever there is nothing "about to happen":
-      // a stopped (idle) or failed (error) session, OR a reconnect (koe-byf) — a
+      // a stopped (idle) or failed (error) session, OR a reconnect (rhanis-byf) — a
       // recoverable transport drop aborts the in-flight tool dispatches, so their
       // "これから〜します" disclosures would never be cleared by a completion and
       // would orphan in the window across the reconnect. `connecting`/`connected`
@@ -323,7 +323,7 @@ export const useActivityStore = create<ActivityState>((set) => ({
       // context and clear only when the operator starts a NEW session
       // (`connecting`). Reconnects also re-send session.update, but the strip is
       // deliberately kept across them — a re-rejected update simply emits a
-      // fresh row (new eventId/sequence), so nothing stale accumulates (koe-nal).
+      // fresh row (new eventId/sequence), so nothing stale accumulates (rhanis-nal).
       const clearProviderErrors = status.state === "connecting";
       return {
         ...state,
@@ -371,7 +371,7 @@ export function selectActiveActions(state: ActivityState): ActionState[] {
 
 /**
  * Recent thinking disclosures, newest first — for the live "考えていること" trace
- * (glass-box M1, koe-sua.1). The view slices the head to show only the freshest
+ * (glass-box M1, rhanis-sua.1). The view slices the head to show only the freshest
  * few; the store keeps the rest within {@link THINKING_CAP}.
  */
 export function selectRecentThinking(state: ActivityState): ThinkingEvent[] {
@@ -379,7 +379,7 @@ export function selectRecentThinking(state: ActivityState): ThinkingEvent[] {
 }
 
 /**
- * Recent provider/server errors, newest first (koe-nal) — for the ActivityLog's
+ * Recent provider/server errors, newest first (rhanis-nal) — for the ActivityLog's
  * error strip. The view slices the head; the store keeps the rest within
  * {@link PROVIDER_ERROR_CAP}.
  */
@@ -400,7 +400,7 @@ export function selectDisplayStatus(state: ActivityState): DisplayStatus {
       return "idle";
     case "connecting":
       return "connecting";
-    // koe-byf: a recoverable transport drop is being retried — surface it as its own
+    // rhanis-byf: a recoverable transport drop is being retried — surface it as its own
     // status (再接続中), not idle/conversing, so the operator sees the session is
     // recovering rather than a frozen "会話". (setSessionStatus also clears the
     // thinking window on reconnecting, since the in-flight dispatches were aborted.)

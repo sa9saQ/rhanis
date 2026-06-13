@@ -1,9 +1,9 @@
-//! `write_note` tool (koe-2gy reference tool).
+//! `write_note` tool (rhanis-2gy reference tool).
 //!
 //! A SAFE tool: takes `{ "text": "…" }`, size-bounds it, and persists it through
-//! the recorder (`RecorderAdapter::save_note`). Chosen as koe-2gy's first real
+//! the recorder (`RecorderAdapter::save_note`). Chosen as rhanis-2gy's first real
 //! tool because it has no filesystem-path surface (so no TOCTOU to get wrong —
-//! `read_file` is deferred to koe-s7i where a component-safe open is built).
+//! `read_file` is deferred to rhanis-s7i where a component-safe open is built).
 //!
 //! The recorder is synchronous (its own `std::sync::Mutex`), so the call goes
 //! through `spawn_blocking` per the `RecorderAdapter` contract.

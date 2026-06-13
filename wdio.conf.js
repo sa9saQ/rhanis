@@ -1,7 +1,7 @@
-// koe Windows E2E (koe-ef8 Step A) — drive the real Tauri debug build via
+// Rhanis Windows E2E (rhanis-ef8 Step A) — drive the real Tauri debug build via
 // tauri-driver + WebdriverIO on a native Windows host. Smoke only: proves the
 // app BOOTS to the onboarding screen. No mic / no real API — the audio bridge
-// stays idle until a session starts (src-tauri/src/lib.rs, koe-flu "device open
+// stays idle until a session starts (src-tauri/src/lib.rs, rhanis-flu "device open
 // happens inside start_session"), so a runner with no microphone is fine.
 //
 // Versions follow the Tauri 2 official WebdriverIO example (@wdio/* v9).
@@ -15,13 +15,13 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-// Tauri productName is "koe" (src-tauri/tauri.conf.json) → koe.exe on Windows.
+// Tauri mainBinaryName is "rhanis" (src-tauri/tauri.conf.json) → rhanis.exe on Windows.
 const application = path.resolve(
   here,
   "src-tauri",
   "target",
   "debug",
-  process.platform === "win32" ? "koe.exe" : "koe",
+  process.platform === "win32" ? "rhanis.exe" : "rhanis",
 );
 
 /** @type {import("node:child_process").ChildProcess | undefined} */

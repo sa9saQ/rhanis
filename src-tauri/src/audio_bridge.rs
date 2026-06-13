@@ -1,4 +1,4 @@
-//! Audio bridge (koe-flu): cpal microphone capture → PCM16 24kHz → WebSocket,
+//! Audio bridge (rhanis-flu): cpal microphone capture → PCM16 24kHz → WebSocket,
 //! and WebSocket audio delta → PCM16 decode → rodio playback.
 //!
 //! # Design overview
@@ -27,7 +27,7 @@
 //! base64 encode, base64 decode — lives in pure free functions exercised by
 //! `#[cfg(test)] mod tests` **without opening any real device**. Hardware
 //! calls (`cpal` stream open, `rodio` OutputStream) are isolated in the audio
-//! thread; those paths are integration-tested only on Windows (koe-ef8 E2E).
+//! thread; those paths are integration-tested only on Windows (rhanis-ef8 E2E).
 //!
 //! ## Fail-closed discipline
 //! - `start` returns `Result<_, String>`; any device-open error is surfaced as
@@ -43,7 +43,7 @@
 //! ## WSL note
 //! cpal cannot open a real mic in WSL (no ALSA/PulseAudio device). The pure
 //! logic tests run fine in WSL (no hardware). Real-mic E2E requires
-//! `pnpm tauri dev` on native Windows (koe-ef8).
+//! `pnpm tauri dev` on native Windows (rhanis-ef8).
 //!
 //! transaction N/A · idempotency_key N/A (real-time audio I/O, not billing).
 
@@ -198,11 +198,11 @@ pub fn build_audio_append_frame(pcm16_bytes: &[u8]) -> Message {
 
 /// Whether `event_type` is an assistant audio-delta frame, under either wire
 /// name: the GA Realtime event is `response.output_audio.delta`; the
-/// superseded beta interface used `response.audio.delta` (koe-bd7). Matching
+/// superseded beta interface used `response.audio.delta` (rhanis-bd7). Matching
 /// only the beta name leaves the assistant silent on a GA handshake while
 /// every other path (transcript, usage) keeps working. Decode, the barge-in
 /// gate, and `parse_frame`'s pinned Ignored arm all route through this single
-/// predicate so the sites cannot diverge; once koe-ef8 (Windows E2E) pins the
+/// predicate so the sites cannot diverge; once rhanis-ef8 (Windows E2E) pins the
 /// live wire name, the unused arm can be dropped here in one place. Mirrors
 /// the transcript dual-name match in `realtime_provider::parse_frame`.
 pub(crate) fn is_audio_delta_type(event_type: &str) -> bool {
@@ -310,7 +310,7 @@ impl Default for ChunkAccumulator {
 /// session_manager task.  Uses only `Arc<AtomicBool>` so no async locks are
 /// needed in the cpal callback (cpal callbacks must be lock-free / no async).
 ///
-/// ## Per-session generation flag (koe-flu round 5)
+/// ## Per-session generation flag (rhanis-flu round 5)
 ///
 /// The running flag is **per session**, not a single Arc reused across
 /// sessions.  Each `start()` installs a **fresh** `Arc<AtomicBool>` via
@@ -376,7 +376,7 @@ impl Default for AudioBridgeState {
 /// **Data** command: PCM payloads bound for the playback queue.  Carried on the
 /// bounded, **lossy** DATA channel (`std::sync::mpsc::SyncSender<AudioCommand>`).
 ///
-/// ## Two-channel split (koe-flu round 5): control must never be dropped by PCM
+/// ## Two-channel split (rhanis-flu round 5): control must never be dropped by PCM
 ///
 /// The previous design carried both PCM **and** the stop control on a SINGLE
 /// bounded channel.  During active server playback `handle_server_audio` floods
@@ -410,7 +410,7 @@ pub enum AudioCommand {
 pub enum PlaybackOp {
     /// Append one decoded PCM payload (the DATA-channel `EnqueuePcm` path).
     Enqueue(Vec<u8>),
-    /// Barge-in cut (koe-bx7): clear everything queued in the sink, resume it,
+    /// Barge-in cut (rhanis-bx7): clear everything queued in the sink, resume it,
     /// and reset the queued-bytes accounting.  The loop keeps running.
     Clear,
 }
@@ -436,7 +436,7 @@ pub enum AudioControl {
     /// where the WS write task is aborted first.  Skipping the flush ensures
     /// no tail PCM races onto the WS after the writer abort.
     StopNow,
-    /// **Barge-in playback cut (koe-bx7)** — the only NON-terminal control: the
+    /// **Barge-in playback cut (rhanis-bx7)** — the only NON-terminal control: the
     /// user started speaking, so stop the assistant's voice NOW. The audio
     /// thread (1) discards every `EnqueuePcm` already queued on the DATA
     /// channel (stale audio of the interrupted response), (2) clears + resumes
@@ -449,7 +449,7 @@ pub enum AudioControl {
 /// Tiny capacity for the CONTROL channel.  At most one stop control is pending
 /// per session (graceful sends one `FlushThenStop`; immediate sends one
 /// `StopNow`; the cpal error callback may add one `StopNow`), plus transient
-/// `ClearPlayback` cuts (koe-bx7) that the audio thread consumes within one
+/// `ClearPlayback` cuts (rhanis-bx7) that the audio thread consumes within one
 /// ~20 ms loop iteration.  A capacity of 4 keeps a pending stop deliverable
 /// even with a barge-in cut in flight; `send_control_reliably` retries cover
 /// a momentary burst.
@@ -506,7 +506,7 @@ fn send_control_reliably(ctrl_tx: &std::sync::mpsc::SyncSender<AudioControl>, ct
     }
 }
 
-// ── PlaybackHandle: lock-free playback / barge-in primitive (koe-bx7) ─────────
+// ── PlaybackHandle: lock-free playback / barge-in primitive (rhanis-bx7) ─────────
 
 /// The playback gate is OFF: deltas flow to the sink normally.
 const GATE_OFF: u8 = 0;
@@ -519,11 +519,11 @@ const GATE_SPEAKING: u8 = 1;
 const GATE_ARMED: u8 = 2;
 
 /// A lock-free handle for the read loop's `audio_handler` seam: playback
-/// enqueueing + the barge-in gate (koe-bx7), WITHOUT acquiring the tokio
+/// enqueueing + the barge-in gate (rhanis-bx7), WITHOUT acquiring the tokio
 /// `Mutex<AudioBridge>`.
 ///
 /// ## Why lock-free matters (same rationale as [`AudioStopHandle`])
-/// The pre-koe-bx7 handler took `try_lock()` and skipped the frame on
+/// The pre-rhanis-bx7 handler took `try_lock()` and skipped the frame on
 /// contention — acceptable when a miss meant one lossy PCM chunk, but the
 /// barge-in STATE TRANSITIONS (`speech_started` / `speech_stopped` /
 /// `response.created`) now ride this seam: a missed `response.created` would
@@ -550,7 +550,7 @@ impl PlaybackHandle {
     /// The playback half of the read loop's `audio_handler` seam: feeds
     /// audio-delta payloads (GA `response.output_audio.delta` / beta
     /// `response.audio.delta`, see [`is_audio_delta_type`]) into the playback
-    /// queue and drives the barge-in gate (koe-bx7).  Silently ignores unknown
+    /// queue and drives the barge-in gate (rhanis-bx7).  Silently ignores unknown
     /// event types or malformed base64.
     ///
     /// Barge-in protocol:
@@ -565,7 +565,7 @@ impl PlaybackHandle {
     ///   may speak.
     /// - `response.created` → lifts the gate ONLY from the armed state. A
     ///   response created while the user is STILL speaking (tool-completion
-    ///   follow-ups via `response.create`, see koe-z8j) stays suppressed —
+    ///   follow-ups via `response.create`, see rhanis-z8j) stays suppressed —
     ///   without this, a mid-speech `response.created` would re-open the gate
     ///   and the assistant would talk over the user (R-B finding).
     /// - audio delta (either wire name) → enqueued only while the gate is OFF;
@@ -663,7 +663,7 @@ pub struct AudioStopHandle {
     running: Arc<AtomicBool>,
     /// CONTROL channel sender (reliable, tiny).  Stop controls travel here, never
     /// on the lossy PCM DATA channel, so a congested playback queue cannot drop a
-    /// stop (koe-flu round 5 two-channel split).
+    /// stop (rhanis-flu round 5 two-channel split).
     ctrl_tx: std::sync::mpsc::SyncSender<AudioControl>,
 }
 
@@ -673,7 +673,7 @@ impl AudioStopHandle {
     /// Use on **normal** server-close exits where the WS write task is NOT
     /// aborted — the tail PCM should reach the server.
     ///
-    /// ## Two-channel reliable delivery (koe-flu round 5)
+    /// ## Two-channel reliable delivery (rhanis-flu round 5)
     ///
     /// The control travels on the dedicated CONTROL channel, NOT the PCM DATA
     /// channel, so a playback-congested DATA channel can never drop it.  Delivery
@@ -756,7 +756,7 @@ pub struct AudioBridge {
     data_tx: Option<std::sync::mpsc::SyncSender<AudioCommand>>,
     /// CONTROL-channel sender (stop intent); `None` before `start()` / after stop.
     ctrl_tx: Option<std::sync::mpsc::SyncSender<AudioControl>>,
-    /// Barge-in gate for the CURRENT session (koe-bx7) — see [`PlaybackHandle`].
+    /// Barge-in gate for the CURRENT session (rhanis-bx7) — see [`PlaybackHandle`].
     /// REPLACED (not reset) by each `start()`, so a stale prior-generation
     /// handler holding the old `Arc` cannot pollute the new session's gate
     /// (the same generation discipline as the `running` flag).
@@ -790,7 +790,7 @@ impl AudioBridge {
         // linger and (a) hold the device or (b) race the new generation.  We
         // signal it to stop first (StopNow on its OWN control channel + clear its
         // OWN generation flag), then join.  Each of these is per-generation, so
-        // this never touches the fresh generation installed below (koe-flu round 5).
+        // this never touches the fresh generation installed below (rhanis-flu round 5).
         if let Some(prev_ctrl) = self.ctrl_tx.take() {
             // Best-effort: clear the previous generation's flag so the old cpal
             // callback gates off, and tell the old thread to stop immediately.
@@ -830,7 +830,7 @@ impl AudioBridge {
 
         // Spawn the dedicated audio thread that owns cpal + rodio handles.
         let handle = std::thread::Builder::new()
-            .name("koe-audio".into())
+            .name("rhanis-audio".into())
             .spawn(move || {
                 audio_thread_main(
                     write_tx,
@@ -850,7 +850,7 @@ impl AudioBridge {
         self.ctrl_tx = Some(ctrl_tx);
         // A fresh session starts with the gate OPEN. The Arc is REPLACED (not
         // stored-into) so a stale prior-generation `PlaybackHandle` keeps its
-        // own dead gate and cannot touch this session's (koe-bx7).
+        // own dead gate and cannot touch this session's (rhanis-bx7).
         self.playback_gate = Arc::new(AtomicU8::new(GATE_OFF));
         self.thread_handle = Some(handle);
         Ok(stop_handle)
@@ -858,7 +858,7 @@ impl AudioBridge {
 
     /// Returns the lock-free [`PlaybackHandle`] for the CURRENT session — the
     /// read loop's `audio_handler` seam (playback enqueueing + barge-in gate,
-    /// koe-bx7).  `None` before `start()`.  Grab it once per connection, AFTER
+    /// rhanis-bx7).  `None` before `start()`.  Grab it once per connection, AFTER
     /// a successful `start()` (the same pattern as [`AudioStopHandle`]): the
     /// handler must never take this bridge's tokio mutex per frame.
     pub fn playback_handle(&self) -> Option<PlaybackHandle> {
@@ -1114,7 +1114,7 @@ fn run_audio_command_loop<P>(
         // 1. CONTROL first — check once (non-blocking).  A stop wins immediately
         //    over any queued PCM (P1-1).  The stop variants are terminal, so at
         //    most one of them is ever acted on and any later one is observed on
-        //    the next iteration's check.  `ClearPlayback` (koe-bx7) is the one
+        //    the next iteration's check.  `ClearPlayback` (rhanis-bx7) is the one
         //    NON-terminal control: it is handled inline and the loop `continue`s
         //    straight back to this check, so a stop queued behind a cut is
         //    honoured before any further PCM.  (Empty falls through to DATA.)
@@ -1211,7 +1211,7 @@ fn run_audio_command_loop<P>(
 /// control is received **or** until `running` is set to false (via the stop
 /// flag) even if no control was delivered.
 ///
-/// ## Two-channel loop (koe-flu round 5)
+/// ## Two-channel loop (rhanis-flu round 5)
 /// Each iteration: (1) drain the **CONTROL** channel first (non-blocking) so a
 /// stop is honoured promptly even while PCM floods the DATA channel; (2) if no
 /// stop, block on the **DATA** channel with a short timeout
@@ -1294,7 +1294,7 @@ fn audio_thread_main(
                         }
                         let msg = build_audio_append_frame(&chunk);
                         // Non-blocking: drop chunks if the WS write channel is full
-                        // (real-time requirement; the UI shows lag indicator in koe-ef8).
+                        // (real-time requirement; the UI shows lag indicator in rhanis-ef8).
                         let _ = tx_cb.try_send(msg);
                     }
                 },
@@ -1413,7 +1413,7 @@ fn audio_thread_main(
         |op: PlaybackOp| match op {
             PlaybackOp::Enqueue(bytes) => enqueue_pcm(bytes, &mut queued_bytes),
             PlaybackOp::Clear => {
-                // Barge-in cut (koe-bx7).  rodio's `Sink::clear()` also PAUSES
+                // Barge-in cut (rhanis-bx7).  rodio's `Sink::clear()` also PAUSES
                 // the sink, so `play()` must follow for the NEXT response's
                 // audio to be audible.  (The overflow path inside `enqueue_pcm`
                 // deliberately skips `play()` — it stops the whole session
@@ -1693,7 +1693,7 @@ mod tests {
 
     #[test]
     fn decode_audio_delta_round_trips_ga_name() {
-        // GA wire name (koe-bd7): `response.output_audio.delta` must decode the
+        // GA wire name (rhanis-bd7): `response.output_audio.delta` must decode the
         // same as the superseded beta `response.audio.delta`, or a GA handshake
         // leaves the assistant silent while every other test stays green.
         let pcm: Vec<u8> = vec![0x01, 0x00, 0x02, 0x00];
@@ -2079,7 +2079,7 @@ mod tests {
                 // CONTROL first.
                 match ctrl_rx.try_recv() {
                     Ok(AudioControl::FlushThenStop) | Ok(AudioControl::StopNow) => break 'outer,
-                    Ok(AudioControl::ClearPlayback) => {} // non-terminal (koe-bx7)
+                    Ok(AudioControl::ClearPlayback) => {} // non-terminal (rhanis-bx7)
                     Err(std::sync::mpsc::TryRecvError::Empty) => {} // no control → DATA
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
                 }
@@ -2166,7 +2166,7 @@ mod tests {
             'outer: loop {
                 match ctrl_rx.try_recv() {
                     Ok(AudioControl::FlushThenStop) | Ok(AudioControl::StopNow) => break 'outer,
-                    Ok(AudioControl::ClearPlayback) => {} // non-terminal (koe-bx7)
+                    Ok(AudioControl::ClearPlayback) => {} // non-terminal (rhanis-bx7)
                     Err(std::sync::mpsc::TryRecvError::Empty) => {} // no control → DATA
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
                 }
@@ -2220,7 +2220,7 @@ mod tests {
         drop(data_tx);
     }
 
-    // ── P1 (koe-flu): graceful vs immediate stop — redesigned command enum ────
+    // ── P1 (rhanis-flu): graceful vs immediate stop — redesigned command enum ────
     //
     // Root cause (confirmed round 4): the `running` atomic was OVERLOADED for two
     // purposes — (1) gate the cpal capture callback and (2) gate the FlushCapture
@@ -2235,7 +2235,7 @@ mod tests {
     // The `running` atomic now has ONLY ONE purpose: gating the cpal capture
     // data-callback.  It is NOT read by the command-receive loop to decide flush.
     //
-    // Tests verify the REDESIGNED stop paths (koe-flu task requirement):
+    // Tests verify the REDESIGNED stop paths (rhanis-flu task requirement):
     //   (a) normal close → FlushThenStop is sent; tail IS enqueued (no running-race)
     //   (b) abnormal exit / manual shutdown → StopNow; no tail enqueued
     //   (c) StopNow never flushes even if a tail is buffered
@@ -2670,7 +2670,7 @@ mod tests {
         );
     }
 
-    // ── Legacy regression tests (renamed from koe-flu P1 block) ─────────────
+    // ── Legacy regression tests (renamed from rhanis-flu P1 block) ─────────────
 
     /// Legacy P1 (a): stop_immediate does NOT enqueue FlushThenStop.
     /// Kept as a named regression; same semantics as stop_immediate_sends_stop_now_no_flush.
@@ -2728,7 +2728,7 @@ mod tests {
         assert!(!found_stop_now, "stop_graceful must NOT enqueue StopNow");
     }
 
-    // ── Barge-in (koe-bx7): ClearPlayback + delta suppression ──────────────────
+    // ── Barge-in (rhanis-bx7): ClearPlayback + delta suppression ──────────────────
 
     /// Drives the REAL `run_audio_command_loop` with a pre-loaded barge-in:
     /// stale PCM already queued on DATA and a `ClearPlayback` on CONTROL.
@@ -2827,7 +2827,7 @@ mod tests {
         });
     }
 
-    /// `PlaybackHandle` barge-in gate (koe-bx7), full protocol walk:
+    /// `PlaybackHandle` barge-in gate (rhanis-bx7), full protocol walk:
     /// speech_started closes the gate + cuts ONCE; a mid-speech
     /// `response.created` (tool-completion follow-up) must NOT reopen it;
     /// speech_stopped arms the release; the next `response.created` reopens.
@@ -2868,7 +2868,7 @@ mod tests {
         );
 
         // A response created WHILE the user is still speaking (tool-completion
-        // follow-up, koe-z8j) must NOT reopen the gate: no talk-over.
+        // follow-up, rhanis-z8j) must NOT reopen the gate: no talk-over.
         handle.handle_server_audio(&created);
         handle.handle_server_audio(&delta);
         assert!(
@@ -2894,7 +2894,7 @@ mod tests {
         assert!(ctrl_rx.try_recv().is_err(), "no further control expected");
     }
 
-    /// GA wire name (koe-bd7): the barge-in gate must treat
+    /// GA wire name (rhanis-bd7): the barge-in gate must treat
     /// `response.output_audio.delta` exactly like the beta name — enqueued
     /// while the gate is OFF, suppressed pre-decode once the user speaks.
     /// (The gate transitions themselves are name-independent; this mirrors

@@ -1,4 +1,4 @@
-// Cost store (koe-9xi) — holds the latest monthly cost snapshot for the live
+// Cost store (rhanis-9xi) — holds the latest monthly cost snapshot for the live
 // header. Both the pull (`get_cost_snapshot`) and the push (`cost-update` event)
 // fold through `applySnapshot`, which keeps only the highest-`sequence` snapshot.
 //

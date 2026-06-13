@@ -1,4 +1,4 @@
-// Permission policy editor (koe-351). Lets the user curate which folders/URLs
+// Permission policy editor (rhanis-351). Lets the user curate which folders/URLs
 // the AI may touch automatically (許可) and which it must always confirm (禁止),
 // layered on top of the built-in SAFE/CAUTION/DANGER gate.
 //
@@ -14,7 +14,7 @@ import { pickFolder } from "../../lib/tauri/ipc";
 import { useSettingsStore } from "./settingsStore";
 import { EMPTY_PERMISSION_POLICY, type AllowedFolder, type PermissionPolicy } from "./types";
 
-const ALLOW_ALL_URLS_HINT_ID = "koe-allow-all-urls-hint";
+const ALLOW_ALL_URLS_HINT_ID = "rhanis-allow-all-urls-hint";
 
 /**
  * Normalizes a typed host entry, or returns `null` if it is not a bare host.
@@ -189,27 +189,27 @@ export function PermissionPolicyEditor() {
   }
 
   return (
-    <div className="koe-policy-editor">
+    <div className="rhanis-policy-editor">
       {error && (
-        <p role="alert" aria-live="polite" className="koe-settings-error">
+        <p role="alert" aria-live="polite" className="rhanis-settings-error">
           {error}
         </p>
       )}
 
       {/* 許可フォルダ */}
-      <div className="koe-policy-group">
+      <div className="rhanis-policy-group">
         <h4>許可フォルダ（自動で触ってよい場所）</h4>
-        <p className="koe-settings-hint">
+        <p className="rhanis-settings-hint">
           ここに入れたフォルダの中は、いちいち確認されずに自動で操作されます。削除やコマンドなどの強い操作（DANGER）は、
           フォルダごとに「強い操作も自動」を ON にしたときだけ自動になります。
         </p>
-        <ul className="koe-policy-list">
+        <ul className="rhanis-policy-list">
           {policy.allowed_folders.map((f, idx) => (
-            <li key={`${f.path}-${idx}`} className="koe-policy-item">
-              <span className="koe-policy-path" title={f.path}>
+            <li key={`${f.path}-${idx}`} className="rhanis-policy-item">
+              <span className="rhanis-policy-path" title={f.path}>
                 {f.path}
               </span>
-              <label className="koe-policy-danger">
+              <label className="rhanis-policy-danger">
                 <input
                   type="checkbox"
                   checked={f.allow_danger}
@@ -220,7 +220,7 @@ export function PermissionPolicyEditor() {
               </label>
               <button
                 type="button"
-                className="koe-btn koe-btn-danger"
+                className="rhanis-btn rhanis-btn-danger"
                 disabled={saving}
                 onClick={() => removeAllowedFolder(f.path)}
                 aria-label={`許可フォルダを削除: ${f.path}`}
@@ -230,13 +230,13 @@ export function PermissionPolicyEditor() {
             </li>
           ))}
           {policy.allowed_folders.length === 0 && (
-            <li className="koe-policy-empty">まだ登録されていません。</li>
+            <li className="rhanis-policy-empty">まだ登録されていません。</li>
           )}
         </ul>
-        <div className="koe-policy-add">
+        <div className="rhanis-policy-add">
           <input
             type="text"
-            className="koe-input"
+            className="rhanis-input"
             placeholder="フォルダのパス（例: /home/user/work）"
             aria-label="許可フォルダのパス"
             value={allowedFolderText}
@@ -245,7 +245,7 @@ export function PermissionPolicyEditor() {
           />
           <button
             type="button"
-            className="koe-btn"
+            className="rhanis-btn"
             disabled={saving}
             aria-label="許可フォルダを追加"
             onClick={() => void addAllowedFolder(allowedFolderText)}
@@ -254,7 +254,7 @@ export function PermissionPolicyEditor() {
           </button>
           <button
             type="button"
-            className="koe-btn"
+            className="rhanis-btn"
             disabled={saving}
             aria-label="許可フォルダをダイアログで選択"
             onClick={() => void handlePickFolder("allowed")}
@@ -265,21 +265,21 @@ export function PermissionPolicyEditor() {
       </div>
 
       {/* 禁止の場所 */}
-      <div className="koe-policy-group">
+      <div className="rhanis-policy-group">
         <h4>禁止の場所（必ず確認する）</h4>
-        <p className="koe-settings-hint">
+        <p className="rhanis-settings-hint">
           ここに入れた場所は自動では絶対に触らず、必要なときも毎回あなたの確認を求めます。SSH 鍵や認証情報、システムフォルダは、
           ここに入れなくても最初から保護されています。
         </p>
-        <ul className="koe-policy-list">
+        <ul className="rhanis-policy-list">
           {policy.denied_folders.map((path, idx) => (
-            <li key={`${path}-${idx}`} className="koe-policy-item">
-              <span className="koe-policy-path" title={path}>
+            <li key={`${path}-${idx}`} className="rhanis-policy-item">
+              <span className="rhanis-policy-path" title={path}>
                 {path}
               </span>
               <button
                 type="button"
-                className="koe-btn koe-btn-danger"
+                className="rhanis-btn rhanis-btn-danger"
                 disabled={saving}
                 onClick={() => removeDeniedFolder(path)}
                 aria-label={`禁止の場所を削除: ${path}`}
@@ -289,13 +289,13 @@ export function PermissionPolicyEditor() {
             </li>
           ))}
           {policy.denied_folders.length === 0 && (
-            <li className="koe-policy-empty">まだ登録されていません。</li>
+            <li className="rhanis-policy-empty">まだ登録されていません。</li>
           )}
         </ul>
-        <div className="koe-policy-add">
+        <div className="rhanis-policy-add">
           <input
             type="text"
-            className="koe-input"
+            className="rhanis-input"
             placeholder="フォルダのパス（例: /home/user/secret）"
             aria-label="禁止する場所のパス"
             value={deniedFolderText}
@@ -304,7 +304,7 @@ export function PermissionPolicyEditor() {
           />
           <button
             type="button"
-            className="koe-btn"
+            className="rhanis-btn"
             disabled={saving}
             aria-label="禁止の場所を追加"
             onClick={() => void addDeniedFolder(deniedFolderText)}
@@ -313,7 +313,7 @@ export function PermissionPolicyEditor() {
           </button>
           <button
             type="button"
-            className="koe-btn"
+            className="rhanis-btn"
             disabled={saving}
             aria-label="禁止の場所をダイアログで選択"
             onClick={() => void handlePickFolder("denied")}
@@ -324,13 +324,13 @@ export function PermissionPolicyEditor() {
       </div>
 
       {/* URL ポリシー */}
-      <div className="koe-policy-group">
+      <div className="rhanis-policy-group">
         <h4>URL（AI が開いてよいサイト）</h4>
-        <p className="koe-settings-hint">
+        <p className="rhanis-settings-hint">
           AI が URL を開くときは、許可リストにあるドメインだけ確認なしで開きます。それ以外は毎回確認します。
         </p>
 
-        <label className="koe-budget-option">
+        <label className="rhanis-budget-option">
           <input
             type="checkbox"
             checked={policy.allow_all_urls}
@@ -340,18 +340,18 @@ export function PermissionPolicyEditor() {
           />
           <span>すべての URL を許可（確認なしで開く）</span>
         </label>
-        <p id={ALLOW_ALL_URLS_HINT_ID} className="koe-settings-hint koe-policy-warning">
+        <p id={ALLOW_ALL_URLS_HINT_ID} className="rhanis-settings-hint rhanis-policy-warning">
           ⚠ ON にすると AI が確認なしに任意の URL を開けます。機密が URL に含まれて外部に送られる可能性があります。
         </p>
 
-        <h5 className="koe-policy-subhead">許可ドメイン</h5>
-        <ul className="koe-policy-list">
+        <h5 className="rhanis-policy-subhead">許可ドメイン</h5>
+        <ul className="rhanis-policy-list">
           {policy.allowed_url_hosts.map((host, idx) => (
-            <li key={`${host}-${idx}`} className="koe-policy-item">
-              <span className="koe-policy-path">{host}</span>
+            <li key={`${host}-${idx}`} className="rhanis-policy-item">
+              <span className="rhanis-policy-path">{host}</span>
               <button
                 type="button"
-                className="koe-btn koe-btn-danger"
+                className="rhanis-btn rhanis-btn-danger"
                 disabled={saving}
                 onClick={() => removeAllowedHost(host)}
                 aria-label={`許可ドメインを削除: ${host}`}
@@ -361,13 +361,13 @@ export function PermissionPolicyEditor() {
             </li>
           ))}
           {policy.allowed_url_hosts.length === 0 && (
-            <li className="koe-policy-empty">まだ登録されていません。</li>
+            <li className="rhanis-policy-empty">まだ登録されていません。</li>
           )}
         </ul>
-        <div className="koe-policy-add">
+        <div className="rhanis-policy-add">
           <input
             type="text"
-            className="koe-input"
+            className="rhanis-input"
             placeholder="ドメイン（例: openai.com）"
             aria-label="許可ドメイン"
             value={allowedHostText}
@@ -376,7 +376,7 @@ export function PermissionPolicyEditor() {
           />
           <button
             type="button"
-            className="koe-btn"
+            className="rhanis-btn"
             disabled={saving}
             aria-label="許可ドメインを追加"
             onClick={() => void addAllowedHost(allowedHostText)}
@@ -385,14 +385,14 @@ export function PermissionPolicyEditor() {
           </button>
         </div>
 
-        <h5 className="koe-policy-subhead">禁止ドメイン（常に確認）</h5>
-        <ul className="koe-policy-list">
+        <h5 className="rhanis-policy-subhead">禁止ドメイン（常に確認）</h5>
+        <ul className="rhanis-policy-list">
           {policy.denied_url_hosts.map((host, idx) => (
-            <li key={`${host}-${idx}`} className="koe-policy-item">
-              <span className="koe-policy-path">{host}</span>
+            <li key={`${host}-${idx}`} className="rhanis-policy-item">
+              <span className="rhanis-policy-path">{host}</span>
               <button
                 type="button"
-                className="koe-btn koe-btn-danger"
+                className="rhanis-btn rhanis-btn-danger"
                 disabled={saving}
                 onClick={() => removeDeniedHost(host)}
                 aria-label={`禁止ドメインを削除: ${host}`}
@@ -402,13 +402,13 @@ export function PermissionPolicyEditor() {
             </li>
           ))}
           {policy.denied_url_hosts.length === 0 && (
-            <li className="koe-policy-empty">まだ登録されていません。</li>
+            <li className="rhanis-policy-empty">まだ登録されていません。</li>
           )}
         </ul>
-        <div className="koe-policy-add">
+        <div className="rhanis-policy-add">
           <input
             type="text"
-            className="koe-input"
+            className="rhanis-input"
             placeholder="ドメイン（例: evil.com）"
             aria-label="禁止ドメイン"
             value={deniedHostText}
@@ -417,7 +417,7 @@ export function PermissionPolicyEditor() {
           />
           <button
             type="button"
-            className="koe-btn"
+            className="rhanis-btn"
             disabled={saving}
             aria-label="禁止ドメインを追加"
             onClick={() => void addDeniedHost(deniedHostText)}

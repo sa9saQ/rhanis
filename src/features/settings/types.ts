@@ -76,12 +76,12 @@ export interface AppSettings {
   recorder_adapter: string;
   /**
    * Selected voice provider/model as a single `"provider/model"` string
-   * (e.g. `"openai/gpt-realtime-2"`). koe-31u persists it; koe-zv3 acts on it.
+   * (e.g. `"openai/gpt-realtime-2"`). rhanis-31u persists it; rhanis-zv3 acts on it.
    */
   voice_provider_model: string;
-  /** Per-provider enable flags for the 手足 tool keys (koe-31u). */
+  /** Per-provider enable flags for the 手足 tool keys (rhanis-31u). */
   tool_providers: ToolProviderFlags;
-  /** Folder/URL allow + deny permission policy (koe-351). */
+  /** Folder/URL allow + deny permission policy (rhanis-351). */
   permission_policy: PermissionPolicy;
 }
 

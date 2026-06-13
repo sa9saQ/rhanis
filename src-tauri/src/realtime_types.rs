@@ -1,4 +1,4 @@
-//! Shared kernel for the Realtime function-call dispatch seam (koe-2gy + koe-e3m).
+//! Shared kernel for the Realtime function-call dispatch seam (rhanis-2gy + rhanis-e3m).
 //!
 //! Owned by neither `session_manager` nor `tool_dispatcher` so the two connect
 //! through a trait with **no import cycle**:
@@ -9,16 +9,16 @@
 //! ```
 //!
 //! Neither module imports the other. `lib.rs` is the single wiring point: it
-//! registers `NoopDispatcher` until koe-2gy swaps in the real one.
+//! registers `NoopDispatcher` until rhanis-2gy swaps in the real one.
 //!
 //! `BoxFuture` is a local `std`-only type alias (no `futures` crate dependency).
 //!
 //! transaction N/A · idempotency_key N/A (in-process routing types, not billing).
 
 // The dispatch seam has no in-crate production caller until session_manager
-// (koe-e3m) wires its read loop to `RealToolDispatcher::dispatch`; the trait and
+// (rhanis-e3m) wires its read loop to `RealToolDispatcher::dispatch`; the trait and
 // the no-op are fully exercised by this module's and the dispatcher's tests.
-// Allow dead_code module-wide until koe-e3m lands, then drop this so any
+// Allow dead_code module-wide until rhanis-e3m lands, then drop this so any
 // genuinely-unused item resurfaces.
 #![allow(dead_code)]
 
@@ -66,8 +66,8 @@ pub struct ToolSchema {
     pub parameters: Value,
 }
 
-/// The seam by which `session_manager` (koe-e3m) invokes the tool dispatcher
-/// (koe-2gy) without knowing its concrete type — defined here to break the
+/// The seam by which `session_manager` (rhanis-e3m) invokes the tool dispatcher
+/// (rhanis-2gy) without knowing its concrete type — defined here to break the
 /// import cycle.
 ///
 /// `Send + Sync + 'static` because the implementor lives behind
@@ -107,12 +107,12 @@ pub fn function_call_output(call_id: &str, output: String) -> DispatchResult {
     }
 }
 
-/// The pre-koe-2gy default and the test double: accepts a function call but runs
+/// The pre-rhanis-2gy default and the test double: accepts a function call but runs
 /// no tool, replying with a fixed error output. Registered in `lib.rs` until the
 /// real dispatcher lands, so the conversation loop stays **functional** (a tool
 /// call still gets a well-formed reply and the model can continue) rather than
-/// dead. The no-op is exercised by koe-e3m (its pre-rebase default) and tests;
-/// koe-2gy's production wiring uses the real dispatcher.
+/// dead. The no-op is exercised by rhanis-e3m (its pre-rebase default) and tests;
+/// rhanis-2gy's production wiring uses the real dispatcher.
 pub struct NoopDispatcher;
 
 impl DispatcherSeam for NoopDispatcher {
@@ -131,7 +131,7 @@ impl DispatcherSeam for NoopDispatcher {
 }
 
 /// Tauri managed-state wrapper. `lib.rs` registers a `NoopDispatcher` until
-/// koe-2gy swaps in the real `RealToolDispatcher`; `session_manager` (koe-e3m)
+/// rhanis-2gy swaps in the real `RealToolDispatcher`; `session_manager` (rhanis-e3m)
 /// reads it via `tauri::State<'_, ManagedDispatcher>` and clones the inner `Arc`
 /// into its read loop.
 pub struct ManagedDispatcher(pub Arc<dyn DispatcherSeam>);

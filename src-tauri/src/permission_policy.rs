@@ -1,4 +1,4 @@
-//! User-configurable permission policy (koe-351).
+//! User-configurable permission policy (rhanis-351).
 //!
 //! Layers a user-defined allow/deny policy ON TOP of the built-in three-tier
 //! risk gate (`approval_gate::classify` → SAFE/CAUTION/DANGER). The policy only
@@ -16,7 +16,7 @@
 //!
 //! [`evaluate`] / [`decide`] are pure (given the filesystem): they read no global
 //! state and never log/emit the path or URL. The only output is a
-//! [`PolicyDecision`] enum the dispatcher (koe-2gy) composes with the risk tier.
+//! [`PolicyDecision`] enum the dispatcher (rhanis-2gy) composes with the risk tier.
 //!
 //! transaction N/A · idempotency_key N/A (read-only approval policy, not billing).
 
@@ -124,7 +124,7 @@ pub trait PolicyProvider: Send + Sync {
 
 /// What the policy reasons about for a given tool call.
 ///
-/// `pub(crate)`: display_descriptor's parity test (koe-whf) locks its tool →
+/// `pub(crate)`: display_descriptor's parity test (rhanis-whf) locks its tool →
 /// arg-key map to this one, so the modal can never show a different string
 /// than the policy judges.
 pub(crate) enum PolicyTarget<'a> {
@@ -307,7 +307,7 @@ fn evaluate_url(policy: &PermissionPolicy, raw: &str) -> PolicyDecision {
 /// correctly, so `https://openai.com@evil.com/` yields host `evil.com` (the
 /// userinfo cannot spoof the host).
 ///
-/// `pub(crate)`: display_descriptor (koe-whf) derives the human-shown host
+/// `pub(crate)`: display_descriptor (rhanis-whf) derives the human-shown host
 /// through this SAME parser, so the modal displays exactly what the policy judges.
 pub(crate) fn url_host(raw: &str) -> Option<Host<String>> {
     let u = Url::parse(raw).ok()?;
@@ -608,9 +608,9 @@ mod tests {
         let policy = PermissionPolicy::default();
         // Absolute but the parent does not exist → unresolvable → confirm.
         let bogus = if cfg!(windows) {
-            "C:\\koe-does-not-exist-xyz\\nope\\file.txt"
+            "C:\\rhanis-does-not-exist-xyz\\nope\\file.txt"
         } else {
-            "/koe-does-not-exist-xyz/nope/file.txt"
+            "/rhanis-does-not-exist-xyz/nope/file.txt"
         };
         assert_eq!(
             evaluate_policy(&policy, "read_file", ApprovalRisk::Safe, &args_path(bogus)),

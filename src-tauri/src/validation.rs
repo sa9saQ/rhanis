@@ -1,4 +1,4 @@
-//! Path validation for file-touching tools (koe-1vi).
+//! Path validation for file-touching tools (rhanis-1vi).
 //!
 //! Adapted from Enitar's `validation.rs`. Confines file access to an explicit
 //! allow-list of base directories (M1: Documents / Desktop, supplied by the
@@ -8,14 +8,14 @@
 //! # Why it lives here (and is not yet called)
 //! The approval gate gates DANGER file operations (`delete_file`, …); the actual
 //! path-safety check happens when those operations *execute* — in the
-//! tool_dispatcher (koe-2gy) and the file tools (`read_file` / `write_file`,
-//! koe-s7i). This module is the stable, fully-tested primitive those PRs import,
+//! tool_dispatcher (rhanis-2gy) and the file tools (`read_file` / `write_file`,
+//! rhanis-s7i). This module is the stable, fully-tested primitive those PRs import,
 //! landed here per the issue scope. Functions with no in-crate caller yet carry
 //! `#[allow(dead_code)]` naming the consumer — the same interface-first
 //! convention as `secret_store::SecretStore::get_api_key` and the
 //! `storage::RecorderAdapter` methods, NOT skeleton.
 //!
-//! # TOCTOU caveat for consumers (koe-2gy / koe-s7i) — MUST read
+//! # TOCTOU caveat for consumers (rhanis-2gy / rhanis-s7i) — MUST read
 //! These functions validate the path **at call time** and return a `PathBuf`.
 //! Between validation and the eventual open, a component could be swapped for a
 //! symlink that escapes the allow-list (time-of-check vs time-of-use). The
@@ -23,7 +23,7 @@
 //! open it without following symlinks (Unix: `O_NOFOLLOW` via `OpenOptions`
 //! `custom_flags`; Windows: do not follow reparse points) and operate on the
 //! resulting handle — never re-resolve the path by name. Tracked for the file
-//! tools (koe-s7i) and the dispatcher (koe-2gy), which own the actual I/O.
+//! tools (rhanis-s7i) and the dispatcher (rhanis-2gy), which own the actual I/O.
 //!
 //! transaction N/A · idempotency_key N/A (read-only path validation, not billing).
 
@@ -46,7 +46,7 @@ const SENSITIVE_COMPONENTS: &[&str] = &[
     ".svn",
     ".hg",
     "node_modules",
-    // Credential-bearing dotfiles/dirs (koe-351): a broad user allow-list (e.g.
+    // Credential-bearing dotfiles/dirs (rhanis-351): a broad user allow-list (e.g.
     // the whole home/project dir) must NOT let the AI auto-touch these. Only
     // high-confidence, low-false-positive secret names (`.env.example` is a
     // distinct component and is NOT matched).
@@ -66,7 +66,7 @@ const SENSITIVE_COMPONENTS: &[&str] = &[
     ".git",
     ".local", // parity with the non-Windows list (e.g. a synced .local dir)
     "node_modules",
-    // Credential-bearing dotfiles/dirs (koe-351) — parity with the non-Windows
+    // Credential-bearing dotfiles/dirs (rhanis-351) — parity with the non-Windows
     // list (these can appear under a synced/WSL home or a project dir on Windows).
     ".env",
     ".netrc",
@@ -84,7 +84,7 @@ const SENSITIVE_COMPONENTS: &[&str] = &[
 ];
 
 /// Absolute system-directory roots that must never be auto-approved or touched,
-/// even inside a user allow-list (koe-351). Matched as a path PREFIX of the
+/// even inside a user allow-list (rhanis-351). Matched as a path PREFIX of the
 /// canonical path (component-wise, via [`is_within`]) — NOT a bare component —
 /// so `/etc/shadow` is caught while a normal `/home/u/project/etc/config` is not.
 /// Windows system roots are drive-prefixed and already covered as components in
@@ -145,7 +145,7 @@ impl std::error::Error for PathValidationError {}
 /// (case-insensitive — Windows and macOS file systems are case-insensitive, and
 /// a case-only bypass like `.SSH` must not slip through).
 ///
-/// `pub(crate)` so the permission policy (koe-351) can enforce the SAME
+/// `pub(crate)` so the permission policy (rhanis-351) can enforce the SAME
 /// non-overridable baseline before honouring a user allow-list.
 pub(crate) fn contains_sensitive(path: &Path) -> bool {
     let component_match = path.components().any(|c| {
@@ -155,7 +155,7 @@ pub(crate) fn contains_sensitive(path: &Path) -> bool {
         }
         // Dotenv variants beyond the exact `.env` (`.env.local`, `.env.production`,
         // `.env.staging`, …) are credential files too and must not slip through a
-        // broad user allow-list (koe-351). Known non-secret templates
+        // broad user allow-list (rhanis-351). Known non-secret templates
         // (`.env.example` / `.sample` / `.template` / `.dist`) stay readable.
         if let Some(suffix) = name.strip_prefix(".env.") {
             return !matches!(suffix, "example" | "sample" | "template" | "dist");
@@ -165,7 +165,7 @@ pub(crate) fn contains_sensitive(path: &Path) -> bool {
     if component_match {
         return true;
     }
-    // System-root prefix check (koe-351): on Unix, system dirs have no drive
+    // System-root prefix check (rhanis-351): on Unix, system dirs have no drive
     // prefix, so a path like `/etc/shadow` has no individually-sensitive component
     // name. Catch it by canonical-path prefix so a broad user allow-list can never
     // auto-approve a system path.
@@ -178,7 +178,7 @@ pub(crate) fn contains_sensitive(path: &Path) -> bool {
 /// `strip_prefix`, so `/home/u/Documents_evil/x` is correctly NOT inside
 /// `/home/u/Documents` (a naive `starts_with` on the string form would match).
 ///
-/// `pub(crate)` so the permission policy (koe-351) can reuse the same boundary
+/// `pub(crate)` so the permission policy (rhanis-351) can reuse the same boundary
 /// check for its folder allow/deny lists. Both `candidate` and `base` MUST be
 /// canonicalized by the caller for the comparison to be meaningful.
 pub(crate) fn is_within(candidate: &Path, base: &Path) -> bool {
@@ -197,7 +197,7 @@ fn within_any_allowed(candidate: &Path, allowed_bases: &[PathBuf]) -> bool {
 }
 
 /// Resolves `input` to a canonical, boundary-comparable absolute path for the
-/// permission policy (koe-351), or `None` when it cannot be trusted. Unlike
+/// permission policy (rhanis-351), or `None` when it cannot be trusted. Unlike
 /// [`validate_read_path`]/[`validate_write_path`] this does NOT confine to an
 /// allow-list or require a regular file — it is the shared primitive the policy
 /// uses to ask "where does this path REALLY land?" before consulting the user's
@@ -245,7 +245,7 @@ pub(crate) fn resolve_for_boundary(input: &str) -> Option<PathBuf> {
 /// or a symlink that escapes the allow-list is rejected as
 /// [`OutsideAllowed`](PathValidationError::OutsideAllowed).
 ///
-/// Consumed by the `read_file` tool (koe-s7i) and the tool_dispatcher (koe-2gy).
+/// Consumed by the `read_file` tool (rhanis-s7i) and the tool_dispatcher (rhanis-2gy).
 #[allow(dead_code)]
 pub fn validate_read_path(
     input: &str,
@@ -277,7 +277,7 @@ pub fn validate_read_path(
 /// already exists, it is fully canonicalized and re-checked so a pre-placed
 /// symlink cannot redirect the write outside the allow-list.
 ///
-/// Consumed by the `write_file` tool (koe-s7i) and the tool_dispatcher (koe-2gy).
+/// Consumed by the `write_file` tool (rhanis-s7i) and the tool_dispatcher (rhanis-2gy).
 #[allow(dead_code)]
 pub fn validate_write_path(
     input: &str,
@@ -639,11 +639,11 @@ mod tests {
         );
     }
 
-    // ---- expanded credential baseline (koe-351) ------------------------------
+    // ---- expanded credential baseline (rhanis-351) ------------------------------
 
     #[test]
     fn contains_sensitive_catches_credential_dotfiles() {
-        // The koe-351 baseline expansion: a broad user allow-list must not be
+        // The rhanis-351 baseline expansion: a broad user allow-list must not be
         // able to reach these even inside an otherwise-allowed dir.
         for name in [".env", ".netrc", ".npmrc", ".pgpass", ".docker", ".kube"] {
             let p = Path::new("/home/u/work").join(name).join("inner");
@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn contains_sensitive_catches_dotenv_variants_but_not_templates() {
         // Secret dotenv variants beyond the exact `.env` must be caught even
-        // inside a broadly allow-listed folder (koe-351 baseline strengthening).
+        // inside a broadly allow-listed folder (rhanis-351 baseline strengthening).
         for secret in [".env.local", ".env.production", ".env.development", ".env.test", ".env.staging"] {
             assert!(
                 contains_sensitive(&Path::new("/home/u/project").join(secret)),
@@ -692,7 +692,7 @@ mod tests {
         assert!(!contains_sensitive(Path::new("/var/tmp/x")));
     }
 
-    // ---- resolve_for_boundary (koe-351 shared primitive) ---------------------
+    // ---- resolve_for_boundary (rhanis-351 shared primitive) ---------------------
 
     #[test]
     fn resolve_for_boundary_resolves_existing_file_and_dir() {
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn resolve_for_boundary_rejects_unresolvable_and_empty() {
-        assert_eq!(resolve_for_boundary("/koe-nope-xyz/missing/file.txt"), None);
+        assert_eq!(resolve_for_boundary("/rhanis-nope-xyz/missing/file.txt"), None);
         assert_eq!(resolve_for_boundary("   "), None);
         assert_eq!(resolve_for_boundary(&"a".repeat(MAX_PATH_LENGTH + 1)), None);
     }

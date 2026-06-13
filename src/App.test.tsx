@@ -9,12 +9,12 @@ const getAppSettings = vi.fn();
 // — those must be in the mock to avoid "not a function" errors.
 vi.mock("./lib/tauri/ipc", () => ({
   onToolEvent: vi.fn().mockResolvedValue(() => {}),
-  // Thinking-event wiring (glass-box M1, koe-sua.1) — useActivityEvents subscribes.
+  // Thinking-event wiring (glass-box M1, rhanis-sua.1) — useActivityEvents subscribes.
   onThinkingEvent: vi.fn().mockResolvedValue(() => {}),
   onProviderError: vi.fn().mockResolvedValue(() => {}),
   onApprovalRequired: vi.fn().mockResolvedValue(() => {}),
   onSessionStatus: vi.fn().mockResolvedValue(() => {}),
-  // Cost snapshot wiring (koe-9xi) — useCostEvents subscribes + pulls on mount.
+  // Cost snapshot wiring (rhanis-9xi) — useCostEvents subscribes + pulls on mount.
   onCostUpdate: vi.fn().mockResolvedValue(() => {}),
   getCostSnapshot: vi.fn().mockResolvedValue({
     month: 202606,
@@ -61,7 +61,7 @@ describe("App", () => {
     await act(async () => {
       render(<App />);
     });
-    // The console shell (koe-ios.1) renders the idle greeting as its h1 anchor.
+    // The console shell (rhanis-ios.1) renders the idle greeting as its h1 anchor.
     expect(
       screen.getByRole("heading", { level: 1, name: "今日は何をしましょう？" }),
     ).toBeInTheDocument();

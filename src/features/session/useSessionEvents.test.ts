@@ -144,7 +144,7 @@ describe("useSessionEvents", () => {
     await waitFor(() => expect(mockStopSession).toHaveBeenCalledTimes(1));
   });
 
-  it("(P1-b) fires stopSession when listen() rejects during a reconnecting session (koe-byf)", async () => {
+  it("(P1-b) fires stopSession when listen() rejects during a reconnecting session (rhanis-byf)", async () => {
     // Pre-condition: session is reconnecting — the backend supervisor is actively
     // re-opening (billable) connections, so a dropped status channel must force-stop
     // it (else the reconnect storm runs unbounded with the UI stuck on the error).

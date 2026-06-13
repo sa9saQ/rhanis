@@ -31,43 +31,43 @@ export type Provider = VoiceProvider | ToolProvider;
 /** Backend event channels. */
 export const EVENT = {
   toolEvent: "tool-event",
-  // Pre-tool thinking disclosure pushed just before a tool runs (glass-box M1, koe-sua.1).
+  // Pre-tool thinking disclosure pushed just before a tool runs (glass-box M1, rhanis-sua.1).
   thinkingEvent: "thinking-event",
   approvalRequired: "tool-approval-required",
   sessionStatus: "session-status",
-  // Live monthly cost snapshot pushed on each usage frame (koe-9xi).
+  // Live monthly cost snapshot pushed on each usage frame (rhanis-9xi).
   costUpdate: "cost-update",
-  // Non-benign server error surfaced mid-session (koe-nal).
+  // Non-benign server error surfaced mid-session (rhanis-nal).
   providerError: "provider-error",
 } as const;
 
 /** Backend command names. */
 export const COMMAND = {
   resolveToolApproval: "resolve_tool_approval",
-  // Settings commands (koe-200)
+  // Settings commands (rhanis-200)
   getAppSettings: "get_app_settings",
   completeOnboarding: "complete_onboarding",
   saveBudgetConfig: "save_budget_config",
   setRecorderAdapter: "set_recorder_adapter",
-  // Multi-provider settings (koe-31u)
+  // Multi-provider settings (rhanis-31u)
   setVoiceProvider: "set_voice_provider",
   setToolProviderEnabled: "set_tool_provider_enabled",
   deleteToolProviderKey: "delete_tool_provider_key",
-  // Permission policy (koe-351)
+  // Permission policy (rhanis-351)
   setPermissionPolicy: "set_permission_policy",
   pickFolder: "pick_folder",
   // Secret store commands (secret_store.rs)
   setOpenaiApiKey: "set_openai_api_key",
   hasOpenaiApiKey: "has_openai_api_key",
   deleteOpenaiApiKey: "delete_openai_api_key",
-  // Multi-provider secret commands (koe-31u) — write + presence only, no get-*
+  // Multi-provider secret commands (rhanis-31u) — write + presence only, no get-*
   setProviderApiKey: "set_provider_api_key",
   hasProviderApiKey: "has_provider_api_key",
   deleteProviderApiKey: "delete_provider_api_key",
-  // Session lifecycle commands (koe-e3m)
+  // Session lifecycle commands (rhanis-e3m)
   startSession: "start_session",
   stopSession: "stop_session",
-  // Cost snapshot pull (koe-9xi)
+  // Cost snapshot pull (rhanis-9xi)
   getCostSnapshot: "get_cost_snapshot",
 } as const;
 
@@ -77,9 +77,9 @@ export function onToolEvent(handler: (event: ToolEvent) => void): Promise<Unlist
 }
 
 /**
- * Subscribe to live thinking disclosures (glass-box M1, koe-sua.1). The backend
+ * Subscribe to live thinking disclosures (glass-box M1, rhanis-sua.1). The backend
  * pushes one just before a tool runs — before that tool's `tool-event` — so the
- * UI can show what koe is about to do inside the 300–700ms thinking window.
+ * UI can show what Rhanis is about to do inside the 300–700ms thinking window.
  * Returns an unlisten function.
  */
 export function onThinkingEvent(handler: (event: ThinkingEvent) => void): Promise<UnlistenFn> {
@@ -94,7 +94,7 @@ export function onApprovalRequired(
 }
 
 /**
- * Subscribe to non-benign provider/server errors (koe-nal) — e.g. a rejected
+ * Subscribe to non-benign provider/server errors (rhanis-nal) — e.g. a rejected
  * `session.update`. Returns an unlisten function.
  */
 export function onProviderError(
@@ -111,7 +111,7 @@ export function onSessionStatus(
 }
 
 /**
- * Subscribe to live monthly-cost snapshots (koe-9xi). The backend pushes one on
+ * Subscribe to live monthly-cost snapshots (rhanis-9xi). The backend pushes one on
  * every usage frame, including the over-budget snapshot just before it stops the
  * session. Returns an unlisten function.
  */
@@ -132,7 +132,7 @@ export function resolveToolApproval(
 }
 
 // ---------------------------------------------------------------------------
-// Settings commands (koe-200)
+// Settings commands (rhanis-200)
 // ---------------------------------------------------------------------------
 
 /** Returns the persisted app settings. Contains no secret values. */
@@ -192,7 +192,7 @@ export function deleteOpenaiApiKey(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-provider key + voice/tool settings commands (koe-31u)
+// Multi-provider key + voice/tool settings commands (rhanis-31u)
 //
 // Provider ids are resolved by a closed allowlist on the Rust side, so an
 // unknown provider is rejected before the vault is touched. As with OpenAI,
@@ -218,7 +218,7 @@ export function deleteToolProviderKey(provider: ToolProvider): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Permission policy commands (koe-351)
+// Permission policy commands (rhanis-351)
 // ---------------------------------------------------------------------------
 
 /**
@@ -261,7 +261,7 @@ export function deleteProviderApiKey(provider: Provider): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Session lifecycle commands (koe-e3m)
+// Session lifecycle commands (rhanis-e3m)
 // ---------------------------------------------------------------------------
 
 /**
@@ -280,7 +280,7 @@ export function stopSession(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Cost snapshot (koe-9xi)
+// Cost snapshot (rhanis-9xi)
 // ---------------------------------------------------------------------------
 
 /**

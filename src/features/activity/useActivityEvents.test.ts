@@ -44,7 +44,7 @@ describe("useActivityEvents", () => {
     });
   });
 
-  it("routes provider errors into the store (koe-nal)", async () => {
+  it("routes provider errors into the store (rhanis-nal)", async () => {
     renderHook(() => useActivityEvents());
     await waitFor(() => expect(handlers.providerError).toBeTypeOf("function"));
     const event: ProviderErrorEvent = {

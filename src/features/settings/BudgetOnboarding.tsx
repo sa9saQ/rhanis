@@ -35,19 +35,19 @@ export function BudgetOnboarding({ onBudgetChosen }: BudgetOnboardingProps) {
   }
 
   return (
-    <div className="koe-budget-onboarding">
-      <h2 className="koe-onboarding-title">月次予算の設定</h2>
-      <p className="koe-onboarding-desc">
+    <div className="rhanis-budget-onboarding">
+      <h2 className="rhanis-onboarding-title">月次予算の設定</h2>
+      <p className="rhanis-onboarding-desc">
         BYOK（自分のOpenAIキーを使う）方式では、高額課金はご自身の負担になります。
         <br />
         音声APIは高価（1分あたり約¥15〜75相当）なので、上限設定を推奨します。
       </p>
 
-      <fieldset className="koe-budget-fieldset">
-        <legend className="koe-visually-hidden">予算の選択</legend>
+      <fieldset className="rhanis-budget-fieldset">
+        <legend className="rhanis-visually-hidden">予算の選択</legend>
 
         {/* aria-label removed: the wrapping <label> + <span> already provide the name */}
-        <label className="koe-budget-option">
+        <label className="rhanis-budget-option">
           <input
             type="radio"
             name="budget-choice"
@@ -59,10 +59,10 @@ export function BudgetOnboarding({ onBudgetChosen }: BudgetOnboardingProps) {
         </label>
 
         {choice === "limited" && (
-          <div className="koe-budget-amount">
-            <label htmlFor="koe-budget-amount-input">月額上限（USD）</label>
+          <div className="rhanis-budget-amount">
+            <label htmlFor="rhanis-budget-amount-input">月額上限（USD）</label>
             <input
-              id="koe-budget-amount-input"
+              id="rhanis-budget-amount-input"
               type="number"
               min="0.01"
               max="1000000"
@@ -70,13 +70,13 @@ export function BudgetOnboarding({ onBudgetChosen }: BudgetOnboardingProps) {
               value={amountStr}
               onChange={(e) => setAmountStr(e.target.value)}
               placeholder="例: 10.00"
-              className="koe-input"
+              className="rhanis-input"
             />
           </div>
         )}
 
         {/* aria-label removed: the wrapping <label> + <span> already provide the name */}
-        <label className="koe-budget-option">
+        <label className="rhanis-budget-option">
           <input
             type="radio"
             name="budget-choice"
@@ -92,7 +92,7 @@ export function BudgetOnboarding({ onBudgetChosen }: BudgetOnboardingProps) {
         type="button"
         onClick={handleSubmit}
         disabled={!canSubmit}
-        className="koe-btn koe-btn-primary"
+        className="rhanis-btn rhanis-btn-primary"
         aria-label="次へ"
       >
         次へ

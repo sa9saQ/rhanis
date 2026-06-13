@@ -39,7 +39,7 @@ describe("ActivityLog", () => {
     expect(screen.getAllByText("web_search").length).toBeGreaterThanOrEqual(1);
   });
 
-  it("shows 再接続中 while the session is reconnecting (koe-byf)", () => {
+  it("shows 再接続中 while the session is reconnecting (rhanis-byf)", () => {
     render(<ActivityLog />);
     act(() => {
       useActivityStore.getState().setSessionStatus({ state: "reconnecting", sequence: 1 });
@@ -49,7 +49,7 @@ describe("ActivityLog", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("surfaces a provider/server error without flipping the session status (koe-nal)", () => {
+  it("surfaces a provider/server error without flipping the session status (rhanis-nal)", () => {
     render(<ActivityLog />);
     act(() => {
       useActivityStore.getState().setSessionStatus({ state: "connected", sequence: 1 });
@@ -75,7 +75,7 @@ describe("ActivityLog", () => {
     expect(screen.getByRole("list", { name: "サーバーエラー" })).toBeInTheDocument();
   });
 
-  it("shows the WHY of an error row via the backend detail (koe-r2o)", () => {
+  it("shows the WHY of an error row via the backend detail (rhanis-r2o)", () => {
     render(<ActivityLog />);
     act(() => {
       useActivityStore.getState().ingestToolEvent({
@@ -121,7 +121,7 @@ describe("ActivityLog", () => {
     expect(region.querySelectorAll("li")).toHaveLength(0);
   });
 
-  it("discloses what koe is about to do, with the verifiable tool (glass-box M1)", () => {
+  it("discloses what Rhanis is about to do, with the verifiable tool (glass-box M1)", () => {
     render(<ActivityLog />);
     act(() => {
       useActivityStore.getState().ingestThinkingEvent({

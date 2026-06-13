@@ -1,25 +1,25 @@
-/* CostHeader (koe-9xi) — live monthly spend + over-budget stop/raise control.
+/* CostHeader (rhanis-9xi) — live monthly spend + over-budget stop/raise control.
  * Moved out of ActivityLog.css when the component moved to the console sidebar
- * foot (koe-ios.1): the styles ship WITH the component so no screen depends on
- * another feature's CSS happening to be loaded (the koe-iyr class of bug). */
+ * foot (rhanis-ios.1): the styles ship WITH the component so no screen depends on
+ * another feature's CSS happening to be loaded (the rhanis-iyr class of bug). */
 
-.koe-cost {
+.rhanis-cost {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
-.koe-cost-line,
-.koe-cost-unknown {
+.rhanis-cost-line,
+.rhanis-cost-unknown {
   font-size: 13px;
   color: var(--muted); /* ≈7:1 on --panel, well past AA in both palettes */
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.01em;
 }
 /* Fail-closed: an explicit "unknown" is tinted amber so it never reads as a calm $0. */
-.koe-cost-unknown {
+.rhanis-cost-unknown {
   color: var(--tone-connecting);
 }
-.koe-cost-overbudget {
+.rhanis-cost-overbudget {
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -29,13 +29,13 @@
   border-radius: 9px;
   background: color-mix(in srgb, var(--tone-error) 10%, transparent);
 }
-.koe-cost-stop {
+.rhanis-cost-stop {
   margin: 0;
   font-size: 13px;
   font-weight: 600;
   color: var(--tone-error);
 }
-.koe-cost-raise {
+.rhanis-cost-raise {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -44,7 +44,7 @@
   color: var(--muted);
 }
 /* Self-contained input/button styles (no dependency on settings.css load order). */
-.koe-cost-input {
+.rhanis-cost-input {
   font-size: 16px; /* >=16px avoids mobile auto-zoom (quality.md) */
   padding: 7px 10px;
   width: 8.5rem;
@@ -53,11 +53,11 @@
   background: var(--panel-2);
   color: var(--text);
 }
-.koe-cost-input:focus {
+.rhanis-cost-input:focus {
   outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
   outline-offset: 1px;
 }
-.koe-cost-raise-btn {
+.rhanis-cost-raise-btn {
   font-size: 14px;
   font-weight: 600;
   padding: 8px 14px;
@@ -68,14 +68,14 @@
   background: var(--accent);
   transition: opacity var(--dur-hover) var(--ease-standard);
 }
-.koe-cost-raise-btn:hover:not(:disabled) {
+.rhanis-cost-raise-btn:hover:not(:disabled) {
   opacity: 0.9;
 }
-.koe-cost-raise-btn:disabled {
+.rhanis-cost-raise-btn:disabled {
   opacity: 0.55;
   cursor: default;
 }
-.koe-cost-error {
+.rhanis-cost-error {
   margin: 0;
   font-size: 12px;
   color: var(--tone-error);

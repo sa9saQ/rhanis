@@ -108,7 +108,7 @@ describe("ApprovalModal", () => {
         .enqueueApproval(approval({ approvalId: "a1", risk: "CAUTION", tool: "open_url" })),
     );
     expect(screen.getByText("CAUTION")).toBeInTheDocument();
-    expect(document.querySelector(".koe-risk-caution")).not.toBeNull();
+    expect(document.querySelector(".rhanis-risk-caution")).not.toBeNull();
   });
 
   it("auto-dismisses the head request when its deadline passes (no resolve call)", () => {
@@ -127,7 +127,7 @@ describe("ApprovalModal", () => {
     expect(resolveToolApproval).not.toHaveBeenCalled();
   });
 
-  // --- a11y / keyboard operability (koe-471) ------------------------------
+  // --- a11y / keyboard operability (rhanis-471) ------------------------------
 
   it("moves initial focus to the deny (safe) button, not approve (fail-closed)", () => {
     render(<ApprovalModal />);

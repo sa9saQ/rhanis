@@ -1,6 +1,6 @@
-//! M1 tools registered into the dispatcher (koe-2gy + koe-s7i).
+//! M1 tools registered into the dispatcher (rhanis-2gy + rhanis-s7i).
 //!
-//! koe-2gy ships `write_note` (a SAFE, path-free reference tool). koe-s7i adds
+//! rhanis-2gy ships `write_note` (a SAFE, path-free reference tool). rhanis-s7i adds
 //! `web_search`, `read_file`, and `take_screenshot` here by extending
 //! [`register_m1_tools`].
 //!
@@ -206,15 +206,15 @@ pub fn command_is_allowed(args: &serde_json::Value) -> bool {
 }
 
 /// Registers every M1 tool (impl + `session.update` schema) into the dispatcher
-/// registry. The single place where koe-s7i wires all tools.
+/// registry. The single place where rhanis-s7i wires all tools.
 ///
 /// Production calls this from `lib.rs` setup. The read_file allowlist and
 /// screenshot save directory are resolved from the OS user directories here
-/// (koe-351 seam: pass user-configurable paths once the settings UI lands).
+/// (rhanis-351 seam: pass user-configurable paths once the settings UI lands).
 pub fn register_m1_tools(registry: &mut ToolRegistry, recorder: Arc<dyn RecorderAdapter>) {
     // Resolve the search provider from the environment (None if none configured).
-    // koe-8fw: provider selection — wire a real provider (+ Stronghold key,
-    // koe-351) inside `configured_search_provider`.
+    // rhanis-8fw: provider selection — wire a real provider (+ Stronghold key,
+    // rhanis-351) inside `configured_search_provider`.
     let search_provider = configured_search_provider();
     register_m1_tools_with_search(registry, recorder, search_provider);
 }
@@ -280,7 +280,7 @@ fn register_m1_tools_with_search(
 /// behaviour, which advertised the tool and let the model invoke a backend that
 /// could only ever return an error.
 ///
-/// # Why this returns `None` unconditionally today (fail-closed until koe-8fw)
+/// # Why this returns `None` unconditionally today (fail-closed until rhanis-8fw)
 ///
 /// The only candidate provider is `BingProvider`, and its endpoint — the Bing
 /// Web Search v7 API — was RETIRED 2025-08. Wiring `BingProvider::from_env()`
@@ -289,17 +289,17 @@ fn register_m1_tools_with_search(
 /// call it, and every call would 404 / auth-error at runtime. That is exactly
 /// the dead-tool failure this gate exists to prevent.
 ///
-/// Provider selection is deferred to **koe-8fw**. Until a working provider is
+/// Provider selection is deferred to **rhanis-8fw**. Until a working provider is
 /// actually wired here, the SHIP path returns `None` unconditionally so
 /// `web_search` is NEVER registered/advertised. The `SearchProvider` trait,
 /// `BingProvider`, and its reqwest timeout + body-cap are intentionally KEPT in
-/// the codebase (see `web_search.rs`) — koe-8fw will swap the endpoint and wire
+/// the codebase (see `web_search.rs`) — rhanis-8fw will swap the endpoint and wire
 /// the real provider in here. The unit tests inject a mock provider directly via
 /// `register_m1_tools_with_search(.., Some(mock))`, so the registration path
 /// stays covered without depending on this ship-path gate.
 fn configured_search_provider() -> Option<Arc<dyn web_search::SearchProvider>> {
-    // koe-8fw: return `Some(Arc::new(<real provider>))` once a working search
-    // endpoint + key retrieval (koe-351 Stronghold) is wired. Returning `None`
+    // rhanis-8fw: return `Some(Arc::new(<real provider>))` once a working search
+    // endpoint + key retrieval (rhanis-351 Stronghold) is wired. Returning `None`
     // here is the deliberate fail-closed default: no provider has a live
     // endpoint yet (Bing v7 retired 2025-08), so web_search stays unregistered.
     None
@@ -642,7 +642,7 @@ mod tests {
     //
     // The retired Bing v7 endpoint must never be re-advertised. The ship path
     // (`register_m1_tools` → `configured_search_provider`) returns `None`
-    // unconditionally until koe-8fw wires a working provider — so even if a
+    // unconditionally until rhanis-8fw wires a working provider — so even if a
     // `BING_API_KEY` is present in the process environment, web_search must NOT
     // be registered (otherwise the model calls a dead tool that 404s/auth-errors).
     //
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn configured_search_provider_returns_none_on_ship_path() {
         // The ship-path resolver returns None unconditionally (fail-closed until
-        // koe-8fw). Set BING_API_KEY to prove the env no longer flips this.
+        // rhanis-8fw). Set BING_API_KEY to prove the env no longer flips this.
         // Serialise against other env-mutating tests to avoid a race.
         let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("BING_API_KEY").ok();
