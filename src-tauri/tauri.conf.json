@@ -13,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "koe",
+        "title": "Rhanis Agent",
         "width": 800,
         "height": 600
       }
