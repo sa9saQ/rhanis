@@ -215,6 +215,66 @@ impl SnapshotPassword for KeychainPassword {
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot encryption work factor (rhanis-ds6).
+// ---------------------------------------------------------------------------
+
+/// Work factor used to encrypt the Stronghold snapshot. We deliberately use `0`.
+///
+/// # Why `0` is safe here (invariant — do not weaken without re-reading)
+///
+/// `stronghold_engine` encrypts the on-disk snapshot file with `age` (scrypt) under
+/// a tunable *work factor* held in a process-global `static ENCRYPT_WORK_FACTOR`
+/// (`stronghold_engine` `snapshot/logic.rs`), initialised to
+/// `age::RECOMMENDED_MINIMUM_ENCRYPT_WORK_FACTOR` (19). That outer file encryption
+/// costs ≈1s of scrypt, and Stronghold pays it on **every** `open` (load) and
+/// `save` — so a single key write (open + has-check + save) burned several seconds,
+/// the cross-cutting cause of rhanis-ds6 symptoms 1/2/3 (slow save / slow startup /
+/// heavy finish). (The outer age file layer is the only scrypt cost we can tune
+/// and is the dominant one; the inner per-client state encryption is already
+/// hard-coded to factor 0 upstream, so it costs nothing to begin with.)
+///
+/// The work factor only strengthens *weak, low-entropy, password-based* keys. Our
+/// snapshot key is not password-based: `KeychainPassword::obtain_or_create` draws a
+/// full 32-byte key straight from the OS CSPRNG (`getrandom`) and Stronghold uses
+/// those raw bytes as the age key. `stronghold_engine`'s own
+/// `encrypt_content_with_work_factor` docs (`snapshot/logic.rs`) are explicit:
+/// "Strong keys generated with cryptographically secure RNG do not need
+/// strengthening and can use minimal (0) work factor." So for our key `0` is the
+/// upstream-documented-correct value, not a downgrade: it lowers only the scrypt
+/// stretching of the key (worthless against a 256-bit keyspace) and changes nothing
+/// about the random salt/nonce or the ChaCha20-Poly1305 confidentiality.
+///
+/// INVARIANT 1 (key entropy): sound **only** while the snapshot key stays a
+/// full-entropy CSPRNG key. If `KeychainPassword::obtain_or_create` is ever changed
+/// to derive the key from a user password / passphrase / PIN (low entropy), this
+/// MUST be reverted to a high work factor — `0` with a weak key allows full offline
+/// compromise of every stored secret.
+///
+/// INVARIANT 2 (scope): the factor is process-global. Today `secret_store` owns the
+/// only Stronghold vault in the app, so lowering it is contained. Any *new*
+/// Stronghold snapshot added later would also inherit `0` and must independently
+/// satisfy INVARIANT 1.
+pub const SNAPSHOT_ENCRYPT_WORK_FACTOR: u8 = 0;
+
+/// Lowers the global Stronghold snapshot **encrypt** work factor to
+/// [`SNAPSHOT_ENCRYPT_WORK_FACTOR`] (0). Call once at startup, before the secret
+/// store performs any open/save, so writes no longer pay ≈1s of scrypt (rhanis-ds6).
+///
+/// Backward-compatible: this changes only the *encrypt* factor. Decryption uses a
+/// ceiling of `age::RECOMMENDED_MAXIMUM_DECRYPT_WORK_FACTOR` (23), so any snapshot
+/// written at the old factor (19) still opens and the next save rewrites it at the
+/// new factor.
+///
+/// A failure is non-fatal and fail-safe: the global keeps the strong, slow default
+/// (19), so callers may ignore the error rather than abort startup. `0` is a valid
+/// `age` work factor, so this returns `Ok` in practice; the `Result` is surfaced
+/// only so the effect is unit-testable.
+pub fn set_encrypt_work_factor_for_strong_key() -> Result<(), SecretError> {
+    iota_stronghold::engine::snapshot::try_set_encrypt_work_factor(SNAPSHOT_ENCRYPT_WORK_FACTOR)
+        .map_err(|_| SecretError::Backend)
+}
+
+// ---------------------------------------------------------------------------
 // StrongholdSecretStore — the real M1 implementation.
 // ---------------------------------------------------------------------------
 
@@ -580,9 +640,37 @@ mod tests {
     fn temp_store(
         password: Box<dyn SnapshotPassword>,
     ) -> (StrongholdSecretStore, tempfile::TempDir) {
+        // Mirror production startup (rhanis-ds6): run integration tests at the same
+        // work factor 0 the app uses, so they exercise the real encrypt path and
+        // don't each pay ≈1s of scrypt. The test keys are full 32-byte keys, so the
+        // strong-key invariant holds here too.
+        let _ = set_encrypt_work_factor_for_strong_key();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rhanis-secrets.stronghold");
         (StrongholdSecretStore::new(path, password), dir)
+    }
+
+    // ---- snapshot encrypt work factor (rhanis-ds6) -------------------------
+
+    #[test]
+    fn set_encrypt_work_factor_for_strong_key_takes_effect() {
+        // The wrapper must actually lower the global factor; `try_from(0)` is a
+        // valid age WorkFactor (0 < 64), so this returns Ok and the global reads
+        // back as 0. Guards against a silent no-op that would leave every save
+        // paying ≈1s of scrypt.
+        //
+        // `ENCRYPT_WORK_FACTOR` is a PROCESS-GLOBAL atomic shared by every test in
+        // this binary (cargo runs them multi-threaded). This assertion is sound
+        // only because `0` is the *only* value any test ever writes (here and in
+        // `temp_store`), so the global monotonically goes 19→0 and can never be
+        // observed non-zero. If a future test needs a different factor it MUST add
+        // serial isolation (e.g. `serial_test`) for ALL writers, or this and the
+        // round-trip tests become order-dependent.
+        set_encrypt_work_factor_for_strong_key().expect("work factor 0 is valid");
+        assert_eq!(
+            iota_stronghold::engine::snapshot::get_encrypt_work_factor(),
+            SNAPSHOT_ENCRYPT_WORK_FACTOR
+        );
     }
 
     // ---- SecretString redaction --------------------------------------------
