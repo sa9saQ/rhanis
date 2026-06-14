@@ -72,6 +72,13 @@ pub fn run() {
                 KEYCHAIN_SERVICE,
                 KEYCHAIN_SNAPSHOT_ACCOUNT,
             ));
+            // rhanis-ds6: drop the Stronghold snapshot encrypt work factor to 0
+            // before the store performs any open/save, eliminating the ≈1s of
+            // scrypt each save/open otherwise pays. Sound only because the snapshot
+            // key is a 32-byte CSPRNG key — see the invariant on
+            // secret_store::SNAPSHOT_ENCRYPT_WORK_FACTOR. Non-fatal: on failure the
+            // global keeps the safe, slow default, so we do not abort startup.
+            let _ = secret_store::set_encrypt_work_factor_for_strong_key();
             let store = StrongholdSecretStore::new(snapshot_path, password);
             app.manage(ManagedSecretStore(Arc::new(store)));
 
