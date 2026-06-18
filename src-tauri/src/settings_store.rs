@@ -378,13 +378,16 @@ pub async fn complete_onboarding(
 ) -> Result<(), String> {
     validate_recorder_adapter(&recorder_adapter)?;
 
-    // Fail-closed: an Err (locked / corrupt vault) is treated as "no key",
-    // never as "key present".
-    if !secret
-        .0
-        .has_api_key(OPENAI_KEY_NAME)
-        .map_err(|e| e.to_string())?
-    {
+    // Fail-closed: an Err (locked / corrupt vault) propagates and aborts
+    // onboarding, never collapsing to "key present". rhanis-nt2: the blocking
+    // snapshot read runs on a blocking thread (a JoinError also aborts, under a
+    // fixed message) so it never stalls a tokio worker.
+    let secret_store = secret.0.clone();
+    let has_key = tokio::task::spawn_blocking(move || secret_store.has_api_key(OPENAI_KEY_NAME))
+        .await
+        .map_err(|_| "secret store operation failed".to_string())?
+        .map_err(|e| e.to_string())?;
+    if !has_key {
         return Err("an API key must be stored before completing onboarding".to_string());
     }
 

@@ -476,9 +476,15 @@ pub async fn set_openai_api_key(
     store: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<(), String> {
     let key = normalize_api_key(&key).map_err(|e| e.to_string())?;
-    store
-        .0
-        .save_api_key(OPENAI_KEY_NAME, SecretString::new(key.to_string()))
+    let secret = SecretString::new(key.to_string());
+    // rhanis-nt2: the Stronghold commit is blocking (snapshot encrypt) — run it
+    // on a blocking thread so it never stalls a tokio worker. A JoinError (task
+    // panic) propagates as Err (fail-closed) under a fixed message, and
+    // SecretError's Display is itself a fixed string that never carries the key.
+    let store = store.0.clone();
+    tokio::task::spawn_blocking(move || store.save_api_key(OPENAI_KEY_NAME, secret))
+        .await
+        .map_err(|_| "secret store operation failed".to_string())?
         .map_err(|e| e.to_string())
 }
 
@@ -500,9 +506,11 @@ fn normalize_api_key(raw: &str) -> Result<&str, &'static str> {
 pub async fn has_openai_api_key(
     store: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<bool, String> {
-    store
-        .0
-        .has_api_key(OPENAI_KEY_NAME)
+    // rhanis-nt2: blocking snapshot read off the async worker (see set_* above).
+    let store = store.0.clone();
+    tokio::task::spawn_blocking(move || store.has_api_key(OPENAI_KEY_NAME))
+        .await
+        .map_err(|_| "secret store operation failed".to_string())?
         .map_err(|e| e.to_string())
 }
 
@@ -511,9 +519,11 @@ pub async fn has_openai_api_key(
 pub async fn delete_openai_api_key(
     store: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<(), String> {
-    store
-        .0
-        .delete_api_key(OPENAI_KEY_NAME)
+    // rhanis-nt2: blocking snapshot commit off the async worker (see set_* above).
+    let store = store.0.clone();
+    tokio::task::spawn_blocking(move || store.delete_api_key(OPENAI_KEY_NAME))
+        .await
+        .map_err(|_| "secret store operation failed".to_string())?
         .map_err(|e| e.to_string())
 }
 
@@ -559,11 +569,15 @@ pub async fn set_provider_api_key(
     key: String,
     store: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<(), String> {
+    // Resolve the allowlist + normalize on the async side (cheap, holds no lock),
+    // then run only the blocking Stronghold commit on a blocking thread (rhanis-nt2).
     let name = provider_key_name(&provider).map_err(|e| e.to_string())?;
     let key = normalize_api_key(&key).map_err(|e| e.to_string())?;
-    store
-        .0
-        .save_api_key(name, SecretString::new(key.to_string()))
+    let secret = SecretString::new(key.to_string());
+    let store = store.0.clone();
+    tokio::task::spawn_blocking(move || store.save_api_key(name, secret))
+        .await
+        .map_err(|_| "secret store operation failed".to_string())?
         .map_err(|e| e.to_string())
 }
 
@@ -576,7 +590,12 @@ pub async fn has_provider_api_key(
     store: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<bool, String> {
     let name = provider_key_name(&provider).map_err(|e| e.to_string())?;
-    store.0.has_api_key(name).map_err(|e| e.to_string())
+    // rhanis-nt2: blocking snapshot read off the async worker.
+    let store = store.0.clone();
+    tokio::task::spawn_blocking(move || store.has_api_key(name))
+        .await
+        .map_err(|_| "secret store operation failed".to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Deletes the stored key for `provider`.
@@ -586,7 +605,12 @@ pub async fn delete_provider_api_key(
     store: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<(), String> {
     let name = provider_key_name(&provider).map_err(|e| e.to_string())?;
-    store.0.delete_api_key(name).map_err(|e| e.to_string())
+    // rhanis-nt2: blocking snapshot commit off the async worker.
+    let store = store.0.clone();
+    tokio::task::spawn_blocking(move || store.delete_api_key(name))
+        .await
+        .map_err(|_| "secret store operation failed".to_string())?
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
