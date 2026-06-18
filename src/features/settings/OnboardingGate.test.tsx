@@ -137,10 +137,10 @@ describe("OnboardingGate", () => {
       });
 
     // The gate's mount probe uses hasOpenaiApiKey (no key yet → false).
-    // ApiKeyInput's save now confirms presence via hasProviderApiKey("openai")
-    // → true, which flips the gate's hasKey and reveals the 完了 button.
+    // rhanis-nt2: ApiKeyInput's save now reports presence optimistically via
+    // onKeyStatusChange(true) (no has() round-trip), which flips the gate's
+    // hasKey and reveals the 完了 button.
     hasOpenaiApiKey.mockResolvedValue(false);
-    hasProviderApiKey.mockResolvedValue(true);
 
     await act(async () => {
       render(
@@ -173,7 +173,8 @@ describe("OnboardingGate", () => {
       fireEvent.click(screen.getByRole("button", { name: /保存/i }));
     });
 
-    // After save, hasOpenaiApiKey returns true → 完了 button should appear.
+    // After save, ApiKeyInput reports the key present (onKeyStatusChange(true))
+    // → 完了 button should appear.
     await waitFor(() => {
       expect(screen.getByRole("button", { name: /完了/i })).toBeInTheDocument();
     });

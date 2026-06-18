@@ -51,7 +51,6 @@ describe("ApiKeyInput", () => {
   });
 
   it("saves the key for the default 'openai' provider and clears the input", async () => {
-    hasProviderApiKey.mockResolvedValue(true);
     render(<ApiKeyInput />);
     const input = document.querySelector("input") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "sk-test-key" } });
@@ -67,7 +66,6 @@ describe("ApiKeyInput", () => {
   });
 
   it("routes to the given provider (xai), NOT openai", async () => {
-    hasProviderApiKey.mockResolvedValue(true);
     render(<ApiKeyInput provider="xai" label="XAI (Grok) APIキー" placeholder="xai-…" />);
     const input = document.querySelector("input") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "xai-secret" } });
@@ -77,8 +75,6 @@ describe("ApiKeyInput", () => {
     });
 
     expect(setProviderApiKey).toHaveBeenCalledWith("xai", "xai-secret");
-    // The presence-confirm runs after the save resolves (a second await).
-    await waitFor(() => expect(hasProviderApiKey).toHaveBeenCalledWith("xai"));
     expect(setProviderApiKey).not.toHaveBeenCalledWith("openai", expect.anything());
   });
 
@@ -98,9 +94,8 @@ describe("ApiKeyInput", () => {
     expect(alert.textContent!.length).toBeGreaterThan(0);
   });
 
-  it("does not show a save error if only the presence-confirm fails (save succeeded)", async () => {
+  it("reports the key present optimistically after save (no presence-confirm round-trip)", async () => {
     setProviderApiKey.mockResolvedValue(undefined); // save OK
-    hasProviderApiKey.mockRejectedValue(new Error("vault temporarily busy")); // confirm fails
     const onKeyStatusChange = vi.fn();
     render(<ApiKeyInput onKeyStatusChange={onKeyStatusChange} />);
     const input = document.querySelector("input") as HTMLInputElement;
@@ -110,15 +105,17 @@ describe("ApiKeyInput", () => {
       fireEvent.click(screen.getByRole("button", { name: /保存|save/i }));
     });
 
-    // The save succeeded → no save-failure alert, key treated as present
-    // optimistically, and the input is cleared.
+    // rhanis-nt2: the save's Ok is the authoritative proof of storage, so the
+    // key is reported present optimistically — no redundant has() round-trip
+    // (which would pay another snapshot decrypt). No save-failure alert, and the
+    // input is cleared.
+    expect(hasProviderApiKey).not.toHaveBeenCalled();
     expect(screen.queryByRole("alert")).toBeNull();
     expect(onKeyStatusChange).toHaveBeenCalledWith(true);
     expect(input.value).toBe("");
   });
 
-  it("confirms key presence via hasProviderApiKey after save", async () => {
-    hasProviderApiKey.mockResolvedValue(true);
+  it("does NOT call hasProviderApiKey after a successful save (redundant scrypt removed)", async () => {
     render(<ApiKeyInput />);
     const input = document.querySelector("input") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "sk-test-key" } });
@@ -127,8 +124,10 @@ describe("ApiKeyInput", () => {
       fireEvent.click(screen.getByRole("button", { name: /保存|save/i }));
     });
 
-    // The presence-confirm runs after the save resolves (a second await).
-    await waitFor(() => expect(hasProviderApiKey).toHaveBeenCalledWith("openai"));
+    expect(setProviderApiKey).toHaveBeenCalledWith("openai", "sk-test-key");
+    // rhanis-nt2: the post-save presence confirm is removed — save Ok already
+    // proves storage, so has() would only pay another snapshot decrypt.
+    expect(hasProviderApiKey).not.toHaveBeenCalled();
   });
 
   it("calls deleteProviderApiKey with the provider when delete is clicked", async () => {
@@ -151,7 +150,6 @@ describe("ApiKeyInput", () => {
   });
 
   it("does not show the saved key value in the DOM after save (key must not linger)", async () => {
-    hasProviderApiKey.mockResolvedValue(true);
     render(<ApiKeyInput />);
     const input = document.querySelector("input") as HTMLInputElement;
     const secretKey = "sk-super-secret-12345";

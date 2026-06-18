@@ -11,7 +11,6 @@ import { useRef, useState } from "react";
 
 import {
   deleteProviderApiKey,
-  hasProviderApiKey,
   setProviderApiKey,
   type Provider,
 } from "../../lib/tauri/ipc";
@@ -78,18 +77,14 @@ export function ApiKeyInput({
       // React state or DOM).
       setValue("");
       setShow(false);
-      // Confirm presence via has (not by returning the key value). A failure
-      // HERE must NOT be reported as a save failure — the key IS already stored;
-      // treat it as present optimistically so the user isn't misled into retyping.
-      // NB: await unconditionally (a separate statement) — folding it into
-      // `onKeyStatusChange?.(await …)` would skip the call entirely when the
-      // optional callback is absent (optional-call short-circuit).
-      try {
-        const confirmed = await hasProviderApiKey(provider);
-        onKeyStatusChange?.(confirmed);
-      } catch {
-        onKeyStatusChange?.(true);
-      }
+      // rhanis-nt2: the save's Ok IS the authoritative proof of storage, so we
+      // report the key present optimistically instead of paying another snapshot
+      // decrypt with a has() round-trip. (Before ds6 lowered the work factor each
+      // has() cost ≈1s of scrypt; even at WF0 it is a pointless extra decrypt.)
+      // Passing `true` as a literal also sidesteps the optional-call short-circuit
+      // footgun where `onKeyStatusChange?.(await …)` would skip the confirm
+      // entirely when the callback is absent (rhanis-31u).
+      onKeyStatusChange?.(true);
     } finally {
       inFlightSave.current = false;
       setSaving(false);
