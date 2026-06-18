@@ -575,13 +575,16 @@ pub async fn set_provider_api_key(
     key: String,
     store: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<(), String> {
+    // Zeroize-own the raw IPC plaintext FIRST — before provider_key_name, which
+    // can early-return on an invalid provider while the key is still an unowned
+    // String (that path would otherwise drop it without wiping). Owning it here
+    // means every exit path — including that early return — zeroizes it on drop.
+    // It is then dropped before the await so the spawn_blocking suspend can't
+    // strand a non-zeroized plaintext copy either (Codex P2 ×2).
+    let key = Zeroizing::new(key);
     // Resolve the allowlist + normalize on the async side (cheap, holds no lock),
     // then run only the blocking Stronghold commit on a blocking thread (rhanis-nt2).
     let name = provider_key_name(&provider).map_err(|e| e.to_string())?;
-    // Zeroize-own the raw IPC plaintext and drop it before the await (see
-    // set_openai_api_key — the spawn_blocking suspend must not strand a
-    // non-zeroized plaintext key in the future). Codex Cloud P2.
-    let key = Zeroizing::new(key);
     let secret = SecretString::new(normalize_api_key(&key).map_err(|e| e.to_string())?.to_string());
     drop(key);
     let store = store.0.clone();
