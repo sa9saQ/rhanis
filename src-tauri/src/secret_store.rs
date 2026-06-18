@@ -475,8 +475,14 @@ pub async fn set_openai_api_key(
     key: String,
     store: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<(), String> {
-    let key = normalize_api_key(&key).map_err(|e| e.to_string())?;
-    let secret = SecretString::new(key.to_string());
+    // Move the raw IPC plaintext into a zeroizing owner (wiped on drop) and drop
+    // it BEFORE the first .await: the spawn_blocking below suspends this future,
+    // and a slow/cancelled Stronghold save must not leave a non-zeroized plaintext
+    // key alive in the suspended future alongside the zeroized SecretString copy
+    // (Codex Cloud P2 — the .await is new in rhanis-nt2).
+    let key = Zeroizing::new(key);
+    let secret = SecretString::new(normalize_api_key(&key).map_err(|e| e.to_string())?.to_string());
+    drop(key);
     // rhanis-nt2: the Stronghold commit is blocking (snapshot encrypt) — run it
     // on a blocking thread so it never stalls a tokio worker. A JoinError (task
     // panic) propagates as Err (fail-closed) under a fixed message, and
@@ -572,8 +578,12 @@ pub async fn set_provider_api_key(
     // Resolve the allowlist + normalize on the async side (cheap, holds no lock),
     // then run only the blocking Stronghold commit on a blocking thread (rhanis-nt2).
     let name = provider_key_name(&provider).map_err(|e| e.to_string())?;
-    let key = normalize_api_key(&key).map_err(|e| e.to_string())?;
-    let secret = SecretString::new(key.to_string());
+    // Zeroize-own the raw IPC plaintext and drop it before the await (see
+    // set_openai_api_key — the spawn_blocking suspend must not strand a
+    // non-zeroized plaintext key in the future). Codex Cloud P2.
+    let key = Zeroizing::new(key);
+    let secret = SecretString::new(normalize_api_key(&key).map_err(|e| e.to_string())?.to_string());
+    drop(key);
     let store = store.0.clone();
     tokio::task::spawn_blocking(move || store.save_api_key(name, secret))
         .await
