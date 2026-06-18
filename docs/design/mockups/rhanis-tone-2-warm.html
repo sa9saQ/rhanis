@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rhanis — トーン2 温かみ・親しみ</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=Zen+Maru+Gothic:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#fbf5ec; --surface:#fffaf2; --surface-2:#f5ece0;
+    --ink:#2c2520; --ink-2:#4d4239; --muted:#9a8a78; --line:#ece0d0;
+    --accent:#c8643c; --accent-2:#e0a04a; --accent-soft:#f7e4d6; --accent-ink:#a14c2b;
+    --danger:#c0392b;
+    --font-jp:'Zen Maru Gothic','Hiragino Maru Gothic ProN','Hiragino Kaku Gothic ProN','Yu Gothic',Meiryo,sans-serif;
+    --font-en:'Quicksand',var(--font-jp);
+    --ease-spring:cubic-bezier(.2,.85,.3,1.1);
+    --ease-decel:cubic-bezier(0,0,.2,1);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:radial-gradient(140% 120% at 0% 0%,#fdf8f0 0%,var(--bg) 60%);color:var(--ink);
+    font-family:var(--font-jp);-webkit-font-smoothing:antialiased;height:100vh;overflow:hidden}
+  .app{display:grid;grid-template-columns:272px 1fr;height:100vh}
+
+  .sidebar{background:var(--surface);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:20px 16px}
+  .brand{display:flex;align-items:center;gap:10px;padding:6px 6px 20px}
+  .brand .mark{width:26px;height:26px}
+  .brand .name{font-family:var(--font-en);font-weight:700;font-size:19px}
+  .new-chat{display:flex;align-items:center;gap:9px;width:100%;
+    background:linear-gradient(135deg,var(--accent) 0%,var(--accent-2) 130%);color:#fff;border:none;
+    border-radius:18px;padding:13px 16px;font-family:var(--font-jp);font-weight:700;font-size:14.5px;
+    cursor:pointer;box-shadow:0 8px 18px -10px rgba(200,100,60,.7);
+    transition:transform .18s var(--ease-spring),filter .18s}
+  .new-chat:hover{filter:brightness(1.04);transform:translateY(-2px)}
+  .nav{margin-top:16px;display:flex;flex-direction:column;gap:3px}
+  .nav-item{display:flex;align-items:center;gap:11px;border:none;background:none;
+    color:var(--ink-2);font-family:var(--font-jp);font-size:14px;text-align:left;
+    padding:10px 12px;border-radius:14px;cursor:pointer;transition:background .14s,color .14s}
+  .nav-item:hover{background:var(--accent-soft);color:var(--accent-ink)}
+  .nav-item .ic{width:18px;text-align:center;font-size:15px}
+  .sec{font-size:12px;letter-spacing:.5px;color:var(--muted);font-weight:700;padding:18px 12px 6px}
+  .proj .dot{width:9px;height:9px;border-radius:999px}
+  .proj .nav-item:nth-child(1) .dot{background:var(--accent)}
+  .proj .nav-item:nth-child(2) .dot{background:var(--accent-2)}
+  .proj .nav-item:nth-child(3) .dot{background:#7fae8a}
+  .spacer{flex:1}
+  .balance{background:linear-gradient(135deg,var(--accent-soft),#fdeede);border-radius:18px;
+    padding:13px 15px;margin-bottom:10px;border:1px solid #f0d8c4}
+  .balance .row{display:flex;align-items:baseline;justify-content:space-between}
+  .balance .amt{font-family:var(--font-en);font-weight:700;font-size:16.5px;color:var(--accent-ink)}
+  .balance .time{font-size:12px;color:var(--accent-ink);opacity:.85}
+  .balance .bar{height:7px;border-radius:99px;background:#f0d4be;margin-top:9px;overflow:hidden}
+  .balance .bar i{display:block;height:100%;width:42%;
+    background:linear-gradient(90deg,var(--accent),var(--accent-2));border-radius:99px}
+  .foot-set{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:14px;
+    padding:10px 12px;border-radius:14px;cursor:pointer;border:none;background:none;font-family:var(--font-jp)}
+  .foot-set:hover{background:var(--surface-2)}
+
+  .main{display:flex;flex-direction:column;padding:34px 44px 24px;overflow:hidden}
+  .greeting{font-family:var(--font-en);font-weight:700;font-size:28px;color:var(--ink);margin-bottom:5px}
+  .greeting .jp{font-family:var(--font-jp)}
+  .sub{color:var(--muted);font-size:14px;margin-bottom:28px}
+  .conversation{display:flex;flex-direction:column;gap:13px;max-width:680px}
+  .msg{max-width:78%;padding:13px 18px;font-size:15px;line-height:1.65;border-radius:22px}
+  .msg.user{align-self:flex-end;background:linear-gradient(135deg,var(--accent),var(--accent-2));
+    color:#fff;border-bottom-right-radius:7px;box-shadow:0 6px 16px -10px rgba(200,100,60,.6)}
+  .msg.assistant{align-self:flex-start;background:var(--surface);border:1px solid var(--line);
+    color:var(--ink-2);border-bottom-left-radius:7px;display:flex;align-items:center;gap:9px;
+    box-shadow:0 4px 14px -12px rgba(120,90,60,.5)}
+  .typing{display:inline-flex;gap:4px}
+  .typing i{width:6px;height:6px;border-radius:99px;background:var(--accent);
+    animation:bob 1.1s var(--ease-spring) infinite}
+  .typing i:nth-child(2){animation-delay:.16s}.typing i:nth-child(3){animation-delay:.32s}
+  @keyframes bob{0%,70%,100%{transform:translateY(0);opacity:.4}35%{transform:translateY(-4px);opacity:1}}
+
+  .activity{margin-top:32px;max-width:680px;background:var(--surface);border:1px solid var(--line);
+    border-radius:24px;padding:20px 22px;box-shadow:0 12px 30px -20px rgba(160,76,43,.5);position:relative;overflow:hidden}
+  .activity::before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;
+    background:linear-gradient(180deg,var(--accent),var(--accent-2))}
+  .activity-head{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:700;
+    color:var(--accent-ink);margin-bottom:15px}
+  .activity-head .pulse{width:10px;height:10px;border-radius:99px;background:var(--accent);
+    animation:ring 1.9s var(--ease-decel) infinite}
+  @keyframes ring{0%{box-shadow:0 0 0 0 rgba(200,100,60,.5)}70%{box-shadow:0 0 0 10px rgba(200,100,60,0)}100%{box-shadow:0 0 0 0 rgba(200,100,60,0)}}
+  .a-row{display:flex;align-items:flex-start;gap:12px;padding:8px 0;font-size:14.5px;line-height:1.55}
+  .a-row .gl{width:24px;height:24px;flex:none;display:flex;align-items:center;justify-content:center;
+    border-radius:10px;background:var(--accent-soft);font-size:14px}
+  .a-row.think{color:var(--ink)}
+  .a-row.tool .tn{font-weight:700;color:var(--accent-ink);background:var(--accent-soft);
+    padding:2px 9px;border-radius:9px;font-size:13.5px}
+  .a-row.tool .q{color:var(--muted)}
+  .a-row.tool .ok{margin-left:auto;color:#5a9468;font-weight:700;font-size:16px}
+  .a-row.src{color:var(--muted);font-size:13.5px}
+  .a-row.src a{color:var(--accent-ink);text-decoration:none;font-weight:500}
+
+  .voicebar{margin-top:auto;display:flex;flex-direction:column;align-items:center;gap:13px;padding-top:20px}
+  .orb{width:72px;height:72px;border-radius:999px;position:relative;
+    background:radial-gradient(circle at 36% 30%,#f0b06a 0%,var(--accent) 58%,var(--accent-ink) 100%);
+    box-shadow:0 12px 30px -10px rgba(200,100,60,.6);animation:breathe 3.2s var(--ease-decel) infinite}
+  .orb::after{content:"";position:absolute;inset:-12px;border-radius:999px;
+    background:radial-gradient(circle,rgba(224,160,74,.25),transparent 70%);animation:glow 3.2s var(--ease-decel) infinite}
+  @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
+  @keyframes glow{0%,100%{transform:scale(1);opacity:.5}50%{transform:scale(1.25);opacity:.15}}
+  .voice-label{font-size:14px;color:var(--muted)}
+  .voice-label b{color:var(--accent-ink);font-weight:700}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 24 24" fill="none"><path d="M12 3c3.6 4.2 6.2 7.4 6.2 10.6A6.2 6.2 0 0 1 5.8 13.6C5.8 10.4 8.4 7.2 12 3Z" fill="#c8643c"/><path d="M12 3c3.6 4.2 6.2 7.4 6.2 10.6a6.2 6.2 0 0 1-3.1 5.4" fill="#e0a04a" opacity=".55"/><circle cx="10" cy="13.5" r="1.6" fill="#fff" opacity=".9"/></svg>
+      <span class="name">Rhanis</span>
+    </div>
+    <button class="new-chat"><span>＋</span> 新しい会話</button>
+    <div class="nav">
+      <button class="nav-item"><span class="ic">🔍</span> 検索</button>
+    </div>
+    <div class="sec">プロジェクト</div>
+    <div class="nav proj">
+      <button class="nav-item"><span class="dot"></span> 旅行計画</button>
+      <button class="nav-item"><span class="dot"></span> 毎朝ニュース</button>
+      <button class="nav-item"><span class="dot"></span> 確定申告</button>
+    </div>
+    <div class="sec">できること</div>
+    <div class="nav">
+      <button class="nav-item"><span class="ic">⚡</span> オートメーション</button>
+      <button class="nav-item"><span class="ic">🧩</span> 手足tool</button>
+      <button class="nav-item"><span class="ic">📋</span> タスクボード</button>
+    </div>
+    <div class="spacer"></div>
+    <button class="foot-set"><span>⚙</span> 設定</button>
+  </aside>
+
+  <main class="main">
+    <div class="greeting"><span class="jp">今日は何をしましょう？</span></div>
+    <div class="sub">声で話しかけても、入力してもOKです。</div>
+
+    <div class="conversation">
+      <div class="msg user">新幹線の時刻、調べて</div>
+      <div class="msg assistant">調べています <span class="typing"><i></i><i></i><i></i></span></div>
+    </div>
+
+    <div class="activity">
+      <div class="activity-head"><span class="pulse"></span> 今していること</div>
+      <div class="a-row think"><span class="gl">💭</span><span>東京→新大阪の新幹線の時刻を確認しています</span></div>
+      <div class="a-row tool"><span class="gl">🔧</span><span class="tn">web.search</span><span class="q">"東京 新大阪 新幹線 時刻"</span><span class="ok">✓</span></div>
+      <div class="a-row src"><span class="gl">📎</span><a href="#">jr-central.co.jp</a></div>
+    </div>
+
+    <div class="voicebar">
+      <div class="orb" aria-label="聞いています"></div>
+      <div class="voice-label"><b>聞いています</b> — 話しかけてください</div>
+    </div>
+  </main>
+</div>
+</body>
+</html>

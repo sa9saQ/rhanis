@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rhanis — トーン1 洗練ミニマル</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Zen+Kaku+Gothic+Antique:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#faf9f5; --surface:#ffffff; --surface-2:#f4f2ec;
+    --ink:#1b1a17; --ink-2:#403d37; --muted:#76726a; --line:#e8e4db;
+    --accent:#1d6f6a; --accent-soft:#e1efed; --accent-ink:#13524e;
+    --danger:#b23b30;
+    --font-jp:'Zen Kaku Gothic Antique','Hiragino Kaku Gothic ProN','Yu Gothic',Meiryo,sans-serif;
+    --font-en:'Plus Jakarta Sans',var(--font-jp);
+    --mono:'JetBrains Mono','SFMono-Regular',Consolas,monospace;
+    --ease-spring:cubic-bezier(.2,.8,.2,1);
+    --ease-decel:cubic-bezier(0,0,.2,1);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font-family:var(--font-jp);
+    -webkit-font-smoothing:antialiased;height:100vh;overflow:hidden}
+  .app{display:grid;grid-template-columns:268px 1fr;height:100vh}
+
+  /* ---- sidebar ---- */
+  .sidebar{background:var(--surface);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:18px 14px}
+  .brand{display:flex;align-items:center;gap:9px;padding:6px 8px 18px}
+  .brand .mark{width:22px;height:22px}
+  .brand .name{font-family:var(--font-en);font-weight:700;font-size:18px;letter-spacing:.2px}
+  .new-chat{display:flex;align-items:center;gap:8px;width:100%;
+    background:var(--accent);color:#fff;border:none;border-radius:11px;
+    padding:11px 13px;font-family:var(--font-jp);font-weight:700;font-size:14px;
+    cursor:pointer;transition:transform .15s var(--ease-spring),filter .15s}
+  .new-chat:hover{filter:brightness(1.06);transform:translateY(-1px)}
+  .nav{margin-top:14px;display:flex;flex-direction:column;gap:2px}
+  .nav-item{display:flex;align-items:center;gap:10px;border:none;background:none;
+    color:var(--ink-2);font-family:var(--font-jp);font-size:13.5px;text-align:left;
+    padding:9px 10px;border-radius:8px;cursor:pointer;transition:background .12s}
+  .nav-item:hover{background:var(--surface-2)}
+  .nav-item .ic{width:18px;text-align:center;opacity:.8;font-size:14px}
+  .sec{font-size:11px;letter-spacing:1.2px;color:var(--muted);font-weight:700;
+    padding:16px 12px 6px}
+  .proj{padding-left:6px}
+  .proj .nav-item{font-size:13px;color:var(--muted)}
+  .proj .dot{width:7px;height:7px;border-radius:999px;background:var(--accent);opacity:.55}
+  .spacer{flex:1}
+  .balance{background:var(--accent-soft);border-radius:12px;padding:11px 13px;margin-bottom:8px}
+  .balance .row{display:flex;align-items:baseline;justify-content:space-between}
+  .balance .amt{font-family:var(--font-en);font-weight:700;font-size:16px;color:var(--accent-ink)}
+  .balance .time{font-size:11.5px;color:var(--accent-ink);opacity:.8}
+  .balance .bar{height:5px;border-radius:99px;background:#cfe5e2;margin-top:8px;overflow:hidden}
+  .balance .bar i{display:block;height:100%;width:42%;background:var(--accent);border-radius:99px}
+  .foot-set{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:13px;
+    padding:9px 10px;border-radius:8px;cursor:pointer;border:none;background:none;font-family:var(--font-jp)}
+  .foot-set:hover{background:var(--surface-2)}
+
+  /* ---- main ---- */
+  .main{display:flex;flex-direction:column;padding:30px 40px 22px;overflow:hidden;position:relative}
+  .greeting{font-family:var(--font-en);font-weight:600;font-size:27px;letter-spacing:.2px;
+    color:var(--ink);margin-bottom:4px}
+  .greeting .jp{font-family:var(--font-jp)}
+  .sub{color:var(--muted);font-size:13.5px;margin-bottom:26px}
+  .conversation{display:flex;flex-direction:column;gap:12px;max-width:680px}
+  .msg{max-width:78%;padding:12px 16px;font-size:14.5px;line-height:1.6;border-radius:16px}
+  .msg.user{align-self:flex-end;background:var(--ink);color:#fff;border-bottom-right-radius:5px}
+  .msg.assistant{align-self:flex-start;background:var(--surface);border:1px solid var(--line);
+    color:var(--ink-2);border-bottom-left-radius:5px;display:flex;align-items:center;gap:9px}
+  .typing{display:inline-flex;gap:3px}
+  .typing i{width:5px;height:5px;border-radius:99px;background:var(--accent);
+    animation:blink 1.2s var(--ease-decel) infinite}
+  .typing i:nth-child(2){animation-delay:.18s}.typing i:nth-child(3){animation-delay:.36s}
+  @keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+
+  /* ---- activity (hero) ---- */
+  .activity{margin-top:30px;max-width:680px;background:var(--surface);
+    border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:16px;
+    padding:18px 20px;box-shadow:0 6px 22px -16px rgba(29,111,106,.45)}
+  .activity-head{display:flex;align-items:center;gap:8px;font-size:11.5px;font-weight:700;
+    letter-spacing:1px;color:var(--accent-ink);margin-bottom:14px;text-transform:none}
+  .activity-head .pulse{width:8px;height:8px;border-radius:99px;background:var(--accent);
+    box-shadow:0 0 0 0 rgba(29,111,106,.5);animation:ring 1.8s var(--ease-decel) infinite}
+  @keyframes ring{0%{box-shadow:0 0 0 0 rgba(29,111,106,.45)}70%{box-shadow:0 0 0 8px rgba(29,111,106,0)}100%{box-shadow:0 0 0 0 rgba(29,111,106,0)}}
+  .a-row{display:flex;align-items:flex-start;gap:11px;padding:7px 0;font-size:14px;line-height:1.5}
+  .a-row .gl{width:20px;flex:none;text-align:center;font-size:15px}
+  .a-row.think{color:var(--ink)}
+  .a-row.tool .tn{font-family:var(--mono);font-size:13px;background:var(--surface-2);
+    padding:1px 7px;border-radius:6px;color:var(--accent-ink)}
+  .a-row.tool .q{color:var(--muted)}
+  .a-row.tool .ok{margin-left:auto;color:var(--accent);font-weight:700}
+  .a-row.src{color:var(--muted);font-size:13px}
+  .a-row.src a{color:var(--accent-ink);text-decoration:none;border-bottom:1px solid var(--accent-soft)}
+
+  /* ---- voice bar ---- */
+  .voicebar{margin-top:auto;display:flex;flex-direction:column;align-items:center;gap:12px;padding-top:18px}
+  .orb{width:62px;height:62px;border-radius:999px;position:relative;
+    background:radial-gradient(circle at 38% 32%,#3a9a93 0%,var(--accent) 55%,var(--accent-ink) 100%);
+    box-shadow:0 8px 24px -8px rgba(29,111,106,.55);animation:breathe 3.6s var(--ease-decel) infinite}
+  .orb::after{content:"";position:absolute;inset:-9px;border-radius:999px;
+    border:1.5px solid var(--accent);opacity:.3;animation:halo 3.6s var(--ease-decel) infinite}
+  @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
+  @keyframes halo{0%,100%{transform:scale(1);opacity:.28}50%{transform:scale(1.12);opacity:.08}}
+  .voice-label{font-size:13px;color:var(--muted)}
+  .voice-label b{color:var(--ink-2);font-weight:600}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 24 24" fill="none"><path d="M12 3c3.4 4 6 7.2 6 10.4A6 6 0 0 1 6 13.4C6 10.2 8.6 7 12 3Z" fill="#1d6f6a"/><path d="M9.6 13.6a2.6 2.6 0 0 0 2.4 2.4" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/></svg>
+      <span class="name">Rhanis</span>
+    </div>
+    <button class="new-chat"><span>＋</span> 新しい会話</button>
+    <div class="nav">
+      <button class="nav-item"><span class="ic">🔍</span> 検索</button>
+    </div>
+    <div class="sec">プロジェクト</div>
+    <div class="nav proj">
+      <button class="nav-item"><span class="dot"></span> 旅行計画</button>
+      <button class="nav-item"><span class="dot"></span> 毎朝ニュース</button>
+      <button class="nav-item"><span class="dot"></span> 確定申告</button>
+    </div>
+    <div class="sec">できること</div>
+    <div class="nav">
+      <button class="nav-item"><span class="ic">⚡</span> オートメーション</button>
+      <button class="nav-item"><span class="ic">🧩</span> 手足tool</button>
+      <button class="nav-item"><span class="ic">📋</span> タスクボード</button>
+    </div>
+    <div class="spacer"></div>
+    <button class="foot-set"><span>⚙</span> 設定</button>
+  </aside>
+
+  <main class="main">
+    <div class="greeting"><span class="jp">今日は何をしましょう？</span></div>
+    <div class="sub">声で話しかけても、入力してもOKです。</div>
+
+    <div class="conversation">
+      <div class="msg user">新幹線の時刻、調べて</div>
+      <div class="msg assistant">調べています <span class="typing"><i></i><i></i><i></i></span></div>
+    </div>
+
+    <div class="activity">
+      <div class="activity-head"><span class="pulse"></span> 今していること</div>
+      <div class="a-row think"><span class="gl">💭</span><span>東京→新大阪の新幹線の時刻を確認しています</span></div>
+      <div class="a-row tool"><span class="gl">🔧</span><span class="tn">web.search</span><span class="q">"東京 新大阪 新幹線 時刻"</span><span class="ok">✓</span></div>
+      <div class="a-row src"><span class="gl">📎</span><a href="#">jr-central.co.jp</a></div>
+    </div>
+
+    <div class="voicebar">
+      <div class="orb" aria-label="聞いています"></div>
+      <div class="voice-label"><b>聞いています</b> — 話しかけてください</div>
+    </div>
+  </main>
+</div>
+</body>
+</html>

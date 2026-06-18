@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="ja" data-theme="dark" data-state="idle">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rhanis — 動的（作業中だけ前面）モノクロ・シック</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=IBM+Plex+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --font-jp:'IBM Plex Sans JP','Hiragino Kaku Gothic ProN','Yu Gothic',Meiryo,sans-serif;
+    --font-en:'Geist',var(--font-jp);
+    --mono:'Geist Mono','SFMono-Regular',Consolas,monospace;
+    --ease-spring:cubic-bezier(.2,.8,.2,1);
+    --ease-decel:cubic-bezier(0,0,.2,1);
+  }
+  [data-theme="dark"]{
+    --bg:#0a0a0b; --surface:#141416; --surface-2:#1c1c1f; --rail:#0d0d0e;
+    --fg:#ededec; --fg-2:#b9b9b6; --muted:#7d7d79;
+    --line:#262628; --line-soft:#1d1d1f;
+    --sel:#26262a; --sel-fg:#ffffff; --btn:#ededec; --btn-fg:#0a0a0b; --ring:#9a9a96;
+  }
+  [data-theme="light"]{
+    --bg:#fbfbfa; --surface:#ffffff; --surface-2:#f4f4f2; --rail:#f6f6f4;
+    --fg:#19191a; --fg-2:#3f3f40; --muted:#83837e;
+    --line:#e7e7e3; --line-soft:#efefec;
+    --sel:#ebebe7; --sel-fg:#101010; --btn:#19191a; --btn-fg:#ffffff; --ring:#5a5a56;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font-family:var(--font-jp);
+    -webkit-font-smoothing:antialiased;height:100vh;overflow:hidden;
+    transition:background .35s var(--ease-decel),color .35s var(--ease-decel)}
+  .app{display:grid;grid-template-columns:236px 1fr;height:100vh}
+  svg.ic{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+  /* ===== LEFT NAV ===== */
+  .nav{background:var(--rail);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:16px 12px}
+  .brand{display:flex;align-items:center;gap:9px;padding:6px 8px 16px}
+  .brand .logo{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linejoin:round}
+  .brand .name{font-family:var(--font-en);font-weight:600;font-size:16.5px;letter-spacing:.3px}
+  .new{display:flex;align-items:center;gap:9px;width:100%;background:var(--btn);color:var(--btn-fg);
+    border:none;border-radius:9px;padding:10px 12px;font-family:var(--font-jp);font-weight:600;font-size:13.5px;
+    cursor:pointer;transition:transform .15s var(--ease-spring),opacity .15s}
+  .new:hover{opacity:.88;transform:translateY(-1px)}
+  .new svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round}
+  .group{margin-top:14px;display:flex;flex-direction:column;gap:1px}
+  .item{display:flex;align-items:center;gap:11px;border:none;background:none;color:var(--fg-2);
+    font-family:var(--font-jp);font-size:13px;text-align:left;padding:8px 10px;border-radius:7px;
+    cursor:pointer;transition:background .13s,color .13s}
+  .item:hover{background:var(--surface-2);color:var(--fg)}
+  .item.sel{background:var(--sel);color:var(--sel-fg);font-weight:500}
+  .item .ic{opacity:.85}
+  .lbl{font-family:var(--mono);font-size:10px;letter-spacing:1.4px;color:var(--muted);text-transform:uppercase;padding:18px 11px 7px}
+  .proj .item .ic{opacity:.5}
+  .grow{flex:1}
+  .nav-foot{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line-soft);padding-top:10px;margin-top:6px}
+  .foot-btn{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:12.5px;padding:7px 9px;border-radius:7px;cursor:pointer;border:none;background:none;font-family:var(--font-jp)}
+  .foot-btn:hover{background:var(--surface-2);color:var(--fg)}
+  .theme-toggle{display:flex;gap:2px;border:1px solid var(--line);border-radius:8px;padding:3px}
+  .tg{width:26px;height:24px;display:grid;place-items:center;border:none;background:none;border-radius:6px;color:var(--muted);cursor:pointer;transition:background .13s,color .13s}
+  .tg.on{background:var(--sel);color:var(--fg)}
+  .tg svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+
+  /* ===== CENTER ===== */
+  .main{display:flex;flex-direction:column;padding:18px 40px 26px;overflow:hidden;position:relative;
+    justify-content:flex-start;transition:justify-content .4s}
+  [data-state="idle"] .main{justify-content:center}
+  .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;
+    position:absolute;top:18px;left:40px;right:40px;z-index:5}
+  .greet{transition:all .4s var(--ease-decel)}
+  .greet .t{font-family:var(--font-en);font-weight:500;letter-spacing:.2px;color:var(--fg);transition:font-size .4s var(--ease-decel)}
+  .greet .t .jp{font-family:var(--font-jp);font-weight:500}
+  .greet .s{color:var(--muted);font-size:13px;margin-top:5px;transition:opacity .35s}
+  [data-state="idle"] .greet .t{font-size:24px}
+  [data-state="working"] .greet .t{font-size:15px}
+  [data-state="working"] .greet .s{opacity:0;height:0;margin:0}
+  /* demo switch */
+  .demo{display:flex;align-items:center;gap:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:none}
+  .demo span{font-family:var(--mono);font-size:9px;letter-spacing:.5px;color:var(--muted);padding:0 8px;align-self:center}
+  .demo button{border:none;background:none;color:var(--muted);font-family:var(--font-jp);font-size:11.5px;padding:6px 11px;cursor:pointer;transition:background .13s,color .13s}
+  .demo button.on{background:var(--sel);color:var(--fg)}
+
+  .stage{display:flex;flex-direction:column;gap:11px;max-width:600px;width:100%;margin:0 auto}
+  /* conversation */
+  .conv{display:flex;flex-direction:column;gap:11px;opacity:0;max-height:0;overflow:hidden;
+    transition:opacity .35s var(--ease-decel),max-height .45s var(--ease-decel)}
+  [data-state="working"] .conv{opacity:1;max-height:240px}
+  .msg{max-width:80%;padding:11px 15px;font-size:14px;line-height:1.6;border-radius:14px}
+  .msg.user{align-self:flex-end;background:var(--surface-2);color:var(--fg);border-bottom-right-radius:5px}
+  .msg.ai{align-self:flex-start;background:none;border:1px solid var(--line);color:var(--fg-2);border-bottom-left-radius:5px;display:flex;align-items:center;gap:8px}
+  .typing{display:inline-flex;gap:3px}
+  .typing i{width:4px;height:4px;border-radius:99px;background:var(--muted);animation:blink 1.2s var(--ease-decel) infinite}
+  .typing i:nth-child(2){animation-delay:.18s}.typing i:nth-child(3){animation-delay:.36s}
+  @keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+
+  /* activity — slides up into view when working */
+  .activity{margin-top:6px;border:1px solid var(--line);border-radius:14px;padding:16px 18px;background:var(--surface);
+    opacity:0;transform:translateY(18px);pointer-events:none;
+    transition:opacity .45s var(--ease-decel),transform .5s var(--ease-spring);box-shadow:0 20px 50px -34px rgba(0,0,0,.7)}
+  [data-state="working"] .activity{opacity:1;transform:none;pointer-events:auto}
+  .a-head{display:flex;align-items:center;gap:8px;font-weight:600;font-size:12.5px;color:var(--fg);margin-bottom:12px}
+  .a-head .live{width:7px;height:7px;border-radius:99px;background:var(--fg);animation:ring 2s var(--ease-decel) infinite}
+  @keyframes ring{0%{box-shadow:0 0 0 0 rgba(150,150,150,.35)}70%{box-shadow:0 0 0 7px rgba(150,150,150,0)}100%{box-shadow:0 0 0 0 rgba(150,150,150,0)}}
+  .a-row{display:flex;align-items:flex-start;gap:10px;padding:8px 0;font-size:13px;line-height:1.5;border-bottom:1px solid var(--line-soft)}
+  .a-row:last-child{border-bottom:none}
+  .a-row .ic{margin-top:1px;opacity:.7}
+  .a-row.tool .tn{font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--surface-2);padding:1px 6px;border-radius:5px;border:1px solid var(--line)}
+  .a-row.tool .q{color:var(--muted);font-size:12px;display:block;margin-top:3px}
+  .a-row.tool .ok{margin-left:auto}.a-row.tool .ok svg{width:15px;height:15px;stroke:var(--fg);stroke-width:2}
+  .a-row.src a{color:var(--fg-2);text-decoration:none;font-family:var(--mono);font-size:12px;border-bottom:1px solid var(--line)}
+
+  /* voice indicator */
+  .voicewrap{display:flex;flex-direction:column;align-items:center;gap:14px;transition:margin .4s var(--ease-decel)}
+  [data-state="idle"] .voicewrap{margin-top:30px}
+  [data-state="working"] .voicewrap{margin-top:auto;padding-top:22px}
+  .voice{position:relative;display:grid;place-items:center;transition:width .4s,height .4s}
+  [data-state="idle"] .voice{width:160px;height:160px}
+  [data-state="working"] .voice{width:120px;height:120px}
+  .voice .wave{position:absolute;width:60px;height:60px;border-radius:999px;border:1.4px dotted var(--ring);opacity:0;animation:expand 3.4s var(--ease-decel) infinite}
+  .voice .wave:nth-child(2){animation-delay:1.13s}.voice .wave:nth-child(3){animation-delay:2.26s}
+  @keyframes expand{0%{transform:scale(.55);opacity:.5}70%{opacity:.12}100%{transform:scale(2.4);opacity:0}}
+  .voice .core{position:relative;width:58px;height:58px;border-radius:999px;display:grid;place-items:center;border:1.4px dotted var(--ring);animation:breathe 3.4s var(--ease-decel) infinite}
+  .voice .core .dot{width:13px;height:13px;border-radius:999px;background:var(--fg);animation:beat 3.4s var(--ease-decel) infinite}
+  @keyframes breathe{0%,100%{transform:scale(1);opacity:.9}50%{transform:scale(1.14);opacity:.55}}
+  @keyframes beat{0%,100%{transform:scale(1)}50%{transform:scale(1.35)}}
+  .voice-label{font-size:13px;color:var(--muted);text-align:center}
+  .voice-label b{color:var(--fg-2);font-weight:600}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- LEFT NAV -->
+  <aside class="nav">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 24 24"><path d="M12 3c3.4 4 6 7.2 6 10.4A6 6 0 0 1 6 13.4C6 10.2 8.6 7 12 3Z"/><path d="M9.6 13.8a2.5 2.5 0 0 0 2.3 2.3"/></svg>
+      <span class="name">Rhanis</span>
+    </div>
+    <button class="new"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg> 新しい会話</button>
+    <div class="group">
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg> 検索</button>
+    </div>
+    <div class="lbl">プロジェクト</div>
+    <div class="group proj">
+      <button class="item sel"><svg class="ic" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg> 旅行計画</button>
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg> 毎朝ニュース</button>
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg> 確定申告</button>
+    </div>
+    <div class="lbl">できること</div>
+    <div class="group">
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><path d="M13 3 4 14h7l-1 7 9-11h-7l1-7Z"/></svg> オートメーション</button>
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/></svg> 手足tool</button>
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg> タスクボード</button>
+    </div>
+    <div class="grow"></div>
+    <div class="nav-foot">
+      <button class="foot-btn"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-2-1.2l-.4-2.6h-4l-.4 2.6a7 7 0 0 0-2 1.2l-2.4-1-2 3.4 2 1.6A7 7 0 0 0 5 12a7 7 0 0 0 .1 1.2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 2 1.2l.4 2.6h4l.4-2.6a7 7 0 0 0 2-1.2l2.4 1 2-3.4-2-1.6A7 7 0 0 0 19 12Z"/></svg> 設定</button>
+      <div class="theme-toggle">
+        <button class="tg" id="tg-light" onclick="setTheme('light')" title="ライト"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2 12h2M20 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg></button>
+        <button class="tg on" id="tg-dark" onclick="setTheme('dark')" title="ダーク"><svg viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5Z"/></svg></button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- CENTER -->
+  <main class="main">
+    <div class="topbar">
+      <div class="greet">
+        <div class="t"><span class="jp">今日は何をしましょう？</span></div>
+        <div class="s">声で話しかけても、入力してもかまいません。</div>
+      </div>
+      <div class="demo"><span>DEMO</span>
+        <button id="d-idle" class="on" onclick="setState('idle')">待機</button>
+        <button id="d-work" onclick="setState('working')">作業中</button>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="conv">
+        <div class="msg user">新幹線の時刻、調べて</div>
+        <div class="msg ai">調べています <span class="typing"><i></i><i></i><i></i></span></div>
+      </div>
+
+      <div class="activity">
+        <div class="a-head"><span class="live"></span> 今していること</div>
+        <div class="a-row think"><svg class="ic" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.6.6 1 1.3 1 2.1V16h6v-.4c0-.8.4-1.5 1-2.1A6 6 0 0 0 12 3Z"/></svg><span>東京→新大阪の新幹線の時刻を確認しています</span></div>
+        <div class="a-row tool"><svg class="ic" viewBox="0 0 24 24"><path d="m9 8-4 4 4 4M15 8l4 4-4 4"/></svg>
+          <div><span class="tn">web.search</span><span class="q">"東京 新大阪 新幹線 時刻"</span></div>
+          <span class="ok"><svg viewBox="0 0 24 24" fill="none"><path d="m5 13 4 4L19 7"/></svg></span>
+        </div>
+        <div class="a-row src"><svg class="ic" viewBox="0 0 24 24"><path d="M10 13a3 3 0 0 0 4.2.3l3-3a3 3 0 0 0-4.2-4.2l-1 1M14 11a3 3 0 0 0-4.2-.3l-3 3a3 3 0 0 0 4.2 4.2l1-1"/></svg><a href="#">jr-central.co.jp</a></div>
+      </div>
+    </div>
+
+    <div class="voicewrap">
+      <div class="voice" aria-label="聞いています">
+        <span class="wave"></span><span class="wave"></span><span class="wave"></span>
+        <div class="core"><span class="dot"></span></div>
+      </div>
+      <div class="voice-label"><b>聞いています</b><br>話しかけてください</div>
+    </div>
+  </main>
+</div>
+<script>
+  function setTheme(t){
+    document.documentElement.setAttribute('data-theme',t);
+    document.getElementById('tg-light').classList.toggle('on',t==='light');
+    document.getElementById('tg-dark').classList.toggle('on',t==='dark');
+  }
+  function setState(s){
+    document.documentElement.setAttribute('data-state',s);
+    document.getElementById('d-idle').classList.toggle('on',s==='idle');
+    document.getElementById('d-work').classList.toggle('on',s==='working');
+  }
+</script>
+</body>
+</html>

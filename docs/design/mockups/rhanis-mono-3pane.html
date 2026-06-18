@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="ja" data-theme="dark" data-state="working" data-rail="open">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rhanis — 3ペイン（JA/EN切替）モノクロ・シック</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=IBM+Plex+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --font-jp:'IBM Plex Sans JP','Hiragino Kaku Gothic ProN','Yu Gothic',Meiryo,sans-serif;
+    --font-en:'Geist',var(--font-jp);
+    --mono:'Geist Mono','SFMono-Regular',Consolas,monospace;
+    --ease-spring:cubic-bezier(.2,.8,.2,1);
+    --ease-decel:cubic-bezier(0,0,.2,1);
+  }
+  [data-theme="dark"]{
+    --bg:#0a0a0b;--surface:#141416;--surface-2:#1c1c1f;--rail:#0d0d0e;
+    --fg:#ededec;--fg-2:#b9b9b6;--muted:#7d7d79;
+    --line:#262628;--line-soft:#1d1d1f;
+    --sel:#26262a;--sel-fg:#fff;--btn:#ededec;--btn-fg:#0a0a0b;--ring:#9a9a96;
+  }
+  [data-theme="light"]{
+    --bg:#fbfbfa;--surface:#fff;--surface-2:#f4f4f2;--rail:#f6f6f4;
+    --fg:#19191a;--fg-2:#3f3f40;--muted:#83837e;
+    --line:#e7e7e3;--line-soft:#efefec;
+    --sel:#ebebe7;--sel-fg:#101010;--btn:#19191a;--btn-fg:#fff;--ring:#5a5a56;
+  }
+  /* 英語表示の時は英語フォントを主に */
+  [lang="en"] body,[lang="en"] .item,[lang="en"] .new,[lang="en"] .foot-btn,
+  [lang="en"] .greet .t,[lang="en"] .voice-label,[lang="en"] .side-head,[lang="en"] .side-sub,
+  [lang="en"] .msg,[lang="en"] .idle-msg,[lang="en"] .done{font-family:var(--font-en)}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font-family:var(--font-jp);
+    -webkit-font-smoothing:antialiased;height:100vh;overflow:hidden;
+    transition:background .35s var(--ease-decel),color .35s var(--ease-decel)}
+  .app{display:grid;grid-template-columns:236px 1fr 308px;height:100vh;
+    transition:grid-template-columns .38s var(--ease-decel)}
+  [data-rail="closed"] .app{grid-template-columns:236px 1fr 0}
+  svg.ic{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+  /* ===== LEFT NAV ===== */
+  .nav{background:var(--rail);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:16px 12px}
+  .brand{display:flex;align-items:center;gap:9px;padding:6px 8px 16px}
+  .brand .logo{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linejoin:round}
+  .brand .name{font-family:var(--font-en);font-weight:600;font-size:16.5px;letter-spacing:.3px}
+  .new{display:flex;align-items:center;gap:9px;width:100%;background:var(--btn);color:var(--btn-fg);
+    border:none;border-radius:9px;padding:10px 12px;font-weight:600;font-size:13.5px;
+    cursor:pointer;transition:transform .15s var(--ease-spring),opacity .15s}
+  .new:hover{opacity:.88;transform:translateY(-1px)}
+  .new svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round}
+  .group{margin-top:14px;display:flex;flex-direction:column;gap:1px}
+  .item{display:flex;align-items:center;gap:11px;border:none;background:none;color:var(--fg-2);
+    font-size:13px;text-align:left;padding:8px 10px;border-radius:7px;cursor:pointer;transition:background .13s,color .13s}
+  .item:hover{background:var(--surface-2);color:var(--fg)}
+  .item.sel{background:var(--sel);color:var(--sel-fg);font-weight:500}
+  .item .ic{opacity:.85}
+  .lbl{font-family:var(--mono);font-size:10px;letter-spacing:1.4px;color:var(--muted);text-transform:uppercase;padding:18px 11px 7px}
+  .proj .item .ic{opacity:.5}
+  .grow{flex:1}
+  .nav-foot{border-top:1px solid var(--line-soft);padding-top:10px;margin-top:6px;display:flex;flex-direction:column;gap:8px}
+  .foot-btn{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:12.5px;padding:7px 9px;border-radius:7px;cursor:pointer;border:none;background:none}
+  .foot-btn:hover{background:var(--surface-2);color:var(--fg)}
+  .toggles{display:flex;gap:8px}
+  .seg{display:flex;gap:2px;border:1px solid var(--line);border-radius:8px;padding:3px}
+  .seg.lang button{font-family:var(--mono);font-size:10.5px;padding:0 8px}
+  .tg{min-width:26px;height:24px;display:grid;place-items:center;border:none;background:none;border-radius:6px;color:var(--muted);cursor:pointer;transition:background .13s,color .13s}
+  .tg.on{background:var(--sel);color:var(--fg)}
+  .tg svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+
+  /* ===== CENTER ===== */
+  .main{display:flex;flex-direction:column;padding:20px 36px 24px;overflow:hidden;position:relative}
+  .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+  .greet .t{font-family:var(--font-en);font-weight:500;font-size:22px;letter-spacing:.2px}
+  .greet .t .jp{font-family:var(--font-jp);font-weight:500}
+  .greet .s{color:var(--muted);font-size:13px;margin-top:5px}
+  .demo{display:flex;align-items:center;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:none}
+  .demo .dl{font-family:var(--mono);font-size:9px;letter-spacing:.5px;color:var(--muted);padding:0 8px}
+  .demo button{border:none;background:none;color:var(--muted);font-size:11.5px;padding:6px 11px;cursor:pointer;transition:background .13s,color .13s}
+  .demo button.on{background:var(--sel);color:var(--fg)}
+  .conv{display:flex;flex-direction:column;gap:11px;max-width:600px;width:100%;margin:24px auto 0;flex:1;overflow:auto}
+  .msg{max-width:80%;padding:11px 15px;font-size:14px;line-height:1.6;border-radius:14px}
+  .msg.user{align-self:flex-end;background:var(--surface-2);color:var(--fg);border-bottom-right-radius:5px}
+  .msg.ai{align-self:flex-start;background:none;border:1px solid var(--line);color:var(--fg-2);border-bottom-left-radius:5px;display:flex;align-items:center;gap:8px}
+  .typing{display:inline-flex;gap:3px}
+  .typing i{width:4px;height:4px;border-radius:99px;background:var(--muted);animation:blink 1.2s var(--ease-decel) infinite}
+  .typing i:nth-child(2){animation-delay:.18s}.typing i:nth-child(3){animation-delay:.36s}
+  @keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+  [data-state="idle"] .conv .ai{display:none}
+  .voicewrap{display:flex;flex-direction:column;align-items:center;gap:13px;padding-top:16px}
+  .voice{position:relative;width:128px;height:128px;display:grid;place-items:center}
+  .voice .wave{position:absolute;width:54px;height:54px;border-radius:999px;border:1.4px dotted var(--ring);opacity:0;animation:expand 3.4s var(--ease-decel) infinite}
+  .voice .wave:nth-child(2){animation-delay:1.13s}.voice .wave:nth-child(3){animation-delay:2.26s}
+  @keyframes expand{0%{transform:scale(.55);opacity:.5}70%{opacity:.12}100%{transform:scale(2.3);opacity:0}}
+  .voice .core{position:relative;width:54px;height:54px;border-radius:999px;display:grid;place-items:center;border:1.4px dotted var(--ring);animation:breathe 3.4s var(--ease-decel) infinite}
+  .voice .core .dot{width:12px;height:12px;border-radius:999px;background:var(--fg);animation:beat 3.4s var(--ease-decel) infinite}
+  @keyframes breathe{0%,100%{transform:scale(1);opacity:.9}50%{transform:scale(1.14);opacity:.55}}
+  @keyframes beat{0%,100%{transform:scale(1)}50%{transform:scale(1.35)}}
+  .voice-label{font-size:13px;color:var(--muted);text-align:center}
+  .voice-label b{color:var(--fg-2);font-weight:600}
+
+  /* ===== RIGHT — glass-box (常設) ===== */
+  .side{background:var(--surface);border-left:1px solid var(--line);display:flex;flex-direction:column;padding:18px 16px;overflow:hidden;min-width:0;opacity:1;transition:opacity .3s var(--ease-decel)}
+  [data-rail="closed"] .side{opacity:0;padding-left:0;padding-right:0}
+  .side-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:3px}
+  .side-head{display:flex;align-items:center;gap:8px;font-weight:600;font-size:12.5px;color:var(--fg);white-space:nowrap}
+  .side-head .live{width:7px;height:7px;border-radius:99px;background:var(--fg)}
+  [data-state="working"] .side-head .live{animation:ring 2s var(--ease-decel) infinite}
+  [data-state="idle"] .side-head .live{background:var(--muted)}
+  @keyframes ring{0%{box-shadow:0 0 0 0 rgba(150,150,150,.35)}70%{box-shadow:0 0 0 7px rgba(150,150,150,0)}100%{box-shadow:0 0 0 0 rgba(150,150,150,0)}}
+  .collapse{border:none;background:none;color:var(--muted);cursor:pointer;padding:4px;border-radius:6px;display:grid;place-items:center}
+  .collapse:hover{background:var(--surface-2);color:var(--fg)}
+  .collapse svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+  .side-sub{font-size:11px;color:var(--muted);margin-bottom:16px;white-space:nowrap}
+  .live-now{display:block}
+  [data-state="idle"] .live-now{display:none}
+  .a-row{display:flex;align-items:flex-start;gap:10px;padding:9px 0;font-size:13px;line-height:1.5;border-bottom:1px solid var(--line-soft)}
+  .a-row:last-child{border-bottom:none}
+  .a-row .ic{margin-top:1px;opacity:.7}
+  .a-row.tool .tn{font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--surface-2);padding:1px 6px;border-radius:5px;border:1px solid var(--line)}
+  .a-row.tool .q{color:var(--muted);font-size:12px;display:block;margin-top:3px}
+  .a-row.tool .ok{margin-left:auto}.a-row.tool .ok svg{width:15px;height:15px;stroke:var(--fg);stroke-width:2}
+  .a-row.src a{color:var(--fg-2);text-decoration:none;font-family:var(--mono);font-size:12px;border-bottom:1px solid var(--line)}
+  [data-state="working"] .a-row.active{animation:rowpulse 2s var(--ease-decel) infinite}
+  @keyframes rowpulse{0%,100%{opacity:1}50%{opacity:.5}}
+  .idle-now{display:none}
+  [data-state="idle"] .idle-now{display:block}
+  .idle-msg{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:12.5px;padding:6px 0 16px}
+  .idle-msg .pip{width:6px;height:6px;border-radius:99px;background:var(--muted);animation:breathe 2.6s var(--ease-decel) infinite}
+  .recent .rl{font-family:var(--mono);font-size:10px;letter-spacing:1.4px;color:var(--muted);text-transform:uppercase;margin:16px 0 10px}
+  .done{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--muted);padding:5px 0}
+  .done svg{width:14px;height:14px;stroke:var(--muted);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+  .reopen{position:absolute;top:20px;right:14px;border:1px solid var(--line);background:var(--surface);color:var(--muted);border-radius:8px;padding:6px;cursor:pointer;display:none}
+  [data-rail="closed"] .reopen{display:grid;place-items:center}
+  .reopen svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- LEFT NAV -->
+  <aside class="nav">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 24 24"><path d="M12 3c3.4 4 6 7.2 6 10.4A6 6 0 0 1 6 13.4C6 10.2 8.6 7 12 3Z"/><path d="M9.6 13.8a2.5 2.5 0 0 0 2.3 2.3"/></svg>
+      <span class="name">Rhanis</span>
+    </div>
+    <button class="new"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg> <span data-i18n="newchat">新しい会話</span></button>
+    <div class="group">
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg> <span data-i18n="search">検索</span></button>
+    </div>
+    <div class="lbl" data-i18n="projects">プロジェクト</div>
+    <div class="group proj">
+      <button class="item sel"><svg class="ic" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg> <span data-i18n="p1">旅行計画</span></button>
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg> <span data-i18n="p2">毎朝ニュース</span></button>
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg> <span data-i18n="p3">確定申告</span></button>
+    </div>
+    <div class="lbl" data-i18n="toolsLbl">ツール</div>
+    <div class="group">
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><path d="M13 3 4 14h7l-1 7 9-11h-7l1-7Z"/></svg> <span data-i18n="automations">オートメーション</span></button>
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><path d="M9 3v2M15 3v2M5 8h14M6 8v11a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8"/><path d="M9 12h6M9 16h4"/></svg> <span data-i18n="integrations">連携ツール</span></button>
+      <button class="item"><svg class="ic" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg> <span data-i18n="tasks">タスクボード</span></button>
+    </div>
+    <div class="grow"></div>
+    <div class="nav-foot">
+      <button class="foot-btn"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-2-1.2l-.4-2.6h-4l-.4 2.6a7 7 0 0 0-2 1.2l-2.4-1-2 3.4 2 1.6A7 7 0 0 0 5 12a7 7 0 0 0 .1 1.2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 2 1.2l.4 2.6h4l.4-2.6a7 7 0 0 0 2-1.2l2.4 1 2-3.4-2-1.6A7 7 0 0 0 19 12Z"/></svg> <span data-i18n="settings">設定</span></button>
+      <div class="toggles">
+        <div class="seg theme">
+          <button class="tg" id="tg-light" onclick="setTheme('light')" title="Light"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2 12h2M20 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg></button>
+          <button class="tg on" id="tg-dark" onclick="setTheme('dark')" title="Dark"><svg viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5Z"/></svg></button>
+        </div>
+        <div class="seg lang">
+          <button class="tg on" id="lg-ja" onclick="setLang('ja')">JA</button>
+          <button class="tg" id="lg-en" onclick="setLang('en')">EN</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- CENTER -->
+  <main class="main">
+    <button class="reopen" onclick="setRail('open')"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+    <div class="topbar">
+      <div class="greet">
+        <div class="t"><span class="jp" data-i18n="greet">今日は何をしましょう？</span></div>
+        <div class="s" data-i18n="greetsub">声で話しかけても、入力してもかまいません。</div>
+      </div>
+      <div class="demo"><span class="dl">DEMO</span>
+        <button id="d-idle" onclick="setState('idle')" data-i18n="stIdle">待機</button>
+        <button id="d-work" class="on" onclick="setState('working')" data-i18n="stWork">作業中</button>
+      </div>
+    </div>
+
+    <div class="conv">
+      <div class="msg user" data-i18n="umsg">新幹線の時刻、調べて</div>
+      <div class="msg ai"><span data-i18n="aimsg">調べています</span> <span class="typing"><i></i><i></i><i></i></span></div>
+    </div>
+
+    <div class="voicewrap">
+      <div class="voice" aria-label="listening">
+        <span class="wave"></span><span class="wave"></span><span class="wave"></span>
+        <div class="core"><span class="dot"></span></div>
+      </div>
+      <div class="voice-label"><b data-i18n="listening">聞いています</b><br><span data-i18n="saysth">話しかけてください</span></div>
+    </div>
+  </main>
+
+  <!-- RIGHT — glass-box -->
+  <aside class="side">
+    <div class="side-top">
+      <div class="side-head"><span class="live"></span> <span data-i18n="nowdoing">今していること</span></div>
+      <button class="collapse" onclick="setRail('closed')"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+    </div>
+    <div class="side-sub" data-i18n="nowsub">Rhanis の動きが、ここに出ます</div>
+
+    <div class="live-now">
+      <div class="a-row think"><svg class="ic" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.6.6 1 1.3 1 2.1V16h6v-.4c0-.8.4-1.5 1-2.1A6 6 0 0 0 12 3Z"/></svg><span data-i18n="think">東京→新大阪の新幹線の時刻を確認しています</span></div>
+      <div class="a-row tool active"><svg class="ic" viewBox="0 0 24 24"><path d="m9 8-4 4 4 4M15 8l4 4-4 4"/></svg>
+        <div><span class="tn">web.search</span><span class="q" data-i18n="query">"東京 新大阪 新幹線 時刻"</span></div>
+        <span class="ok"><svg viewBox="0 0 24 24" fill="none"><path d="m5 13 4 4L19 7"/></svg></span>
+      </div>
+      <div class="a-row src"><svg class="ic" viewBox="0 0 24 24"><path d="M10 13a3 3 0 0 0 4.2.3l3-3a3 3 0 0 0-4.2-4.2l-1 1M14 11a3 3 0 0 0-4.2-.3l-3 3a3 3 0 0 0 4.2 4.2l1-1"/></svg><a href="#">jr-central.co.jp</a></div>
+    </div>
+
+    <div class="idle-now">
+      <div class="idle-msg"><span class="pip"></span> <span data-i18n="idle">待機中 — 指示を待っています</span></div>
+    </div>
+
+    <div class="recent">
+      <div class="rl" data-i18n="recent">最近</div>
+      <div class="done"><svg viewBox="0 0 24 24"><path d="m5 13 4 4L19 7"/></svg> <span data-i18n="done1">天気を確認しました</span></div>
+      <div class="done"><svg viewBox="0 0 24 24"><path d="m5 13 4 4L19 7"/></svg> <span data-i18n="done2">メモを保存しました</span></div>
+    </div>
+  </aside>
+
+</div>
+<script>
+  const I18N={
+    ja:{newchat:"新しい会話",search:"検索",projects:"プロジェクト",p1:"旅行計画",p2:"毎朝ニュース",p3:"確定申告",
+      toolsLbl:"ツール",automations:"オートメーション",integrations:"連携ツール",tasks:"タスクボード",settings:"設定",
+      stIdle:"待機",stWork:"作業中",greet:"今日は何をしましょう？",greetsub:"声で話しかけても、入力してもかまいません。",
+      umsg:"新幹線の時刻、調べて",aimsg:"調べています",listening:"聞いています",saysth:"話しかけてください",
+      nowdoing:"今していること",nowsub:"Rhanis の動きが、ここに出ます",
+      think:"東京→新大阪の新幹線の時刻を確認しています",query:'"東京 新大阪 新幹線 時刻"',
+      idle:"待機中 — 指示を待っています",recent:"最近",done1:"天気を確認しました",done2:"メモを保存しました"},
+    en:{newchat:"New chat",search:"Search",projects:"Projects",p1:"Trip planning",p2:"Morning news",p3:"Tax filing",
+      toolsLbl:"Tools",automations:"Automations",integrations:"Integrations",tasks:"Tasks",settings:"Settings",
+      stIdle:"Idle",stWork:"Working",greet:"What can I do for you?",greetsub:"Talk or type — either works.",
+      umsg:"Find the Shinkansen schedule",aimsg:"Looking it up",listening:"Listening",saysth:"Say something",
+      nowdoing:"What Rhanis is doing",nowsub:"Rhanis's activity shows up here",
+      think:"Checking the Tokyo → Shin-Osaka train times",query:'"Tokyo Shin-Osaka shinkansen times"',
+      idle:"Idle — waiting for you",recent:"Recent",done1:"Checked the weather",done2:"Saved a note"}
+  };
+  function setLang(l){
+    document.documentElement.setAttribute('lang',l);
+    document.querySelectorAll('[data-i18n]').forEach(function(el){
+      var k=el.getAttribute('data-i18n'); if(I18N[l][k]!==undefined) el.textContent=I18N[l][k];
+    });
+    document.getElementById('lg-ja').classList.toggle('on',l==='ja');
+    document.getElementById('lg-en').classList.toggle('on',l==='en');
+  }
+  function setTheme(t){
+    document.documentElement.setAttribute('data-theme',t);
+    document.getElementById('tg-light').classList.toggle('on',t==='light');
+    document.getElementById('tg-dark').classList.toggle('on',t==='dark');
+  }
+  function setState(s){
+    document.documentElement.setAttribute('data-state',s);
+    document.getElementById('d-idle').classList.toggle('on',s==='idle');
+    document.getElementById('d-work').classList.toggle('on',s==='working');
+  }
+  function setRail(r){ document.documentElement.setAttribute('data-rail',r); }
+</script>
+</body>
+</html>
