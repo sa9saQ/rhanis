@@ -42,6 +42,35 @@ const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-
 /// onto the same cost ledger (rhanis-pbe).
 const ASR_MODEL: &str = "gpt-4o-mini-transcribe";
 
+/// Ceiling on OUTPUT TOKENS (text + audio) for a SINGLE assistant `response`, set
+/// in the initial `session.update` (rhanis-95z). The GA default is `"inf"` (model
+/// maximum); pinning the largest *explicit* integer the API allows (`1..=4096`)
+/// caps how long one response can run while staying generous enough never to
+/// truncate a normal spoken turn.
+///
+/// SCOPE — this is DEFENSE-IN-DEPTH, not a cost cap. It bounds the *output-token
+/// count* of one `response`, NOT its cost and NOT a whole turn:
+/// - Audio output dominates the bill (`AUDIO_OUTPUT_PER_TOKEN` = 64_000 nanodollars
+///   in [`cost_tracker`]), so a full 4096-token audio response is still ≈ $0.26 of
+///   output alone.
+/// - INPUT tokens (audio input at 32_000 nanodollars/token) are NOT capped by this
+///   field, and a tool loop emits MANY sub-4096 responses, so per-turn / per-session
+///   spend is not bounded here.
+/// The real, authoritative stop remains the fail-closed budget gate that fires on
+/// EACH `response.done` against the cross-session ledger (see [`parse_usage`] →
+/// `ProviderEvent::Usage` in `session_manager`). A malicious server may ignore this
+/// request entirely; the cap only trims single-response overshoot *between* gate
+/// firings.
+///
+/// FIELD NAME: the GA Realtime session object names this `max_output_tokens`
+/// (top-level under `session`). The beta interface used `max_response_output_tokens`
+/// and the GA server does NOT accept that name — sending the beta name here would
+/// be rejected (surfaced via rhanis-nal) or silently dropped (re-opening the very
+/// budget leak this guards). gpt-realtime-2 is GA (see [`REALTIME_URL`] + the
+/// dropped `OpenAI-Beta` header), so the GA name is required. The exact live
+/// acceptance is pinned in rhanis-ef8 (Windows E2E), like the rest of the wire.
+const MAX_OUTPUT_TOKENS_PER_RESPONSE: u32 = 4096;
+
 // ---- RealtimeAuth ------------------------------------------------------------
 
 /// The connection credential. `Byok` is M1; `ManagedCredit` is a stub for M4
@@ -286,6 +315,10 @@ impl RealtimeProvider for OpenAiRealtime {
             "session": {
                 "tools": tools,
                 "tool_choice": "auto",
+                // rhanis-95z: bound a single response's output so it can't overshoot
+                // the monthly budget by one unbounded response (GA default = "inf").
+                // GA field name is `max_output_tokens` — see the constant's doc.
+                "max_output_tokens": MAX_OUTPUT_TOKENS_PER_RESPONSE,
                 "audio": { "input": { "transcription": { "model": ASR_MODEL } } }
             }
         });
@@ -856,6 +889,33 @@ mod tests {
         );
         // The tools advertisement must survive the merge (same session.update).
         assert_eq!(v["session"]["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn initial_frames_caps_max_output_tokens() {
+        // rhanis-95z: cap the OUTPUT-TOKEN COUNT of one response so it can't run to
+        // the GA default of `max_output_tokens: "inf"` between budget-gate firings.
+        // (Defense-in-depth — the real stop is the post-`response.done` fail-closed
+        // gate; see the constant's doc for why this is not a cost/per-turn cap.)
+        // NOTE the GA field is `max_output_tokens` (top-level under `session`) — NOT
+        // the beta-era `max_response_output_tokens` (the GA server rejects that).
+        let p = OpenAiRealtime::new();
+        let frames = p.initial_frames(&[]);
+        let Message::Text(t) = &frames[0] else {
+            panic!("expected a text frame");
+        };
+        let v: Value = serde_json::from_str(t.as_str()).unwrap();
+        assert_eq!(
+            v["session"]["max_output_tokens"],
+            serde_json::json!(MAX_OUTPUT_TOKENS_PER_RESPONSE),
+            "a single response must be bounded (not the GA default of inf)"
+        );
+        // The cap must merge alongside the tools/transcription config, not replace it.
+        assert_eq!(v["session"]["tool_choice"], "auto");
+        assert_eq!(
+            v["session"]["audio"]["input"]["transcription"]["model"],
+            "gpt-4o-mini-transcribe"
+        );
     }
 
     // ---- parse_usage (moved from session_manager) ----------------------------
