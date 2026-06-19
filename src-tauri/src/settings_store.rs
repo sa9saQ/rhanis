@@ -299,12 +299,18 @@ impl ManagedSettings {
     where
         F: FnOnce(&dyn SettingsStore) -> Result<T, String>,
     {
-        // PoisonError → fixed message (a poisoned lock means a prior writer
-        // panicked; surface it as "unavailable", never as a silent success).
-        let _guard = self
-            .1
-            .lock()
-            .map_err(|_| SettingsError::Unavailable.to_string())?;
+        // PoisonError → recover the guard (rhanis-cku). This lock guards only
+        // `()`: there is no in-memory invariant to protect — the real state is
+        // the atomic temp+rename file (and the secret vault), and every critical
+        // section reloads from scratch, so a prior writer's panic leaves no torn
+        // in-memory state behind the lock. Writers that also touch the vault
+        // (the blocking variant's tool-provider commands) order their save +
+        // vault op so any partial failure is benign (disabled + key-present); a
+        // recovered lock therefore never resumes onto a corrupt state. Failing
+        // closed here would instead turn one panic into a
+        // permanent "settings unavailable until restart" DoS. `Unavailable` is
+        // reserved for genuine IO failures (load/save).
+        let _guard = self.1.lock().unwrap_or_else(|p| p.into_inner());
         f(self.0.as_ref())
     }
 
@@ -326,10 +332,12 @@ impl ManagedSettings {
         let store = Arc::clone(&self.0);
         let lock = Arc::clone(&self.1);
         tokio::task::spawn_blocking(move || {
-            // PoisonError → fixed "unavailable" message, same as with_write_lock.
-            let _guard = lock
-                .lock()
-                .map_err(|_| SettingsError::Unavailable.to_string())?;
+            // PoisonError → recover the guard, same rationale as with_write_lock
+            // (rhanis-cku): the lock guards only `()`, so recovering avoids a
+            // permanent DoS. A panic in THIS closure still fails closed for the
+            // caller via the JoinError branch below — only the *next* writer
+            // benefits from the recovery.
+            let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             f(store.as_ref())
         })
         .await
@@ -1216,6 +1224,86 @@ mod tests {
             store.load().expect("reload"),
             before,
             "a closure that fails before saving must not change the file"
+        );
+    }
+
+    #[test]
+    fn with_write_lock_recovers_after_poisoning_panic() {
+        // rhanis-cku: a panic inside a write-lock critical section poisons the
+        // shared Mutex<()>. Pre-fix the next writer got a permanent Unavailable
+        // (DoS until restart). Post-fix the poison is recovered — the lock guards
+        // only `()` so there is no corrupt state to protect — and later writes
+        // succeed. (The panic happens before any save, so the file is whole-old.)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn SettingsStore> =
+            Arc::new(JsonSettingsStore::new(dir.path().join("rhanis-settings.json")));
+        store.save(&AppSettings::default()).expect("seed");
+        let managed = ManagedSettings::new(Arc::clone(&store));
+
+        // Panic INSIDE the locked critical section → poisons the lock. The store
+        // reloads from the file each call, so there is no half-mutated in-memory
+        // state to make unwind-unsafe; AssertUnwindSafe is sound here.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            managed.with_write_lock(|_store| -> Result<(), String> {
+                panic!("boom inside critical section");
+            })
+        }));
+        assert!(poisoned.is_err(), "the panic must propagate out of the lock");
+
+        // A subsequent write must recover the poisoned lock and persist.
+        managed
+            .update(|s| {
+                s.tool_providers.xai = true;
+                Ok(())
+            })
+            .expect("update must succeed after a poisoning panic (no permanent DoS)");
+        assert!(
+            store.load().expect("reload").tool_providers.xai,
+            "the post-recovery write must persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_write_lock_blocking_recovers_after_panicking_closure() {
+        // rhanis-cku (blocking variant): a panic in the blocking critical section
+        // (1) fails THAT call closed via JoinError → Unavailable (unchanged) AND
+        // (2) poisons the shared lock. The poison must be recovered so later
+        // writers — both the blocking and the sync path share this lock — still
+        // succeed, instead of a permanent settings DoS.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn SettingsStore> =
+            Arc::new(JsonSettingsStore::new(dir.path().join("rhanis-settings.json")));
+        store.save(&AppSettings::default()).expect("seed");
+        let managed = ManagedSettings::new(Arc::clone(&store));
+
+        // The panicking call itself still fails closed (JoinError → Unavailable).
+        let panicked: Result<(), String> = managed
+            .with_write_lock_blocking(|_store| -> Result<(), String> {
+                panic!("boom on the blocking thread");
+            })
+            .await;
+        assert!(panicked.is_err(), "a panicking blocking closure fails closed");
+
+        // The shared lock is now poisoned; the blocking path must recover it.
+        managed
+            .with_write_lock_blocking(|store| {
+                let mut s = store.load().map_err(|e| e.to_string())?;
+                s.tool_providers.x = true;
+                store.save(&s).map_err(|e| e.to_string())
+            })
+            .await
+            .expect("blocking write must succeed after a poisoning panic");
+        // The sync path shares the same lock — it must recover too.
+        managed
+            .update(|s| {
+                s.tool_providers.xai = true;
+                Ok(())
+            })
+            .expect("sync write must also recover the shared poisoned lock");
+        let reloaded = store.load().expect("reload");
+        assert!(
+            reloaded.tool_providers.x && reloaded.tool_providers.xai,
+            "both post-recovery writes must persist"
         );
     }
 
