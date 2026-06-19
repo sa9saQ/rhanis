@@ -273,11 +273,14 @@ impl SettingsStore for JsonSettingsStore {
 /// lose each other's updates (last-writer-wins). Construct with
 /// [`ManagedSettings::new`]. Reads need no lock — saves are atomic temp+rename,
 /// so a concurrent read sees the whole old or whole new file, never a torn one.
-pub struct ManagedSettings(pub Arc<dyn SettingsStore>, std::sync::Mutex<()>);
+pub struct ManagedSettings(pub Arc<dyn SettingsStore>, Arc<std::sync::Mutex<()>>);
 
 impl ManagedSettings {
     pub fn new(store: Arc<dyn SettingsStore>) -> Self {
-        Self(store, std::sync::Mutex::new(()))
+        // The write lock is an `Arc` so the compound critical section can be moved
+        // onto a blocking thread (rhanis-2ef) while still excluding the synchronous
+        // writers that lock the same `Arc<Mutex<()>>`.
+        Self(store, Arc::new(std::sync::Mutex::new(())))
     }
 
     /// Runs `load → mutate → save` under the write lock so two concurrent
@@ -303,6 +306,36 @@ impl ManagedSettings {
             .lock()
             .map_err(|_| SettingsError::Unavailable.to_string())?;
         f(self.0.as_ref())
+    }
+
+    /// Same lock + atomicity contract as [`with_write_lock`], but runs the locked
+    /// closure on a BLOCKING thread so a closure that does slow work — notably a
+    /// scrypt-backed secret op (`has_api_key` / `delete_api_key`) — does not stall
+    /// a tokio async worker (rhanis-2ef). The lock is acquired INSIDE the blocking
+    /// thread and held across the whole closure, so the critical section (e.g. a
+    /// flag write + a secret op kept consistent so a concurrent toggle can't slip
+    /// between them) is identical to `with_write_lock` — only the executing thread
+    /// differs. The same `Arc<Mutex<()>>` is shared with the synchronous writers,
+    /// so blocking and non-blocking commands still mutually exclude. `f` must NOT
+    /// re-enter `update`/`replace`/`with_write_lock*` (the lock is not reentrant).
+    async fn with_write_lock_blocking<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&dyn SettingsStore) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        let store = Arc::clone(&self.0);
+        let lock = Arc::clone(&self.1);
+        tokio::task::spawn_blocking(move || {
+            // PoisonError → fixed "unavailable" message, same as with_write_lock.
+            let _guard = lock
+                .lock()
+                .map_err(|_| SettingsError::Unavailable.to_string())?;
+            f(store.as_ref())
+        })
+        .await
+        // A JoinError means the blocking thread panicked; surface it fail-closed
+        // (never collapse to a silent success), mirroring the secret-store commands.
+        .map_err(|_| SettingsError::Unavailable.to_string())?
     }
 
     /// `load → mutate → save` under the write lock so two concurrent mutating
@@ -470,14 +503,22 @@ pub async fn set_tool_provider_enabled(
     // run under ONE settings-lock hold, so a concurrent delete_tool_provider_key
     // can't slip between them. Fail-closed: an Err from has_api_key (locked
     // vault) blocks the enable too.
-    settings.with_write_lock(|store| {
-        if enabled && !secret.0.has_api_key(key_name).map_err(|e| e.to_string())? {
-            return Err("set an API key before enabling this tool".into());
-        }
-        let mut s = store.load().map_err(|e| e.to_string())?;
-        set_tool_flag(&mut s.tool_providers, &provider, enabled);
-        store.save(&s).map_err(|e| e.to_string())
-    })
+    //
+    // rhanis-2ef: has_api_key is a scrypt-backed read, so the whole locked critical
+    // section runs on a blocking thread (off the async worker). The single lock hold
+    // — and thus the enable↔delete atomicity above — is unchanged; only the thread
+    // differs (see with_write_lock_blocking).
+    let secret_store = secret.0.clone();
+    settings
+        .with_write_lock_blocking(move |store| {
+            if enabled && !secret_store.has_api_key(key_name).map_err(|e| e.to_string())? {
+                return Err("set an API key before enabling this tool".into());
+            }
+            let mut s = store.load().map_err(|e| e.to_string())?;
+            set_tool_flag(&mut s.tool_providers, &provider, enabled);
+            store.save(&s).map_err(|e| e.to_string())
+        })
+        .await
 }
 
 /// Deletes a 手足 tool key **and** clears its enable flag, both under ONE
@@ -494,12 +535,19 @@ pub async fn delete_tool_provider_key(
     secret: tauri::State<'_, ManagedSecretStore>,
 ) -> Result<(), String> {
     let key_name = tool_provider_key_name(&provider)?;
-    settings.with_write_lock(|store| {
-        let mut s = store.load().map_err(|e| e.to_string())?;
-        set_tool_flag(&mut s.tool_providers, &provider, false);
-        store.save(&s).map_err(|e| e.to_string())?;
-        secret.0.delete_api_key(key_name).map_err(|e| e.to_string())
-    })
+    // rhanis-2ef: delete_api_key is scrypt-backed, so the locked flag-clear +
+    // key-delete runs on a blocking thread. Order within the lock is unchanged
+    // (clear the flag, then delete the key), so a partial failure still leaves
+    // disabled + key-present (benign — the tool is simply off).
+    let secret_store = secret.0.clone();
+    settings
+        .with_write_lock_blocking(move |store| {
+            let mut s = store.load().map_err(|e| e.to_string())?;
+            set_tool_flag(&mut s.tool_providers, &provider, false);
+            store.save(&s).map_err(|e| e.to_string())?;
+            secret_store.delete_api_key(key_name).map_err(|e| e.to_string())
+        })
+        .await
 }
 
 /// Replaces the whole permission policy (rhanis-351). The policy is validated
@@ -1108,6 +1156,66 @@ mod tests {
             store.load().expect("load"),
             before,
             "a failed update must not persist a partial change"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_write_lock_blocking_serialises_concurrent_writers() {
+        // rhanis-2ef: the two tool-provider commands run their locked load-modify-
+        // save on a blocking thread. Two concurrent blocking writers, each flipping
+        // a DIFFERENT flag, must BOTH land — the shared write lock serialises the
+        // read-modify-write so neither clobbers the other (a lost update would drop
+        // one flag). JsonSettingsStore's own save_lock only prevents torn files, not
+        // this RMW race, so this exercises the ManagedSettings lock specifically.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn SettingsStore> =
+            Arc::new(JsonSettingsStore::new(dir.path().join("rhanis-settings.json")));
+        store.save(&AppSettings::default()).expect("seed");
+        let managed = Arc::new(ManagedSettings::new(Arc::clone(&store)));
+
+        let m1 = Arc::clone(&managed);
+        let m2 = Arc::clone(&managed);
+        let a = m1.with_write_lock_blocking(|s| {
+            let mut cur = s.load().map_err(|e| e.to_string())?;
+            cur.tool_providers.x = true;
+            s.save(&cur).map_err(|e| e.to_string())
+        });
+        let b = m2.with_write_lock_blocking(|s| {
+            let mut cur = s.load().map_err(|e| e.to_string())?;
+            cur.tool_providers.xai = true;
+            s.save(&cur).map_err(|e| e.to_string())
+        });
+        let (ra, rb) = tokio::join!(a, b);
+        ra.expect("writer a ok");
+        rb.expect("writer b ok");
+
+        let reloaded = store.load().expect("reload");
+        assert!(
+            reloaded.tool_providers.x && reloaded.tool_providers.xai,
+            "both concurrent blocking writers must land (no lost update under the lock)"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_write_lock_blocking_propagates_err_without_saving() {
+        // A closure that fails BEFORE saving must leave the file unchanged and the
+        // Err must propagate fail-closed — exactly the guard set_tool_provider_enabled
+        // relies on: a keyless enable (or a locked vault) returns Err before any save.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn SettingsStore> =
+            Arc::new(JsonSettingsStore::new(dir.path().join("rhanis-settings.json")));
+        store.save(&AppSettings::default()).expect("seed");
+        let managed = ManagedSettings::new(Arc::clone(&store));
+        let before = store.load().expect("load");
+
+        let res: Result<(), String> = managed
+            .with_write_lock_blocking(|_store| Err("rejected before save".to_string()))
+            .await;
+        assert!(res.is_err());
+        assert_eq!(
+            store.load().expect("reload"),
+            before,
+            "a closure that fails before saving must not change the file"
         );
     }
 
