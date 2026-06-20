@@ -44,7 +44,7 @@ use crate::audio_bridge::{AudioBridge, ManagedAudioBridge, MAX_WS_TEXT_BYTES};
 use crate::cost_tracker::{BudgetConfig, CostSnapshot, CostTracker};
 use crate::events::{ManagedSequenceCounter, SequenceCounter};
 use crate::realtime_provider::{select_provider, ProviderEvent, RealtimeAuth, RealtimeProvider};
-use crate::realtime_types::{DispatcherSeam, FunctionCall, ManagedDispatcher};
+use crate::realtime_types::{Admission, DispatcherSeam, FunctionCall, ManagedDispatcher};
 use crate::secret_store::{ManagedSecretStore, SecretStore, OPENAI_KEY_NAME};
 use crate::settings_store::ManagedSettings;
 use crate::storage::adapter::{ManagedRecorder, RecorderAdapter};
@@ -877,6 +877,21 @@ where
         }
         stop_audio(false); // false = immediate: StopNow (discard tail)
         dispatch_tasks.abort_all();
+        // Deterministically release each aborted task's DANGER admission
+        // reservation (rhanis-e2b) here. The `reserved` counter lives in the
+        // app-lifetime `ApprovalGate` shared across reconnects, and `abort_all()`
+        // only SIGNALS cancellation — a guard drops when its task is polled to the
+        // cancel point. The downstream teardown awaits (journal flush) plus the
+        // supervisor's reconnect backoff already drive the runtime to drop the
+        // aborted tasks in practice, but this BOUNDED drain makes the release
+        // immediate and explicit (symmetric with the graceful branch below), so
+        // the invariant "no reservation outlives its connection" does not rely on
+        // incidental scheduling. Bounded so the "tear down promptly" intent holds
+        // even if a task is slow to cancel: the JoinSet drop reclaims any remainder.
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            while dispatch_tasks.join_next().await.is_some() {}
+        })
+        .await;
     } else {
         stop_audio(true); // true = graceful: flush tail
         // Drain in-flight dispatches so their side effects + final frames finish.
@@ -1598,6 +1613,39 @@ where
             // episode logs once more.
             *cap_warned = false;
 
+            // Pre-spawn admission control (rhanis-e2b). A DANGER call that cannot
+            // reserve an approval slot is declined HERE, inline, WITHOUT spawning a
+            // dispatch task — so a back-to-back burst of DANGER function_calls
+            // cannot fill the in-flight JoinSet checked above and starve legitimate
+            // SAFE/CAUTION calls. SAFE/CAUTION (and any dispatcher without admission
+            // control) admit with no reservation. Risk is classified from the tool
+            // NAME, so this runs before the (still-unparsed) args below.
+            let reservation = match dispatcher.try_admit(&pending.name, &pending.call_id) {
+                Admission::Admit(reservation) => reservation,
+                Admission::Reject(frames) => {
+                    // Send the declined pair inline (NON-blocking, no spawn → no
+                    // dispatch slot consumed). Reserve BOTH channel slots first so
+                    // the pair is all-or-nothing: a partial send (the
+                    // function_call_output item WITHOUT the following response.create)
+                    // would leave the turn unanswered. Under a full channel both
+                    // frames are dropped (fail-soft, same discipline as the audio
+                    // path) — acceptable since hitting the reservation cap is already
+                    // an anomalous burst. The call is intentionally not journalled /
+                    // disclosed: it never runs, so an emit_thinking would be an orphan
+                    // (no following tool-event), matching the cap-drop path above.
+                    if let (Ok(item_slot), Ok(resp_slot)) =
+                        (write_tx.try_reserve(), write_tx.try_reserve())
+                    {
+                        item_slot.send(Message::Text(
+                            frames.conversation_item_create.to_string().into(),
+                        ));
+                        resp_slot
+                            .send(Message::Text(frames.response_create.to_string().into()));
+                    }
+                    return LoopAction::Continue;
+                }
+            };
+
             // Journal the tool INVOCATION (rhanis-emd) — i.e. "the model requested
             // tool X", recorded when the function_call arrives, NOT a confirmed
             // execution outcome. A later approval-deny / policy-block / dispatch
@@ -1630,8 +1678,9 @@ where
                 // by the dispatcher BEFORE it emits any tool-event, so a disclosure
                 // for it would be a dangling orphan (a thinking-event with no
                 // following tool-event start, which the store could never consume).
-                // Emitted synchronously here — after the in-flight cap admitted the
-                // call, but BEFORE the dispatch task is spawned — so this
+                // Emitted synchronously here — after the in-flight cap AND the
+                // DANGER admission control (rhanis-e2b) admitted the call, but
+                // BEFORE the dispatch task is spawned — so this
                 // thinking-event always precedes the call's `tool-event` phase=start
                 // (emitted inside the spawned task) and lands inside the 300–700ms
                 // window rather than after a silent pause. Built from the call_id +
@@ -1652,6 +1701,10 @@ where
             let dispatcher = Arc::clone(dispatcher);
             let tx = write_tx.clone();
             dispatch_tasks.spawn(async move {
+                // Hold the admission reservation (rhanis-e2b) for the whole call —
+                // including the up-to-30s approval await inside dispatch — so the
+                // slot frees only when the task ends. `None` for SAFE/CAUTION.
+                let _reservation = reservation;
                 let result = dispatcher.dispatch(call).await;
                 // Bounded channel: if the writer is gone (session stopped) these
                 // simply fail and the task ends.
@@ -3443,6 +3496,234 @@ mod tests {
         assert_eq!(
             dispatched, MAX_INFLIGHT_DISPATCHES,
             "in-flight tool dispatches must be capped at MAX_INFLIGHT_DISPATCHES, got {dispatched}"
+        );
+    }
+
+    #[tokio::test]
+    async fn danger_burst_is_admission_capped_without_starving_safe() {
+        // rhanis-e2b: a hostile model that streams DANGER `function_call`s
+        // back-to-back must not fill the in-flight dispatch JoinSet with calls
+        // parked on the 30s approval gate and starve a legitimate SAFE call. The
+        // pre-spawn admission control (`try_admit`) reserves at most `cap` DANGER
+        // slots; over-cap DANGER calls are declined inline WITHOUT spawning, so a
+        // later SAFE call is always dispatched.
+        //
+        // Same determinism as `inflight_dispatch_count_is_bounded`: on the
+        // current-thread runtime the read loop never yields between ready frames,
+        // so the spawned DANGER tasks are NOT polled during the burst and their
+        // reservations stay held — exactly the worst case. The drain then polls
+        // them and `dispatch` records one call per SPAWNED task (declined calls
+        // never reach `dispatch`).
+        struct AdmissionDispatcher {
+            gate: Arc<crate::approval_gate::ApprovalGate>,
+            calls: StdMutex<Vec<String>>,
+        }
+        impl DispatcherSeam for AdmissionDispatcher {
+            fn try_admit(&self, name: &str, call_id: &str) -> Admission {
+                // Exercise the SAME production admission logic (no inline copy) so
+                // this integration test can never pass against stale behaviour.
+                crate::tool_dispatcher::admit_by_risk(&self.gate, name, call_id)
+            }
+            fn dispatch(
+                &self,
+                call: FunctionCall,
+            ) -> crate::realtime_types::BoxFuture<'static, DispatchResult> {
+                self.calls.lock().unwrap().push(call.name.clone());
+                Box::pin(async move {
+                    crate::realtime_types::function_call_output(&call.call_id, "{}".into())
+                })
+            }
+            fn tool_schemas(&self) -> Vec<ToolSchema> {
+                Vec::new()
+            }
+        }
+
+        let cap = 2;
+        let disp = Arc::new(AdmissionDispatcher {
+            gate: Arc::new(crate::approval_gate::ApprovalGate::with_max_pending(
+                Arc::new(crate::events::SequenceCounter::new()),
+                cap,
+            )),
+            calls: StdMutex::new(Vec::new()),
+        });
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        // Drop the receiver so every result `send` / inline `try_send` fails
+        // instantly (fail-soft) instead of blocking the drain.
+        let (write_tx, write_rx) = mpsc::channel::<Message>(8);
+        drop(write_rx);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        // 5 DANGER (delete_file) then 1 SAFE (write_note). With cap=2 the first two
+        // DANGER reserve a slot and are spawned; the next three are declined inline
+        // (no spawn); the trailing SAFE is admitted with no reservation and spawned.
+        let mut frames: Vec<Value> = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "call_id": format!("danger_{i}"),
+                    "name": "delete_file",
+                    "arguments": "{}"
+                })
+            })
+            .collect();
+        frames.push(serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "call_id": "safe_0",
+            "name": "write_note",
+            "arguments": "{}"
+        }));
+
+        run_read_loop(
+            frame_stream(frames),
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            disp.clone() as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {}, // no-op audio_handler (no device in test)
+            Arc::new(AtomicBool::new(true)),
+            |_| {}, // no-op stop_audio
+            None,
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
+        )
+        .await;
+
+        let dispatched = disp.calls.lock().unwrap().clone();
+        let danger = dispatched.iter().filter(|n| n.as_str() == "delete_file").count();
+        let safe = dispatched.iter().filter(|n| n.as_str() == "write_note").count();
+        assert_eq!(
+            danger, cap,
+            "DANGER dispatches must be bounded by the admission cap; got {danger} ({dispatched:?})"
+        );
+        assert_eq!(
+            safe, 1,
+            "the SAFE call must NOT be starved by the DANGER burst; got {safe} ({dispatched:?})"
+        );
+        assert_eq!(
+            dispatched.len(),
+            cap + 1,
+            "only admitted calls reach dispatch; got {dispatched:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abnormal_exit_does_not_leak_admission_reservations() {
+        // rhanis-e2b INVARIANT: no DANGER admission reservation outlives its
+        // connection. The `reserved` counter lives in the app-lifetime ApprovalGate
+        // shared ACROSS reconnects, and a DANGER task holds its reservation until
+        // polled to its cancel point. This drives an ABNORMAL exit (a transport-
+        // error frame) with two DANGER calls reserved-and-spawned (parked so they
+        // genuinely hold their reservations) and asserts the count is back to 0
+        // after run_read_loop returns. The bounded drain on the abnormal branch
+        // makes that release deterministic; the teardown awaits would also achieve
+        // it, so this test locks the end-state invariant rather than the drain
+        // mechanism specifically.
+        struct ParkingDispatcher {
+            gate: Arc<crate::approval_gate::ApprovalGate>,
+        }
+        impl DispatcherSeam for ParkingDispatcher {
+            fn try_admit(&self, name: &str, call_id: &str) -> Admission {
+                crate::tool_dispatcher::admit_by_risk(&self.gate, name, call_id)
+            }
+            fn dispatch(
+                &self,
+                call: FunctionCall,
+            ) -> crate::realtime_types::BoxFuture<'static, DispatchResult> {
+                Box::pin(async move {
+                    // Park until aborted, so the reservation stays held right up to
+                    // the abnormal-exit teardown (the worst case the drain fixes).
+                    std::future::pending::<()>().await;
+                    crate::realtime_types::function_call_output(&call.call_id, "{}".into())
+                })
+            }
+            fn tool_schemas(&self) -> Vec<ToolSchema> {
+                Vec::new()
+            }
+        }
+
+        let gate = Arc::new(crate::approval_gate::ApprovalGate::new(Arc::new(
+            crate::events::SequenceCounter::new(),
+        )));
+        let disp = Arc::new(ParkingDispatcher { gate: Arc::clone(&gate) });
+        let cost = Arc::new(TokioMutex::new(CostTracker::new(
+            BudgetConfig { enabled: false, monthly_limit_nanodollars: 0 },
+            current_yyyymm(),
+        )));
+        let (write_tx, write_rx) = mpsc::channel::<Message>(8);
+        drop(write_rx);
+        let (_sd_tx, sd_rx) = oneshot::channel();
+        let (_log, emit) = collect_emit();
+
+        // Two DANGER frames (reserve+spawn, unpolled on the current-thread runtime),
+        // then a transport error → abnormal exit (`abort_inflight = true`).
+        let danger = |id: &str| -> Result<Message, WsError> {
+            Ok(Message::Text(
+                serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "call_id": id,
+                    "name": "delete_file",
+                    "arguments": "{}"
+                })
+                .to_string()
+                .into(),
+            ))
+        };
+        let stream = futures_util::stream::iter(vec![
+            danger("d0"),
+            danger("d1"),
+            Err(WsError::ConnectionClosed),
+        ]);
+
+        run_read_loop(
+            stream,
+            Arc::new(OpenAiRealtime::new()) as Arc<dyn RealtimeProvider>,
+            write_tx,
+            cost,
+            Arc::new(OkRecorder) as Arc<dyn RecorderAdapter>,
+            disp.clone() as Arc<dyn DispatcherSeam>,
+            sd_rx,
+            emit,
+            Arc::new(TokioMutex::new(None)),
+            TEST_GENERATION,
+            test_counter(),
+            |_| {}, // no-op audio_handler
+            Arc::new(AtomicBool::new(true)),
+            |_| {}, // no-op stop_audio
+            None,
+            |_month: u32, _used: u64, _budget: BudgetConfig| {},
+            |_call_id: &str, _tool: &str| {}, |_c: Option<&str>, _m: &str| {},
+        )
+        .await;
+
+        assert_eq!(
+            gate.reserved_count(),
+            0,
+            "abnormal exit must drain DANGER admission reservations before reconnect"
+        );
+    }
+
+    #[test]
+    fn danger_admission_cap_is_below_inflight_cap() {
+        // rhanis-e2b relies on the reservation cap (MAX_PENDING_APPROVALS) leaving
+        // dispatch slots free for SAFE/CAUTION: if it ever met or exceeded
+        // MAX_INFLIGHT_DISPATCHES, a DANGER burst could reserve every dispatch slot
+        // and the admission control would no longer protect other dispatches. Lock
+        // the invariant so a future cap bump cannot silently defeat the fix.
+        assert!(
+            crate::approval_gate::MAX_PENDING_APPROVALS < MAX_INFLIGHT_DISPATCHES,
+            "DANGER reservation cap ({}) must stay below the in-flight dispatch cap ({})",
+            crate::approval_gate::MAX_PENDING_APPROVALS,
+            MAX_INFLIGHT_DISPATCHES,
         );
     }
 

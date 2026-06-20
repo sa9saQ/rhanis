@@ -29,6 +29,8 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::approval_gate::ApprovalReservation;
+
 /// A heap-pinned, `Send` future — the object-safe return shape for the async
 /// trait method below (`async fn` in traits is not yet `dyn`-compatible, so we
 /// box explicitly). `'static` because the future is moved into a spawned task.
@@ -51,6 +53,23 @@ pub struct FunctionCall {
 pub struct DispatchResult {
     pub conversation_item_create: Value,
     pub response_create: Value,
+}
+
+/// Outcome of the pre-spawn admission check (rhanis-e2b), returned by
+/// [`DispatcherSeam::try_admit`]. The read loop calls `try_admit` BEFORE spawning
+/// a dispatch task so a DANGER burst cannot fill the in-flight dispatch JoinSet
+/// (`MAX_INFLIGHT_DISPATCHES`) and starve SAFE/CAUTION calls.
+pub enum Admission {
+    /// Admit the call: the read loop spawns the dispatch task. The optional
+    /// reservation (Some for a DANGER call that acquired an admission slot; None
+    /// for SAFE/CAUTION or a dispatcher with no admission control) MUST be moved
+    /// into the spawned task so the slot is freed when the task ends (including
+    /// after its up-to-30s approval await).
+    Admit(Option<ApprovalReservation>),
+    /// Refuse the call WITHOUT spawning: the read loop sends these declined frames
+    /// inline (slot-free). Used when a DANGER call cannot acquire an admission
+    /// slot because all are reserved.
+    Reject(DispatchResult),
 }
 
 /// A tool's function-calling schema, serialized into the `session.update` tools
@@ -81,6 +100,20 @@ pub trait DispatcherSeam: Send + Sync + 'static {
     /// frames to send back. A tool error is encoded as a `function_call_output`
     /// with an error body — the caller always sends both frames.
     fn dispatch(&self, call: FunctionCall) -> BoxFuture<'static, DispatchResult>;
+
+    /// Pre-spawn admission check (rhanis-e2b). Called on the single read-loop task
+    /// BEFORE the dispatch task is spawned. The default admits every call with no
+    /// reservation — correct for the no-op and test doubles that have no approval
+    /// gate. `RealToolDispatcher` overrides it to reserve a DANGER admission slot
+    /// (declining an over-cap DANGER call inline) so a back-to-back burst cannot
+    /// starve the in-flight dispatch JoinSet.
+    ///
+    /// `name` and `call_id` come from the still-unparsed function call: risk is
+    /// classified from `name` alone, so admission needs no argument parse and runs
+    /// before the call's arguments are deserialized.
+    fn try_admit(&self, _name: &str, _call_id: &str) -> Admission {
+        Admission::Admit(None)
+    }
 
     /// Tool schemas to advertise in `session.update`. Empty for the no-op.
     fn tool_schemas(&self) -> Vec<ToolSchema>;
@@ -199,5 +232,17 @@ mod tests {
     fn managed_dispatcher_holds_trait_object() {
         // Compile-time: NoopDispatcher coerces into Arc<dyn DispatcherSeam>.
         let _m = ManagedDispatcher(Arc::new(NoopDispatcher));
+    }
+
+    #[test]
+    fn default_try_admit_admits_without_reservation() {
+        // The no-op (and any test double) inherits the default admission: admit
+        // with no reservation. rhanis-e2b's reservation lives only in
+        // RealToolDispatcher, so a dispatcher with no approval gate never blocks a
+        // call here — even a DANGER-classified name like `run_command`.
+        match NoopDispatcher.try_admit("run_command", "call_1") {
+            Admission::Admit(None) => {}
+            _ => panic!("default try_admit must Admit(None)"),
+        }
     }
 }

@@ -122,8 +122,17 @@ pub fn run() {
             let mut registry = ToolRegistry::new();
             tools::register_m1_tools(&mut registry, Arc::clone(&recorder));
             let policy = Arc::new(SettingsPolicyProvider(Arc::clone(&settings_store)));
-            let dispatcher =
-                RealToolDispatcher::new(io, Arc::clone(&sequence), Arc::new(registry), policy);
+            // The dispatcher gets the SAME gate Arc so `try_admit` (rhanis-e2b) can
+            // reserve a DANGER admission slot before session_manager spawns the
+            // dispatch task — the reservation and the pending modal (reached via
+            // `io` during dispatch) then share one gate instance.
+            let dispatcher = RealToolDispatcher::new(
+                io,
+                Arc::clone(&sequence),
+                Arc::new(registry),
+                policy,
+                Arc::clone(&gate),
+            );
             app.manage(ManagedDispatcher(Arc::new(dispatcher)));
 
             // Realtime session (rhanis-e3m): the RealToolDispatcher managed above
