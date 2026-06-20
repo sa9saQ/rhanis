@@ -38,6 +38,7 @@
 //! transaction N/A · idempotency_key N/A (in-memory approval routing, not billing).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -59,22 +60,26 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 ///   `tool-approval-required` modals ever reach the operator at once.
 /// - **Approval-map growth** — bounded: the `pending` map cannot grow without
 ///   bound under a sustained DANGER burst.
-/// - **Dispatch-slot starvation** — *partially* mitigated, NOT fully closed:
-///   each pending DANGER holds one in-flight dispatch slot for up to the 30s
-///   deadline (tool_dispatcher). In steady state, capping pending approvals far
-///   below the dispatch cap (`MAX_INFLIGHT_DISPATCHES` = 64, rhanis-wj2) keeps most
-///   slots free. BUT this cap is enforced inside [`ApprovalGate::register`],
-///   which a dispatch task only reaches AFTER session_manager has already
-///   `spawn`ed it onto the in-flight JoinSet — so a fast back-to-back burst can
-///   transiently fill all 64 slots before the over-cap tasks reach `register`
-///   and decline, briefly skipping legitimate SAFE/CAUTION calls. Fully closing
-///   that race needs a risk-aware admission BEFORE spawn (refuse an over-cap
-///   DANGER call without consuming a slot); tracked as follow-up rhanis-e2b.
+/// - **Dispatch-slot starvation** — fully closed by [`ApprovalGate::try_reserve`]
+///   (rhanis-e2b). Each pending DANGER would otherwise hold one in-flight dispatch
+///   slot for up to the 30s deadline (tool_dispatcher). `register` alone cannot
+///   close the burst race: it runs only AFTER session_manager has `spawn`ed the
+///   task onto the in-flight JoinSet, so the slot is already consumed by then — a
+///   fast back-to-back burst could transiently fill all `MAX_INFLIGHT_DISPATCHES`
+///   (= 64, rhanis-wj2) slots before the over-cap tasks reached `register` and
+///   declined, briefly skipping legitimate SAFE/CAUTION calls. `try_reserve` adds
+///   a risk-aware admission BEFORE spawn: a DANGER call that would exceed
+///   `max_pending` reserved slots is declined WITHOUT consuming a dispatch slot,
+///   so spawned DANGER tasks stay bounded by this same cap and a back-to-back
+///   DANGER burst can no longer starve other dispatches. (A CAUTION tool that the
+///   user's policy escalates to the gate is admitted without a reservation and
+///   can still hold a slot, but that is bounded by this cap and the 64-slot
+///   in-flight cap — see `admit_by_risk`.)
 ///
 /// Chosen generously enough that a realistic batch of genuine DANGER operations
 /// (e.g. "delete these few files") is never refused, yet far below the dispatch
 /// cap so steady-state slot pressure stays low.
-const MAX_PENDING_APPROVALS: usize = 8;
+pub(crate) const MAX_PENDING_APPROVALS: usize = 8;
 
 /// Hard cap on the redacted summary length before it crosses to the WebView.
 /// Defense-in-depth: the caller (rhanis-2gy tool_dispatcher) owns redaction, but a
@@ -200,6 +205,38 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
+/// RAII permit for ONE DANGER dispatch-admission slot (rhanis-e2b). Acquired by
+/// `try_reserve` BEFORE session_manager spawns the dispatch task and moved INTO
+/// that task, so it is held for the whole call — including the up-to-30s approval
+/// await — and dropping it (on completion, decline, or abort) frees the slot.
+///
+/// This is the pre-spawn counterpart to the `pending`-map cap: it bounds how many
+/// DANGER calls may be SPAWNED at once so a back-to-back burst cannot fill the
+/// in-flight dispatch JoinSet (`MAX_INFLIGHT_DISPATCHES`) and starve SAFE/CAUTION
+/// dispatches. It is INDEPENDENT of the `pending` map — reserving a slot does not
+/// register a pending approval (the task still calls `request_approval` →
+/// `register` later under its own cap), so the two counters never double-count:
+/// `reserved` tracks spawned-but-unfinished DANGER tasks; `pending` tracks open
+/// modals.
+///
+/// Unlike [`PendingGuard`] (a stack-bound `&self` borrow), this guard owns an
+/// `Arc<AtomicUsize>` so it is `Send + 'static` and can live inside the spawned
+/// task on a worker thread.
+pub struct ApprovalReservation {
+    reserved: Arc<AtomicUsize>,
+}
+
+impl Drop for ApprovalReservation {
+    fn drop(&mut self) {
+        // Release the admission slot. The `reserved` atomic carries no companion
+        // data, so the count's atomicity is all that is required (a `Relaxed` RMW
+        // would also be correct); `Release`/`Acquire` is kept as a conservative,
+        // self-documenting synchronization point. Underflow is impossible: every
+        // live guard owns exactly one increment performed by `try_reserve`.
+        self.reserved.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// Routes human approval decisions to the tool task awaiting them.
 ///
 /// One `oneshot` channel exists per in-flight request, keyed by `approvalId` in
@@ -222,6 +259,14 @@ pub struct ApprovalGate {
     /// Max concurrently-PENDING approvals; a request beyond this fails closed
     /// without opening a modal (see [`MAX_PENDING_APPROVALS`]).
     max_pending: usize,
+    /// Count of DANGER dispatch-admission slots currently reserved (rhanis-e2b).
+    /// Capped at `max_pending`. SEPARATE from `pending` (open modals): this is the
+    /// pre-spawn gate that bounds how many DANGER calls may be spawned at once, so
+    /// a back-to-back burst cannot fill the in-flight dispatch JoinSet
+    /// (`MAX_INFLIGHT_DISPATCHES`) and starve SAFE/CAUTION dispatches. An `Arc` so
+    /// an [`ApprovalReservation`] guard can outlive a `&self` borrow — it is moved
+    /// into the spawned dispatch task and decrements the count on drop.
+    reserved: Arc<AtomicUsize>,
 }
 
 impl ApprovalGate {
@@ -231,6 +276,7 @@ impl ApprovalGate {
             seq,
             timeout: DEFAULT_TIMEOUT,
             max_pending: MAX_PENDING_APPROVALS,
+            reserved: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -243,9 +289,12 @@ impl ApprovalGate {
         }
     }
 
-    /// Test/diagnostic constructor with a custom pending-approval cap.
+    /// Test/diagnostic constructor with a custom pending-approval cap. The cap
+    /// also bounds `try_reserve` (rhanis-e2b), so cross-module tests
+    /// (tool_dispatcher / session_manager) construct a small-cap gate through this
+    /// to exercise admission denial — hence `pub(crate)`.
     #[cfg(test)]
-    fn with_max_pending(seq: Arc<SequenceCounter>, max_pending: usize) -> Self {
+    pub(crate) fn with_max_pending(seq: Arc<SequenceCounter>, max_pending: usize) -> Self {
         Self {
             max_pending,
             ..Self::new(seq)
@@ -300,6 +349,57 @@ impl ApprovalGate {
         let sequence = self.seq.next();
         pending.insert(approval_id.clone(), PendingApproval { tx, expires_at });
         Some((approval_id, sequence, rx))
+    }
+
+    /// Tries to acquire one DANGER dispatch-admission slot BEFORE the call is
+    /// spawned (rhanis-e2b). Returns `None` when `max_pending` slots are already
+    /// reserved — the caller (tool_dispatcher `try_admit`) then declines the
+    /// DANGER call WITHOUT spawning it, so a back-to-back burst of DANGER
+    /// `function_call`s cannot transiently fill the in-flight dispatch JoinSet
+    /// (`MAX_INFLIGHT_DISPATCHES`) and starve legitimate SAFE/CAUTION dispatches.
+    ///
+    /// This closes the spawn-burst race the pending-map cap (`register`) alone
+    /// cannot: `register` runs only AFTER session_manager has spawned the task, so
+    /// the dispatch slot is already consumed by then. Reserving here — on the
+    /// single read-loop task, before spawn — bounds spawned DANGER tasks to
+    /// `max_pending`, and the returned guard holds the slot until the task
+    /// finishes (including its approval await).
+    ///
+    /// The CAS loop makes the load-check-increment atomic against a guard's `Drop`
+    /// (which runs on a worker thread when a task ends), so a reservation and a
+    /// concurrent release never corrupt the count even though `try_reserve` itself
+    /// is only ever called from the single read loop.
+    ///
+    /// A `max_pending` of 0 would deny every reservation (no DANGER call could be
+    /// admitted); production always uses `MAX_PENDING_APPROVALS` (8), never 0.
+    pub fn try_reserve(&self) -> Option<ApprovalReservation> {
+        let mut cur = self.reserved.load(Ordering::Acquire);
+        loop {
+            if cur >= self.max_pending {
+                return None;
+            }
+            match self.reserved.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ApprovalReservation {
+                        reserved: Arc::clone(&self.reserved),
+                    })
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Test-only view of the current DANGER admission reservation count, so a
+    /// cross-module test (session_manager) can assert the count returns to 0
+    /// after an abnormal-exit drain (rhanis-e2b).
+    #[cfg(test)]
+    pub(crate) fn reserved_count(&self) -> usize {
+        self.reserved.load(Ordering::Acquire)
     }
 
     /// Awaits the decision for `approval_id`, enforcing the fail-closed deadline.
@@ -806,5 +906,50 @@ mod tests {
         g.remove_pending(&id0); // free the only slot
         let (_id1, seq1, _rx1) = g.register().expect("after slot freed");
         assert_eq!(seq1, 1, "the refused request must not have advanced the sequence");
+    }
+
+    #[test]
+    fn try_reserve_admits_up_to_cap_then_denies() {
+        // The DANGER admission slots (rhanis-e2b) are capped at `max_pending`,
+        // independent of the pending-modal map. With cap=2: two reservations
+        // succeed, the third is denied while the first two are held.
+        let g = ApprovalGate::with_max_pending(Arc::new(SequenceCounter::new()), 2);
+        let r0 = g.try_reserve().expect("1st within cap");
+        let r1 = g.try_reserve().expect("2nd within cap");
+        assert!(g.try_reserve().is_none(), "3rd at cap → denied");
+        drop((r0, r1)); // holding the guards kept the slots reserved
+    }
+
+    #[test]
+    fn dropping_reservation_frees_a_slot() {
+        // A reservation guard releases its slot on drop, so a freed slot is
+        // immediately reusable (no leak across a burst).
+        let g = ApprovalGate::with_max_pending(Arc::new(SequenceCounter::new()), 1);
+        let r0 = g.try_reserve().expect("1st within cap");
+        assert!(g.try_reserve().is_none(), "at cap → denied");
+        drop(r0);
+        let _r1 = g.try_reserve().expect("slot freed → admitted again");
+        assert!(g.try_reserve().is_none(), "back at cap → denied");
+    }
+
+    #[test]
+    fn reservation_and_pending_map_are_independent_counters() {
+        // rhanis-e2b: `try_reserve` (spawn admission) and `register` (open modals)
+        // are SEPARATE caps that share only the `max_pending` value. Reserving all
+        // slots must not block `register`, and registering must not block
+        // reserving — otherwise the two would double-count and the gate would
+        // wrongly refuse legitimate calls.
+        let g = ApprovalGate::with_max_pending(Arc::new(SequenceCounter::new()), 1);
+        let _res = g.try_reserve().expect("reserve the only admission slot");
+        // The pending map is still empty, so a register succeeds despite the
+        // reservation cap being full.
+        let (_id, _seq, _rx) = g
+            .register()
+            .expect("register is independent of the reservation cap");
+        // And the reservation cap is still full despite the register.
+        assert!(
+            g.try_reserve().is_none(),
+            "reservation cap unaffected by register"
+        );
     }
 }

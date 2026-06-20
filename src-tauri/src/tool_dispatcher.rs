@@ -47,7 +47,8 @@ use crate::display_descriptor::run_summary;
 use crate::events::SequenceCounter;
 use crate::permission_policy::{decide, PolicyDecision, PolicyProvider};
 use crate::realtime_types::{
-    function_call_output, BoxFuture, DispatchResult, DispatcherSeam, FunctionCall, ToolSchema,
+    function_call_output, Admission, BoxFuture, DispatchResult, DispatcherSeam, FunctionCall,
+    ToolSchema,
 };
 
 /// Hard cap on incoming function-call args (bytes of serialized JSON). The args
@@ -209,6 +210,12 @@ pub struct RealToolDispatcher {
     /// edit takes effect immediately; a load failure fails closed (see
     /// `SettingsPolicyProvider` / `PolicyState::Unavailable`).
     policy: Arc<dyn PolicyProvider>,
+    /// The SAME `Arc<ApprovalGate>` held by `AppDispatchIo` (wired in `lib.rs`).
+    /// Used only by `try_admit` (rhanis-e2b) to reserve a DANGER dispatch-admission
+    /// slot BEFORE the call is spawned; the gate's `request_approval` is still
+    /// reached through `io` during dispatch, so both the reservation and the
+    /// pending modal target one gate instance (separate counters on it).
+    gate: Arc<ApprovalGate>,
 }
 
 impl RealToolDispatcher {
@@ -217,12 +224,14 @@ impl RealToolDispatcher {
         seq: Arc<SequenceCounter>,
         registry: Arc<ToolRegistry>,
         policy: Arc<dyn PolicyProvider>,
+        gate: Arc<ApprovalGate>,
     ) -> Self {
         Self {
             io,
             seq,
             registry,
             policy,
+            gate,
         }
     }
 }
@@ -238,8 +247,44 @@ impl DispatcherSeam for RealToolDispatcher {
         Box::pin(async move { dispatch_impl(io, seq, registry, policy, call).await })
     }
 
+    fn try_admit(&self, name: &str, call_id: &str) -> Admission {
+        admit_by_risk(&self.gate, name, call_id)
+    }
+
     fn tool_schemas(&self) -> Vec<ToolSchema> {
         self.registry.tool_schemas()
+    }
+}
+
+/// Shared pre-spawn admission decision (rhanis-e2b), used by BOTH
+/// [`RealToolDispatcher::try_admit`] and the session_manager integration test so
+/// neither drifts from the other (the repo's inline-copy-divergence lesson).
+///
+/// Risk is classified from the tool NAME alone — no argument parse — so it runs
+/// on the read loop before the call's args are deserialized. SAFE/CAUTION admit
+/// with no reservation (they run-and-return promptly without the gate). A DANGER
+/// call reserves one admission slot; when all are taken it is declined WITHOUT
+/// spawning, so a back-to-back DANGER burst cannot fill the in-flight dispatch
+/// JoinSet and starve other dispatches. The declined output is a distinct "busy"
+/// message (NOT "user declined"), so a saturation refusal is distinguishable from
+/// a human decline and the model's turn is not left hanging.
+///
+/// NOTE: a CAUTION tool that the user's permission policy ESCALATES to the gate
+/// (`RequireApproval`) is admitted here with no reservation yet still awaits the
+/// 30s gate in `dispatch_impl`, so it can hold a dispatch slot. That residual is
+/// bounded by the pending-modal cap and `MAX_INFLIGHT_DISPATCHES`; counting it
+/// would need args+policy at admission time, which this name-only pre-parse gate
+/// deliberately avoids. Tracked as a follow-up.
+pub(crate) fn admit_by_risk(gate: &ApprovalGate, name: &str, call_id: &str) -> Admission {
+    if classify(name) != ApprovalRisk::Danger {
+        return Admission::Admit(None);
+    }
+    match gate.try_reserve() {
+        Some(reservation) => Admission::Admit(Some(reservation)),
+        None => Admission::Reject(function_call_output(
+            call_id,
+            error_output("rejected: too many privileged actions pending"),
+        )),
     }
 }
 
@@ -593,6 +638,75 @@ mod tests {
     ) -> DispatchResult {
         let seq = Arc::new(SequenceCounter::new());
         dispatch_impl(io.clone() as Arc<dyn DispatchIo>, seq, registry, policy, c).await
+    }
+
+    /// Builds a real dispatcher wired to a small-cap gate so `try_admit`
+    /// (rhanis-e2b) admission denial can be exercised. The registry/policy/io are
+    /// irrelevant to `try_admit` (it only consults `classify` + the gate), so any
+    /// fixtures will do.
+    fn real_dispatcher(io: Arc<MockIo>, gate: Arc<ApprovalGate>) -> RealToolDispatcher {
+        RealToolDispatcher::new(
+            io as Arc<dyn DispatchIo>,
+            Arc::new(SequenceCounter::new()),
+            registry_with("delete_file"),
+            empty_policy(),
+            gate,
+        )
+    }
+
+    #[test]
+    fn try_admit_admits_safe_and_caution_without_reservation() {
+        let io = MockIo::new(ApprovalOutcome::Approved);
+        let gate = Arc::new(ApprovalGate::with_max_pending(Arc::new(SequenceCounter::new()), 1));
+        let d = real_dispatcher(io, Arc::clone(&gate));
+        // SAFE (read_file) and CAUTION (write_file) never reach the approval gate,
+        // so they are admitted with no reservation.
+        assert!(matches!(d.try_admit("read_file", "c0"), Admission::Admit(None)));
+        assert!(matches!(d.try_admit("write_file", "c1"), Admission::Admit(None)));
+        // Neither touched the reservation cap, so a DANGER can still reserve.
+        assert!(gate.try_reserve().is_some());
+    }
+
+    #[test]
+    fn try_admit_reserves_danger_up_to_cap_then_rejects_inline() {
+        let io = MockIo::new(ApprovalOutcome::Approved);
+        let gate = Arc::new(ApprovalGate::with_max_pending(Arc::new(SequenceCounter::new()), 2));
+        let d = real_dispatcher(io, Arc::clone(&gate));
+        // Two DANGER calls take the two admission slots; hold the guards.
+        let r0 = match d.try_admit("delete_file", "c0") {
+            Admission::Admit(Some(r)) => r,
+            _ => panic!("1st DANGER must be admitted with a reservation"),
+        };
+        let r1 = match d.try_admit("run_command", "c1") {
+            Admission::Admit(Some(r)) => r,
+            _ => panic!("2nd DANGER must be admitted with a reservation"),
+        };
+        // Third DANGER is rejected WITHOUT consuming a dispatch slot (cap reached);
+        // the declined frames answer the right call_id with a distinct "busy" body.
+        let frames = match d.try_admit("external_upload", "c2") {
+            Admission::Reject(f) => f,
+            _ => panic!("3rd DANGER over cap must be rejected"),
+        };
+        let item = &frames.conversation_item_create["item"];
+        assert_eq!(item["call_id"], "c2");
+        let out = item["output"].as_str().unwrap();
+        assert!(
+            out.contains("rejected"),
+            "declined output names the saturation refusal, got {out}"
+        );
+        assert_eq!(frames.response_create["type"], "response.create");
+        // An UNKNOWN tool classifies DANGER (fail-closed) and is rejected at cap too.
+        assert!(matches!(
+            d.try_admit("totally_unknown", "c3"),
+            Admission::Reject(_)
+        ));
+        // Freeing one guard re-opens exactly one slot.
+        drop(r0);
+        assert!(matches!(
+            d.try_admit("delete_file", "c4"),
+            Admission::Admit(Some(_))
+        ));
+        drop(r1);
     }
 
     #[tokio::test]
